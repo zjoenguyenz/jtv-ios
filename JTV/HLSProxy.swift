@@ -242,8 +242,18 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate {
         // /__hls_proxy/<base64>. When that proxy dies, the playlist
         // still loads (edge cache) but every segment returns 502 —
         // while the wrapped origin file stays publicly fetchable
-        // (topxx, verified 2026-11-14). Unwrap and fetch it directly.
-        if let decoded = decodeProxyWrapped(absolute) { absolute = decoded }
+        // (topxx, verified 2026-11-14: HTTP 200, full size, valid
+        // TS, with NO headers at all and with AVPlayer's own user
+        // agent). Serve the unwrapped URL DIRECTLY in the
+        // rewritten playlist and let AVPlayer fetch the segment
+        // itself. Routing these segments back through this loader
+        // (the pre-v1.11 behaviour) never once played on the
+        // user's device across four builds, while every other
+        // part of the chain verified clean — so the loader now
+        // only serves playlists and resources that genuinely need
+        // disguise-stripping, and plain public files take the
+        // plain path.
+        if let decoded = decodeProxyWrapped(absolute) { return decoded.absoluteString }
         guard let proxied = proxiedURL(for: absolute) else { return uri }
         return proxied.absoluteString
     }
