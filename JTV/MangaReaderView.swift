@@ -23,6 +23,12 @@ struct MangaReaderView: View {
     @State private var loadError: String?
     @State private var currentIndex: Int
     @State private var scrollTarget: Int?
+    /// The working chapter list. Seeded from the caller's
+    /// list; the reader heals it from the title's detail
+    /// when an entry path handed it a stub (Continue
+    /// Watching resumes could arrive with a single chapter,
+    /// which left Chap sau permanently disabled).
+    @State private var chapterList: [Episode]
 
     init(movie: Movie, pluginId: String, pluginName: String, serverName: String,
          episodes: [Episode], startEpisode: Episode, initialStream: StreamInfo,
@@ -38,6 +44,7 @@ struct MangaReaderView: View {
         _currentEpisode = State(initialValue: startEpisode)
         _stream = State(initialValue: initialStream)
         _currentIndex = State(initialValue: max(0, initialIndex))
+        _chapterList = State(initialValue: episodes)
     }
 
     /// Chapters in reading order. Plugins hand the episode
@@ -46,7 +53,7 @@ struct MangaReaderView: View {
     /// by it so "Chap sau" always means the NEXT chapter.
     private var orderedEpisodes: [Episode] {
         var seen = Set<String>()
-        let unique = episodes.filter { seen.insert($0.id).inserted }
+        let unique = chapterList.filter { seen.insert($0.id).inserted }
         let numbered = unique.map { (episode: $0, number: chapterNumber(of: $0)) }
         guard numbered.allSatisfy({ $0.number != nil }) else { return unique }
         return numbered.sorted { $0.number! < $1.number! }.map { $0.episode }
@@ -124,6 +131,40 @@ struct MangaReaderView: View {
                 scrollTarget = min(initialIndex, stream.images.count - 1)
             }
             saveProgress()
+        }
+        .task { await healChapterListIfNeeded() }
+    }
+
+    /// Self-heal: if this reader was opened with a stub
+    /// chapter list (a single chapter, or a list that does
+    /// not contain the chapter being read), fetch the
+    /// title's detail and adopt its full chapter list, so
+    /// Chap trước / Chap sau work no matter which entry
+    /// path opened the reader. A stored movie id can be
+    /// stale or empty for some plugins, so fall back to a
+    /// title search like the detail screen does.
+    private func healChapterListIfNeeded() async {
+        let containsCurrent = chapterList.contains { $0.id == currentEpisode.id }
+        guard chapterList.count <= 1 || !containsCurrent else { return }
+        var detail = (try? await service.detail(pluginId: pluginId, movieId: movie.id))?.detail
+        if (detail?.servers.flatMap { $0.episodes }.count ?? 0) <= chapterList.count,
+           let page = try? await service.search(pluginId: pluginId, keyword: movie.title, page: 1),
+           !page.items.isEmpty {
+            let wanted = movie.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let found = page.items.first {
+                $0.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == wanted
+            } ?? (movie.id.isEmpty ? page.items[0] : nil)
+            if let found, !found.id.isEmpty,
+               let healed = try? await service.detail(pluginId: pluginId, movieId: found.id) {
+                detail = healed.detail
+            }
+        }
+        guard let detail else { return }
+        let server = detail.servers.first { $0.name == serverName }
+            ?? detail.servers.first { srv in srv.episodes.contains { $0.id == currentEpisode.id } }
+            ?? detail.servers.max { $0.episodes.count < $1.episodes.count }
+        if let server, server.episodes.count > chapterList.count {
+            chapterList = server.episodes
         }
     }
 
