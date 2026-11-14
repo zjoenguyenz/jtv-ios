@@ -111,6 +111,18 @@ final class PluginManager: ObservableObject {
 
         seedBundledPlugins()
 
+        // Display truth: the bundled set mirrors the default source's
+        // repo, so until a sync succeeds the source row should still
+        // show how many plugins it accounts for — not "0 plugin".
+        if let idx = sources.firstIndex(where: { $0.url == Self.defaultSourceURL }),
+           sources[idx].pluginIds.isEmpty {
+            let bundledIds = installed.filter { $0.sourceURL == "bundled" }.map { $0.id }
+            if !bundledIds.isEmpty {
+                sources[idx].pluginIds = bundledIds
+                persist()
+            }
+        }
+
         if activePluginId.isEmpty || !installed.contains(where: { $0.id == activePluginId }) {
             activePluginId = visiblePlugins.first?.id ?? installed.first?.id ?? ""
         }
@@ -244,11 +256,14 @@ final class PluginManager: ObservableObject {
     // MARK: - Sync
 
     /// Fetches every source's plugins.json, downloads changed scripts and
-    /// rebuilds the installed list.
-    func syncAll() async {
+    /// rebuilds the installed list. Automatic syncs (launch, pull-to-
+    /// refresh) pass silent: a failed update CHECK is not an app error —
+    /// the installed set keeps working — so it must never surface as
+    /// one. Only a manual sync from Settings reports errors.
+    func syncAll(silent: Bool = false) async {
         guard !isSyncing else { return }
         isSyncing = true
-        lastSyncError = nil
+        if !silent { lastSyncError = nil }
         defer { isSyncing = false }
 
         var errors: [String] = []
@@ -263,7 +278,13 @@ final class PluginManager: ObservableObject {
                 newSources.append(PluginSource(url: source.url, pluginIds: synced.plugins.map { $0.id }))
                 anyChanged = anyChanged || synced.changed
             } catch {
-                errors.append("\(source.url): \(error.localizedDescription)")
+                if (error as? URLError)?.code == .badServerResponse {
+                    // 404/403 from the raw host — for the owner's own
+                    // repo this almost always means it is still private.
+                    errors.append("Chưa tải được danh sách nguồn — kho nguồn đang để riêng tư hoặc link chưa đúng. Các nguồn đã cài vẫn chạy bình thường.")
+                } else {
+                    errors.append(error.localizedDescription)
+                }
                 // Keep previously installed plugins from this source.
                 let kept = installed.filter { $0.sourceURL == source.url }
                 newInstalled.append(contentsOf: kept)
@@ -283,10 +304,10 @@ final class PluginManager: ObservableObject {
         }
         persist()
         if anyChanged { syncGeneration += 1 }
-        if !errors.isEmpty {
+        if !silent && !errors.isEmpty {
             lastSyncError = errors.joined(separator: "\n")
         }
-        if !installed.isEmpty && errors.isEmpty {
+        if !silent && !installed.isEmpty && errors.isEmpty {
             Haptics.success()
         }
     }

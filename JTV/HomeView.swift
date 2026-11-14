@@ -55,7 +55,8 @@ struct HomeView: View {
                         // Like the Đá Banh apps: check the source repo
                         // on every launch, in the background, so plugin
                         // fixes reach the phone without a new build.
-                        Task { await plugins.syncAll() }
+                        // Silent: a failed CHECK is not an app error.
+                        Task { await plugins.syncAll(silent: true) }
                     }
                 }
                 await loadSections()
@@ -112,7 +113,7 @@ struct HomeView: View {
             .padding(.vertical, 12)
             }
             .refreshable {
-                await plugins.syncAll()
+                await plugins.syncAll(silent: true)
                 await loadSections(force: true)
             }
         }
