@@ -116,6 +116,37 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         private var transportSwitched = false
         private var stallTimer: Timer?
         var onGiveUp: (() -> Void)?
+        private var didMaterialize = false
+
+        /// The loader-free upgrade for proxy-first streams whose
+        /// playlist flattens to direct URLs (see
+        /// HLSProxyLoader.materializedPlaylistURL): as soon as the
+        /// materialized local playlist is ready, swap the loader
+        /// item for a plain file item. If materialization declines
+        /// (anything still needs the loader), nothing changes and
+        /// the loader item carries on. If the file item itself
+        /// later fails or stalls, the normal transport-switch
+        /// machinery treats it like any other failed attempt.
+        func upgradeToMaterializedPlaylist() {
+            guard !didMaterialize, let sourceURL else { return }
+            didMaterialize = true
+            let headers = sourceHeaders
+            Task { [weak self] in
+                guard let fileURL = await HLSProxyLoader.materializedPlaylistURL(url: sourceURL, headers: headers) else { return }
+                await MainActor.run {
+                    guard let self, let player = self.player else { return }
+                    let pos = player.currentTime().seconds
+                    if pos.isFinite, pos > 10 {
+                        self.startPosition = pos
+                        self.didSeek = false
+                    }
+                    let item = AVPlayerItem(url: fileURL)
+                    player.replaceCurrentItem(with: item)
+                    self.observe(item: item)
+                    self.seekAndPlay()
+                }
+            }
+        }
 
         init(onProgress: @escaping (Double, Double) -> Void, onExit: @escaping (Double, Double) -> Void) {
             self.onProgress = onProgress
