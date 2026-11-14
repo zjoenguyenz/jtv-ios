@@ -34,7 +34,14 @@ final class PluginManager: ObservableObject {
     }
 
     @Published var adultEnabled: Bool {
-        didSet { UserDefaults.standard.set(adultEnabled, forKey: Keys.adultEnabled) }
+        didSet {
+            UserDefaults.standard.set(adultEnabled, forKey: Keys.adultEnabled)
+            // Turning the gate off while an adult plugin is active must
+            // not leave the app sitting on a now-hidden source.
+            if !adultEnabled, isAdult(activePluginId) {
+                activePluginId = visiblePlugins.first?.id ?? ""
+            }
+        }
     }
 
     /// Plugin ids the user disabled in Settings (persisted).
@@ -71,7 +78,10 @@ final class PluginManager: ObservableObject {
     init() {
         let defaults = UserDefaults.standard
         self.activePluginId = defaults.string(forKey: Keys.activePlugin) ?? ""
-        self.adultEnabled = defaults.bool(forKey: Keys.adultEnabled)
+        // The 18+ gate is session-only by the owner's rule: adult sources
+        // appear only while he has the switch on, so every launch starts
+        // with the gate OFF regardless of the previous session.
+        self.adultEnabled = false
 
         if let data = defaults.data(forKey: Keys.sources),
            let saved = try? JSONDecoder().decode([PluginSource].self, from: data), !saved.isEmpty {

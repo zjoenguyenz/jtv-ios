@@ -31,11 +31,27 @@ enum Net {
         guard let url = URL(string: urlString) else {
             throw URLError(.badURL)
         }
-        let (data, response) = try await session.data(for: makeRequest(url: url, headers: headers))
-        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-            throw URLError(.badServerResponse)
+        // Up to 3 attempts with a short backoff: the VPN tunnel path can
+        // drop or garble a first response (-1011), a retry usually lands.
+        var lastError: Error = URLError(.unknown)
+        for attempt in 0..<3 {
+            do {
+                var req = makeRequest(url: url, headers: headers)
+                req.timeoutInterval = 20
+                let (data, response) = try await session.data(for: req)
+                if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                    throw URLError(.badServerResponse)
+                }
+                return String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+            } catch {
+                if (error as? URLError)?.code == .cancelled { throw error }
+                lastError = error
+                if attempt < 2 {
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                }
+            }
         }
-        return String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+        throw lastError
     }
 
     static func fetchData(_ urlString: String, headers: [String: String] = [:]) async throws -> Data {

@@ -11,6 +11,16 @@ struct HomeView: View {
     @State private var isLoading = false
     @State private var didInitialSync = false
 
+    /// Session cache of loaded home content per plugin (10-minute TTL) so
+    /// switching sources back and forth is instant instead of refetching
+    /// every section over the tunnel each time.
+    private struct HomeCacheEntry {
+        var sections: [HomeSection]
+        var items: [String: [Movie]]
+        var loadedAt: Date
+    }
+    @State private var homeCache: [String: HomeCacheEntry] = [:]
+
     private var pluginId: String { plugins.activePlugin?.id ?? "" }
 
     var body: some View {
@@ -89,7 +99,7 @@ struct HomeView: View {
         }
         .refreshable {
             await plugins.syncAll()
-            await loadSections()
+            await loadSections(force: true)
         }
     }
 
@@ -327,19 +337,39 @@ struct HomeView: View {
 
     // MARK: - Loading
 
-    private func loadSections() async {
-        guard !pluginId.isEmpty else { return }
+    private func loadSections(force: Bool = false) async {
+        let pid = pluginId
+        guard !pid.isEmpty else { return }
+        if !force, let cached = homeCache[pid],
+           Date().timeIntervalSince(cached.loadedAt) < 600 {
+            sections = cached.sections
+            sectionItems = cached.items
+            return
+        }
         isLoading = true
         defer { isLoading = false }
-        let loadedSections = await service.homeSections(pluginId: pluginId)
+        let loadedSections = await service.homeSections(pluginId: pid)
+        guard pluginId == pid else { return }
         sections = loadedSections
-        var items: [String: [Movie]] = [:]
-        for section in loadedSections {
-            if let page = try? await service.list(pluginId: pluginId, slug: section.slug,
-                                                  filters: ListFilters(), page: 1) {
-                items[section.id] = page.items
+        sectionItems = [:]
+        // Fetch every section's first page IN PARALLEL and publish each
+        // row as soon as its own fetch lands — previously this loop was
+        // strictly serial, so the slowest section blocked all the others.
+        await withTaskGroup(of: (String, [Movie]).self) { group in
+            for section in loadedSections {
+                group.addTask {
+                    let page = try? await service.list(pluginId: pid, slug: section.slug,
+                                                       filters: ListFilters(), page: 1)
+                    return (section.id, page?.items ?? [])
+                }
+            }
+            for await (sectionId, movies) in group {
+                if !movies.isEmpty {
+                    sectionItems[sectionId] = movies
+                }
             }
         }
-        sectionItems = items
+        guard pluginId == pid else { return }
+        homeCache[pid] = HomeCacheEntry(sections: sections, items: sectionItems, loadedAt: Date())
     }
 }

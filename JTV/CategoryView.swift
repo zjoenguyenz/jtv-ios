@@ -171,9 +171,16 @@ struct CategoryDetailView: View {
 
             if isLoading && items.isEmpty {
                 ProgressView().tint(Theme.accent).scaleEffect(1.3)
-            } else if let loadError, items.isEmpty {
-                ContentUnavailableView("Không tải được danh sách", systemImage: "wifi.exclamationmark",
-                                       description: Text(loadError))
+            } else if loadError != nil, items.isEmpty {
+                ContentUnavailableView {
+                    Label("Không tải được danh sách", systemImage: "wifi.exclamationmark")
+                } description: {
+                    Text("Nguồn phản hồi chậm hoặc hầm VPN chưa ổn định. Kiểm tra hầm đang bật rồi thử lại.")
+                } actions: {
+                    Button("Thử lại") { Task { await reload() } }
+                        .buttonStyle(.borderedProminent)
+                        .tint(Theme.accent)
+                }
             } else if items.isEmpty && didLoad {
                 ContentUnavailableView("Không có nội dung", systemImage: "film.stack",
                                        description: Text("Danh mục này đang trống."))
