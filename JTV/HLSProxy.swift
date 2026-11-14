@@ -133,12 +133,58 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate {
     /// nested URI routes back through this loader; binaries are
     /// sniffed and re-typed honestly.
     private func prepare(data: Data, finalURL: URL) -> (data: Data, contentType: String) {
+        var data = data
+        // Some CDNs wrap each segment in a complete tiny PNG (a real
+        // image header + IEND, then the actual media bytes): VSMOV's
+        // TS segments and Film4K's fMP4 segments both do this. Strip
+        // the wrapper or AVFoundation chokes on the garbage prefix.
+        if Self.hasPNGMagic(data), let stripped = Self.stripPNGWrapper(data) {
+            data = stripped
+        }
         if Self.looksLikePlaylist(data),
            let text = String(data: data, encoding: .utf8) {
             let rewritten = Self.rewritePlaylist(text, base: finalURL)
             return (Data(rewritten.utf8), "com.apple.mpegurl")
         }
         return (data, Self.sniffContentType(data: data, url: finalURL))
+    }
+
+    static func hasPNGMagic(_ data: Data) -> Bool {
+        data.count >= 8 && data.prefix(8) == Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+    }
+
+    /// Returns the media payload after a PNG wrapper, or nil when no
+    /// confident media start is found. Tries, in order: the bytes
+    /// right after the PNG's IEND chunk; the first MPEG-TS sync
+    /// pattern (0x47 at i, i+188, i+376); an fMP4 box type (ftyp/
+    /// styp) backed up to its 4-byte size field.
+    static func stripPNGWrapper(_ data: Data) -> Data? {
+        let window = min(data.count, 8192)
+        // 1) IEND terminator: 00 00 00 00 "IEND" AE 42 60 82
+        let iend = Data([0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82])
+        if let range = data.range(of: iend, in: 0..<window) {
+            let start = range.upperBound
+            if start < data.count { return data.subdata(in: start..<data.count) }
+        }
+        // 2) TS sync pattern
+        if data.count > 564 {
+            var i = 1
+            let limit = min(data.count - 565, window)
+            while i < limit {
+                if data[i] == 0x47 && data[i + 188] == 0x47 && data[i + 376] == 0x47 && data[i + 564] == 0x47 {
+                    return data.subdata(in: i..<data.count)
+                }
+                i += 1
+            }
+        }
+        // 3) fMP4 box
+        for marker in ["styp", "ftyp"] {
+            if let range = data.range(of: Data(marker.utf8), in: 0..<window), range.lowerBound >= 4 {
+                let start = range.lowerBound - 4
+                if start > 0 && start < data.count { return data.subdata(in: start..<data.count) }
+            }
+        }
+        return nil
     }
 
     private func respond(_ request: AVAssetResourceLoadingRequest, data: Data, contentType: String) {
