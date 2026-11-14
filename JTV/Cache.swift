@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import UIKit
+import WebKit
 
 // MARK: - Networking
 
@@ -27,6 +28,28 @@ enum Net {
         return req
     }
 
+    /// Cloudflare's JS challenge ("Just a moment…") is served with a
+    /// 403/503 (rarely a 200 interstitial). Ordinary Cloudflare pages
+    /// also carry challenge-platform scripts, so the body marker alone
+    /// is not enough — status or the interstitial title must agree.
+    static func isCloudflareChallenge(_ text: String, status: Int) -> Bool {
+        let t = text.lowercased()
+        if t.contains("<title>just a moment") { return true }
+        if status == 403 || status == 503 {
+            return t.contains("just a moment")
+                || t.contains("challenge-platform")
+                || t.contains("challenges.cloudflare.com")
+        }
+        return false
+    }
+
+    /// Marker check for rendered DOM coming back from the WebView
+    /// fetcher (no HTTP status available there).
+    static func isChallengeHTML(_ text: String) -> Bool {
+        let t = text.lowercased()
+        return t.contains("<title>just a moment") || t.contains("challenges.cloudflare.com")
+    }
+
     static func fetchText(_ urlString: String, headers: [String: String] = [:]) async throws -> String {
         guard let url = URL(string: urlString) else {
             throw URLError(.badURL)
@@ -34,15 +57,32 @@ enum Net {
         // Up to 3 attempts with a short backoff: the VPN tunnel path can
         // drop or garble a first response (-1011), a retry usually lands.
         var lastError: Error = URLError(.unknown)
+        var triedWebView = false
         for attempt in 0..<3 {
             do {
                 var req = makeRequest(url: url, headers: headers)
                 req.timeoutInterval = 20
                 let (data, response) = try await session.data(for: req)
-                if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                let text = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 200
+                if isCloudflareChallenge(text, status: status) {
+                    // Only a real browser passes this wall. Retrying
+                    // URLSession just burns time (the user watched a
+                    // 4-minute spinner on SayHentai) — go straight to
+                    // the WebView fetcher, once.
+                    if !triedWebView {
+                        triedWebView = true
+                        if let html = await WebFetcher.fetchHTML(url: url),
+                           !html.isEmpty, !isChallengeHTML(html) {
+                            return html
+                        }
+                    }
                     throw URLError(.badServerResponse)
                 }
-                return String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+                if !(200...299).contains(status) {
+                    throw URLError(.badServerResponse)
+                }
+                return text
             } catch {
                 if (error as? URLError)?.code == .cancelled { throw error }
                 lastError = error
@@ -58,6 +98,114 @@ enum Net {
         guard let url = URL(string: urlString) else { throw URLError(.badURL) }
         let (data, _) = try await session.data(for: makeRequest(url: url, headers: headers))
         return data
+    }
+}
+
+// MARK: - WebView fetcher (Cloudflare-challenge fallback)
+
+/// Some sources (SayHentai) sit behind Cloudflare's JavaScript
+/// challenge: plain URLSession requests receive a "Just a moment…"
+/// page or stall, while a real WebKit view passes the check. This
+/// fetcher loads the page in an off-screen WKWebView, lets the
+/// challenge solve itself, returns the rendered HTML, and copies the
+/// clearance cookies into the shared cookie jar so Net.session can
+/// fetch follow-up pages and chapter images directly (the clearance
+/// is bound to this device's IP + user agent, both unchanged).
+@MainActor
+final class WebFetcher: NSObject, WKNavigationDelegate {
+    static let shared = WebFetcher()
+
+    private var webView: WKWebView?
+    private var continuation: CheckedContinuation<String?, Never>?
+    private var timeoutTask: Task<Void, Never>?
+    private var busy = false
+
+    static func fetchHTML(url: URL) async -> String? {
+        await shared.fetch(url: url)
+    }
+
+    private func fetch(url: URL) async -> String? {
+        while busy {
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        busy = true
+        defer { busy = false }
+        return await load(url: url)
+    }
+
+    private func ensureWebView() -> WKWebView {
+        if let webView { return webView }
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .default()
+        let wv = WKWebView(frame: CGRect(x: 0, y: 0, width: 390, height: 844), configuration: config)
+        wv.customUserAgent = Net.defaultUA
+        wv.navigationDelegate = self
+        webView = wv
+        // Attach invisibly to the key window: WebKit can throttle JS
+        // timers in fully detached views, and the challenge is JS.
+        if let window = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .flatMap({ $0.windows })
+            .first(where: { $0.isKeyWindow }) {
+            wv.isHidden = true
+            window.addSubview(wv)
+        }
+        return wv
+    }
+
+    private func load(url: URL) async -> String? {
+        let wv = ensureWebView()
+        return await withCheckedContinuation { (cont: CheckedContinuation<String?, Never>) in
+            self.continuation = cont
+            self.timeoutTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 40_000_000_000)
+                self.finish(nil)
+            }
+            var req = URLRequest(url: url)
+            req.setValue(Net.defaultUA, forHTTPHeaderField: "User-Agent")
+            wv.stopLoading()
+            wv.load(req)
+        }
+    }
+
+    private func finish(_ html: String?) {
+        timeoutTask?.cancel()
+        timeoutTask = nil
+        continuation?.resume(returning: html)
+        continuation = nil
+    }
+
+    private func harvestCookies(from webView: WKWebView) async {
+        let cookies = await webView.configuration.websiteDataStore.httpCookieStore.allCookies()
+        for cookie in cookies {
+            HTTPCookieStorage.shared.setCookie(cookie)
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        Task { @MainActor in
+            // The challenge needs a beat to solve and redirect; poll
+            // the DOM until it turns into the real page.
+            for attempt in 0..<6 {
+                try? await Task.sleep(nanoseconds: attempt == 0 ? 800_000_000 : 1_200_000_000)
+                let raw = try? await webView.evaluateJavaScript("document.documentElement.outerHTML")
+                guard let html = raw as? String else { continue }
+                if Net.isChallengeHTML(html) { continue }
+                await self.harvestCookies(from: webView)
+                self.finish(html)
+                return
+            }
+            let raw = try? await webView.evaluateJavaScript("document.documentElement.outerHTML")
+            self.finish(raw as? String)
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        finish(nil)
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        finish(nil)
     }
 }
 
