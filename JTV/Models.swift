@@ -162,7 +162,7 @@ struct FilterConfig {
 }
 
 /// Active list filters (encoded into the filtersJson passed to plugins).
-struct ListFilters: Equatable {
+struct ListFilters: Equatable, Hashable {
     var category: String = ""
     var country: String = ""
     var year: String = ""
@@ -503,6 +503,57 @@ struct MovieRoute: Hashable {
     /// (where another chapter can be picked) instead of
     /// dropping the user at the library list.
     var autoResume: Bool = false
+}
+
+/// Navigation route to a category listing screen.
+struct CategoryRoute: Hashable {
+    let pluginId: String
+    let slug: String
+    let title: String
+    let filters: ListFilters
+}
+
+/// Navigation route to a search-results screen (cast taps).
+struct SearchRoute: Hashable {
+    let pluginId: String
+    let keyword: String
+}
+
+/// The single route type every browsing stack (Home / Categories /
+/// Search / Library) is built on, so each stack's path is explicit
+/// state the app owns instead of SwiftUI's opaque internal store.
+enum AppRoute: Hashable {
+    case movie(MovieRoute)
+    case category(CategoryRoute)
+    case search(SearchRoute)
+}
+
+/// Guards the browsing stacks against a navigation race: a push
+/// that lands while a pop transition is still running can stack
+/// the new detail page ON TOP of the detail that was on its way
+/// out, so Back then walks through stale detail pages instead of
+/// returning to the list (the sextop1 browsing bug, 2026-11-14).
+/// After every path change, collapse any run of adjacent movie
+/// routes to the newest one and drop exact duplicates. No
+/// legitimate flow places two movie details adjacent — getting
+/// from one detail to another always passes through a list or a
+/// search-results page — so collapsing is always safe.
+enum NavSanitizer {
+    static func sanitize(_ path: inout [AppRoute]) {
+        var cleaned: [AppRoute] = []
+        cleaned.reserveCapacity(path.count)
+        for route in path {
+            if let last = cleaned.last {
+                if case .movie = route, case .movie = last {
+                    cleaned[cleaned.count - 1] = route
+                    continue
+                }
+                if route == last { continue }
+            }
+            cleaned.append(route)
+        }
+        if cleaned != path { path = cleaned }
+    }
 }
 
 // MARK: - URL helpers

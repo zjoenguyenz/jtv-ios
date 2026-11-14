@@ -6,12 +6,13 @@ struct SearchView: View {
     @State private var query = ""
     @State private var submittedQuery = ""
     @State private var recentQueries: [String] = []
+    @State private var path: [AppRoute] = []
 
     private let recentKey = "jtv_recent_searches"
     private var pluginId: String { plugins.activePlugin?.id ?? "" }
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             ZStack {
                 Color.clear.jtvBackground()
 
@@ -30,9 +31,18 @@ struct SearchView: View {
             .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always),
                         prompt: "Tìm phim, truyện…")
             .onSubmit(of: .search) { submit() }
-            .navigationDestination(for: MovieRoute.self) { route in
-                MovieDetailView(pluginId: route.pluginId, movie: route.movie, autoResume: route.autoResume)
+            .navigationDestination(for: AppRoute.self) { route in
+                switch route {
+                case .movie(let movieRoute):
+                    MovieDetailView(pluginId: movieRoute.pluginId, movie: movieRoute.movie, autoResume: movieRoute.autoResume)
+                case .category(let categoryRoute):
+                    CategoryDetailView(pluginId: categoryRoute.pluginId, slug: categoryRoute.slug,
+                                       title: categoryRoute.title, initialFilters: categoryRoute.filters)
+                case .search(let searchRoute):
+                    SearchResultsView(query: searchRoute.keyword, pluginId: searchRoute.pluginId)
+                }
             }
+            .onChange(of: path) { _, _ in NavSanitizer.sanitize(&path) }
             .onAppear {
                 recentQueries = UserDefaults.standard.stringArray(forKey: recentKey) ?? []
             }
@@ -135,7 +145,7 @@ struct SearchResultsView: View {
                 ScrollView {
                     LazyVGrid(columns: columns, spacing: 16) {
                         ForEach(items) { movie in
-                            NavigationLink(value: MovieRoute(pluginId: pluginId, movie: movie)) {
+                            NavigationLink(value: AppRoute.movie(MovieRoute(pluginId: pluginId, movie: movie))) {
                                 MovieGridCell(movie: movie)
                             }
                             .buttonStyle(.plain)

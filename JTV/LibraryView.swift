@@ -7,9 +7,10 @@ struct LibraryView: View {
     }
 
     @State private var tab: Tab = .history
+    @State private var path: [AppRoute] = []
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             ZStack {
                 Color.clear.jtvBackground()
                 VStack(spacing: 0) {
@@ -32,9 +33,18 @@ struct LibraryView: View {
             }
             .navigationTitle("Thư viện")
             .navigationBarTitleDisplayMode(.large)
-            .navigationDestination(for: MovieRoute.self) { route in
-                MovieDetailView(pluginId: route.pluginId, movie: route.movie)
+            .navigationDestination(for: AppRoute.self) { route in
+                switch route {
+                case .movie(let movieRoute):
+                    MovieDetailView(pluginId: movieRoute.pluginId, movie: movieRoute.movie, autoResume: movieRoute.autoResume)
+                case .category(let categoryRoute):
+                    CategoryDetailView(pluginId: categoryRoute.pluginId, slug: categoryRoute.slug,
+                                       title: categoryRoute.title, initialFilters: categoryRoute.filters)
+                case .search(let searchRoute):
+                    SearchResultsView(query: searchRoute.keyword, pluginId: searchRoute.pluginId)
+                }
             }
+            .onChange(of: path) { _, _ in NavSanitizer.sanitize(&path) }
         }
     }
 }
@@ -53,9 +63,7 @@ struct HistoryView: View {
             } else {
                 List {
                     ForEach(history.records) { record in
-                        Button {
-                            resume(record)
-                        } label: {
+                        NavigationLink(value: AppRoute.movie(MovieRoute(pluginId: record.pluginId, movie: record.movie, autoResume: true))) {
                             historyRow(record)
                         }
                         .buttonStyle(.plain)
@@ -139,21 +147,6 @@ struct HistoryView: View {
         .contentShape(Rectangle())
     }
 
-    private func resume(_ record: HistoryRecord) {
-        let episode = Episode(id: record.episodeId, name: record.episodeName, slug: record.episodeId)
-        presenter.request = PlaybackRequest(
-            movie: record.movie,
-            pluginId: record.pluginId,
-            pluginName: record.pluginName,
-            isManga: record.isManga,
-            serverName: record.serverName,
-            episode: episode,
-            allEpisodes: [episode],
-            startPosition: record.isManga ? 0 : record.lastPosition,
-            knownStreamURL: record.streamURL
-        )
-    }
-
     private func formatTime(_ seconds: Double) -> String {
         guard seconds.isFinite, seconds >= 0 else { return "0:00" }
         let total = Int(seconds)
@@ -181,7 +174,7 @@ struct FavoritesList: View {
                 ScrollView {
                     LazyVGrid(columns: columns, spacing: 16) {
                         ForEach(favorites.records) { record in
-                            NavigationLink(value: MovieRoute(pluginId: record.pluginId, movie: record.movie)) {
+                            NavigationLink(value: AppRoute.movie(MovieRoute(pluginId: record.pluginId, movie: record.movie))) {
                                 MovieGridCell(movie: record.movie)
                             }
                             .buttonStyle(.plain)

@@ -10,6 +10,7 @@ struct HomeView: View {
     @State private var sectionItems: [String: [Movie]] = [:]
     @State private var isLoading = false
     @State private var didInitialSync = false
+    @State private var path: [AppRoute] = []
 
     /// Session cache of loaded home content per plugin (10-minute TTL) so
     /// switching sources back and forth is instant instead of refetching
@@ -24,7 +25,7 @@ struct HomeView: View {
     private var pluginId: String { plugins.activePlugin?.id ?? "" }
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             ZStack {
                 Color.clear.jtvBackground()
 
@@ -43,9 +44,18 @@ struct HomeView: View {
                     }
                 }
             }
-            .navigationDestination(for: MovieRoute.self) { route in
-                MovieDetailView(pluginId: route.pluginId, movie: route.movie, autoResume: route.autoResume)
+            .navigationDestination(for: AppRoute.self) { route in
+                switch route {
+                case .movie(let movieRoute):
+                    MovieDetailView(pluginId: movieRoute.pluginId, movie: movieRoute.movie, autoResume: movieRoute.autoResume)
+                case .category(let categoryRoute):
+                    CategoryDetailView(pluginId: categoryRoute.pluginId, slug: categoryRoute.slug,
+                                       title: categoryRoute.title, initialFilters: categoryRoute.filters)
+                case .search(let searchRoute):
+                    SearchResultsView(query: searchRoute.keyword, pluginId: searchRoute.pluginId)
+                }
             }
+            .onChange(of: path) { _, _ in NavSanitizer.sanitize(&path) }
             .task {
                 if !didInitialSync {
                     didInitialSync = true
@@ -162,7 +172,7 @@ struct HomeView: View {
     @ViewBuilder
     private var heroIfAvailable: some View {
         if let hero = heroMovie {
-            NavigationLink(value: MovieRoute(pluginId: pluginId, movie: hero)) {
+            NavigationLink(value: AppRoute.movie(MovieRoute(pluginId: pluginId, movie: hero))) {
                 ZStack(alignment: .bottomLeading) {
                     CachedAsyncImage(urlString: hero.displayBackdrop)
                         .frame(maxWidth: .infinity)
@@ -235,7 +245,7 @@ struct HomeView: View {
     }
 
     private func continueCard(_ record: HistoryRecord) -> some View {
-        NavigationLink(value: MovieRoute(pluginId: record.pluginId, movie: record.movie, autoResume: true)) {
+        NavigationLink(value: AppRoute.movie(MovieRoute(pluginId: record.pluginId, movie: record.movie, autoResume: true))) {
             VStack(alignment: .leading, spacing: 7) {
                 ZStack(alignment: .bottomLeading) {
                     CachedAsyncImage(urlString: record.movie.displayBackdrop)
@@ -298,10 +308,9 @@ struct HomeView: View {
         let items = sectionItems[section.id] ?? []
         if !items.isEmpty {
             VStack(alignment: .leading, spacing: 12) {
-                NavigationLink {
-                    CategoryDetailView(pluginId: pluginId, slug: section.slug,
-                                       title: section.title, initialFilters: ListFilters())
-                } label: {
+                NavigationLink(value: AppRoute.category(CategoryRoute(
+                    pluginId: pluginId, slug: section.slug,
+                    title: section.title, filters: ListFilters()))) {
                     SectionHeader(title: section.title, showChevron: true)
                 }
                 .buttonStyle(.plain)
@@ -310,7 +319,7 @@ struct HomeView: View {
                 if section.isGrid {
                     LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 3), spacing: 14) {
                         ForEach(items.prefix(9)) { movie in
-                            NavigationLink(value: MovieRoute(pluginId: pluginId, movie: movie)) {
+                            NavigationLink(value: AppRoute.movie(MovieRoute(pluginId: pluginId, movie: movie))) {
                                 MovieGridCell(movie: movie)
                             }
                             .buttonStyle(.plain)
@@ -321,7 +330,7 @@ struct HomeView: View {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(alignment: .top, spacing: 13) {
                             ForEach(items) { movie in
-                                NavigationLink(value: MovieRoute(pluginId: pluginId, movie: movie)) {
+                                NavigationLink(value: AppRoute.movie(MovieRoute(pluginId: pluginId, movie: movie))) {
                                     MovieCard(movie: movie)
                                 }
                                 .buttonStyle(.plain)

@@ -11,12 +11,13 @@ struct CategoryBrowseView: View {
     @State private var countries: [NameValue] = []
     @State private var years: [NameValue] = []
     @State private var isLoading = false
+    @State private var path: [AppRoute] = []
 
     private var pluginId: String { plugins.activePlugin?.id ?? "" }
     private var defaultSlug: String { primary.first?.slug ?? "phim-moi" }
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             ZStack {
                 Color.clear.jtvBackground()
 
@@ -30,16 +31,16 @@ struct CategoryBrowseView: View {
                             if !primary.isEmpty {
                                 block(title: "Danh mục") {
                                     chipFlow(primary) { item in
-                                        CategoryDetailView(pluginId: pluginId, slug: item.slug,
-                                                           title: item.name, initialFilters: ListFilters())
+                                        CategoryRoute(pluginId: pluginId, slug: item.slug,
+                                                      title: item.name, filters: ListFilters())
                                     }
                                 }
                             }
                             if !categories.isEmpty {
                                 block(title: "Thể loại") {
                                     chipFlow(categories) { item in
-                                        CategoryDetailView(pluginId: pluginId, slug: item.slug,
-                                                           title: item.name, initialFilters: ListFilters())
+                                        CategoryRoute(pluginId: pluginId, slug: item.slug,
+                                                      title: item.name, filters: ListFilters())
                                     }
                                 }
                             }
@@ -48,8 +49,8 @@ struct CategoryBrowseView: View {
                                     chipFlow(countries) { item in
                                         var f = ListFilters()
                                         f.country = item.value
-                                        return CategoryDetailView(pluginId: pluginId, slug: defaultSlug,
-                                                                  title: item.name, initialFilters: f)
+                                        return CategoryRoute(pluginId: pluginId, slug: defaultSlug,
+                                                             title: item.name, filters: f)
                                     }
                                 }
                             }
@@ -58,8 +59,8 @@ struct CategoryBrowseView: View {
                                     chipFlow(years) { item in
                                         var f = ListFilters()
                                         f.year = item.value
-                                        return CategoryDetailView(pluginId: pluginId, slug: defaultSlug,
-                                                                  title: "Năm \(item.name)", initialFilters: f)
+                                        return CategoryRoute(pluginId: pluginId, slug: defaultSlug,
+                                                             title: "Năm \(item.name)", filters: f)
                                     }
                                 }
                             }
@@ -77,9 +78,18 @@ struct CategoryBrowseView: View {
             }
             .navigationTitle("Thể loại")
             .navigationBarTitleDisplayMode(.large)
-            .navigationDestination(for: MovieRoute.self) { route in
-                MovieDetailView(pluginId: route.pluginId, movie: route.movie, autoResume: route.autoResume)
+            .navigationDestination(for: AppRoute.self) { route in
+                switch route {
+                case .movie(let movieRoute):
+                    MovieDetailView(pluginId: movieRoute.pluginId, movie: movieRoute.movie, autoResume: movieRoute.autoResume)
+                case .category(let categoryRoute):
+                    CategoryDetailView(pluginId: categoryRoute.pluginId, slug: categoryRoute.slug,
+                                       title: categoryRoute.title, initialFilters: categoryRoute.filters)
+                case .search(let searchRoute):
+                    SearchResultsView(query: searchRoute.keyword, pluginId: searchRoute.pluginId)
+                }
             }
+            .onChange(of: path) { _, _ in NavSanitizer.sanitize(&path) }
             .task(id: pluginId) { await load() }
             .onChange(of: plugins.activePluginId) { _, _ in Task { await load() } }
         }
@@ -92,14 +102,12 @@ struct CategoryBrowseView: View {
         }
     }
 
-    private func chipFlow<T: Identifiable, Destination: View>(
-        _ items: [T], destination: @escaping (T) -> Destination
+    private func chipFlow<T: Identifiable>(
+        _ items: [T], destination: @escaping (T) -> CategoryRoute
     ) -> some View where T: Hashable {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 108), spacing: 10)], spacing: 10) {
             ForEach(items) { item in
-                NavigationLink {
-                    destination(item)
-                } label: {
+                NavigationLink(value: AppRoute.category(destination(item))) {
                     Text(label(for: item))
                         .font(.system(size: 13, weight: .semibold, design: .rounded))
                         .foregroundStyle(.white)
@@ -188,7 +196,7 @@ struct CategoryDetailView: View {
                 ScrollView {
                     LazyVGrid(columns: columns, spacing: 16) {
                         ForEach(items) { movie in
-                            NavigationLink(value: MovieRoute(pluginId: pluginId, movie: movie)) {
+                            NavigationLink(value: AppRoute.movie(MovieRoute(pluginId: pluginId, movie: movie))) {
                                 MovieGridCell(movie: movie)
                             }
                             .buttonStyle(.plain)

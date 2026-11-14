@@ -314,9 +314,7 @@ struct MovieDetailView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
                     ForEach(detail.castNames, id: \.self) { name in
-                        NavigationLink {
-                            SearchResultsView(query: name, pluginId: pluginId)
-                        } label: {
+                        NavigationLink(value: AppRoute.search(SearchRoute(pluginId: pluginId, keyword: name))) {
                             HStack(spacing: 6) {
                                 Image(systemName: "person.crop.circle")
                                     .foregroundStyle(Theme.accent)
