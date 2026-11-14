@@ -51,11 +51,20 @@ struct HomeView: View {
                     didInitialSync = true
                     if plugins.installed.isEmpty {
                         await plugins.syncAll()
+                    } else {
+                        // Like the Đá Banh apps: check the source repo
+                        // on every launch, in the background, so plugin
+                        // fixes reach the phone without a new build.
+                        Task { await plugins.syncAll() }
                     }
                 }
                 await loadSections()
             }
             .onChange(of: plugins.activePluginId) { _, _ in
+                Task { await loadSections() }
+            }
+            .onChange(of: plugins.syncGeneration) { _, _ in
+                // A background sync installed newer plugin scripts.
                 Task { await loadSections() }
             }
         }
@@ -78,9 +87,14 @@ struct HomeView: View {
     }
 
     private var content: some View {
-        ScrollView {
+        VStack(spacing: 0) {
+            // Pinned OUTSIDE the vertical scroll view: nested scroll views
+            // competed for the drag gesture and the source bar would not
+            // swipe. As a sibling it scrolls freely and stays reachable.
+            pluginSwitcher
+                .padding(.vertical, 8)
+            ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                pluginSwitcher
                 if isLoading && sections.isEmpty {
                     HStack {
                         Spacer()
@@ -96,10 +110,11 @@ struct HomeView: View {
                 }
             }
             .padding(.vertical, 12)
-        }
-        .refreshable {
-            await plugins.syncAll()
-            await loadSections(force: true)
+            }
+            .refreshable {
+                await plugins.syncAll()
+                await loadSections(force: true)
+            }
         }
     }
 

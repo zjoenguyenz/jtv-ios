@@ -28,6 +28,9 @@ final class PluginManager: ObservableObject {
     @Published private(set) var installed: [InstalledPlugin] = []
     @Published private(set) var isSyncing = false
     @Published var lastSyncError: String?
+    /// Bumps whenever a sync actually added or updated a plugin, so
+    /// views can refresh content built from the old scripts.
+    @Published private(set) var syncGeneration = 0
 
     @Published var activePluginId: String {
         didSet { UserDefaults.standard.set(activePluginId, forKey: Keys.activePlugin) }
@@ -160,7 +163,23 @@ final class PluginManager: ObservableObject {
 
     // MARK: - Visibility
 
-    func isAdult(_ pluginId: String) -> Bool { Self.adultPluginIds.contains(pluginId) }
+    func isAdult(_ pluginId: String) -> Bool {
+        if Self.adultPluginIds.contains(pluginId) { return true }
+        // Sources added later can flag a plugin as adult in plugins.json.
+        return installed.first { $0.id == pluginId }?.manifest.adult == true
+    }
+
+    /// Dotted-numeric version compare ("1.0.10" > "1.0.9"); -1/0/1.
+    static func compareVersions(_ a: String, _ b: String) -> Int {
+        let pa = a.split(separator: ".").map { Int($0) ?? 0 }
+        let pb = b.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(pa.count, pb.count) {
+            let x = i < pa.count ? pa[i] : 0
+            let y = i < pb.count ? pb[i] : 0
+            if x != y { return x < y ? -1 : 1 }
+        }
+        return 0
+    }
 
     /// Plugins shown in switchers/pickers: installed, adult gate applied,
     /// not user-disabled.
@@ -235,12 +254,14 @@ final class PluginManager: ObservableObject {
         var errors: [String] = []
         var newInstalled: [InstalledPlugin] = []
         var newSources: [PluginSource] = []
+        var anyChanged = false
 
         for source in sources {
             do {
-                let plugins = try await syncSource(urlString: source.url)
-                newInstalled.append(contentsOf: plugins)
-                newSources.append(PluginSource(url: source.url, pluginIds: plugins.map { $0.id }))
+                let synced = try await syncSource(urlString: source.url)
+                newInstalled.append(contentsOf: synced.plugins)
+                newSources.append(PluginSource(url: source.url, pluginIds: synced.plugins.map { $0.id }))
+                anyChanged = anyChanged || synced.changed
             } catch {
                 errors.append("\(source.url): \(error.localizedDescription)")
                 // Keep previously installed plugins from this source.
@@ -261,6 +282,7 @@ final class PluginManager: ObservableObject {
             activePluginId = visiblePlugins.first?.id ?? ""
         }
         persist()
+        if anyChanged { syncGeneration += 1 }
         if !errors.isEmpty {
             lastSyncError = errors.joined(separator: "\n")
         }
@@ -269,29 +291,67 @@ final class PluginManager: ObservableObject {
         }
     }
 
-    private func syncSource(urlString: String) async throws -> [InstalledPlugin] {
+    /// Syncs one source. Updates are version-gated and validated BEFORE
+    /// they touch disk: a downloaded script replaces the installed one
+    /// only when its own manifest parses, its id matches, and its
+    /// version is newer (or the plugin is new). A failed or older entry
+    /// keeps the working copy — a bad push can never break a source
+    /// that works, the same floor the bundled set provides.
+    private func syncSource(urlString: String) async throws -> (plugins: [InstalledPlugin], changed: Bool) {
         let text = try await Net.fetchText(urlString)
         guard let data = text.data(using: .utf8) else { throw URLError(.cannotDecodeContentData) }
         let file = try JSONDecoder().decode(PluginManifestFile.self, from: data)
 
         var result: [InstalledPlugin] = []
+        var changed = false
         for entry in file.plugins where !entry.id.isEmpty && !entry.scriptUrl.isEmpty {
-            let script = try await Net.fetchText(entry.scriptUrl)
+            let existing = installed.first { $0.id == entry.id }
             let fileURL = scriptFileURL(for: entry.id)
-            try script.write(to: fileURL, atomically: true, encoding: .utf8)
-            invalidateEngine(for: entry.id)
+            let hasScript = FileManager.default.fileExists(atPath: fileURL.path)
 
-            // Parse the real manifest from the script itself.
-            let engine = PluginEngine(pluginId: entry.id)
-            await engine.load(script: script)
-            var manifest = await engine.manifest() ?? entry
-            if manifest.id.isEmpty { manifest.id = entry.id }
-            if manifest.name.isEmpty { manifest.name = entry.name }
-            if manifest.iconUrl.isEmpty { manifest.iconUrl = entry.iconUrl }
-            manifest.scriptUrl = entry.scriptUrl
-            result.append(InstalledPlugin(manifest: manifest, sourceURL: urlString))
+            // Already at this version (or newer): keep, no re-download.
+            if let existing, hasScript,
+               Self.compareVersions(entry.version, existing.manifest.version) <= 0 {
+                var manifest = existing.manifest
+                if entry.adult { manifest.adult = true }
+                if manifest.iconUrl.isEmpty { manifest.iconUrl = entry.iconUrl }
+                result.append(InstalledPlugin(manifest: manifest, sourceURL: existing.sourceURL))
+                continue
+            }
+
+            do {
+                let script = try await Net.fetchText(entry.scriptUrl)
+                // Validate first: the script must load and identify
+                // itself as this plugin before it earns the disk slot.
+                let engine = PluginEngine(pluginId: entry.id)
+                await engine.load(script: script)
+                guard var manifest = await engine.manifest(),
+                      manifest.id == entry.id else {
+                    if let existing { result.append(existing) }
+                    continue
+                }
+                if existing != nil,
+                   Self.compareVersions(manifest.version, existing!.manifest.version) < 0 {
+                    result.append(existing!)
+                    continue
+                }
+                try script.write(to: fileURL, atomically: true, encoding: .utf8)
+                invalidateEngine(for: entry.id)
+                if manifest.name.isEmpty { manifest.name = entry.name }
+                if manifest.iconUrl.isEmpty { manifest.iconUrl = entry.iconUrl }
+                if entry.adult { manifest.adult = true }
+                manifest.scriptUrl = entry.scriptUrl
+                // A plugin that arrived via sync keeps the bundled
+                // floor: mark it with the source that delivered it.
+                result.append(InstalledPlugin(manifest: manifest, sourceURL: urlString))
+                changed = true
+            } catch {
+                // Keep the working copy; one bad entry must not fail
+                // the whole source's other updates.
+                if let existing { result.append(existing) }
+            }
         }
-        return result
+        return (result, changed)
     }
 
     // MARK: - Source management

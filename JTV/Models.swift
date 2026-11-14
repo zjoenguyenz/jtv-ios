@@ -28,12 +28,15 @@ struct PluginManifest: Codable, Identifiable, Hashable {
     var isEnabled: Bool = true
     var type: String = "MOVIE"
     var playerType: String = ""
+    /// Set from the plugins.json entry (scripts don't declare it): keeps
+    /// the 18+ gate correct even for plugins added remotely later.
+    var adult: Bool = false
 
     var isManga: Bool { type.uppercased() == "MANGA" }
     var isEmbedPlayer: Bool { playerType.lowercased() == "embed" }
 
     enum CodingKeys: String, CodingKey {
-        case id, name, version, scriptUrl, iconUrl, baseUrl, isEnabled, type, playerType
+        case id, name, version, scriptUrl, iconUrl, baseUrl, isEnabled, type, playerType, adult
     }
 
     init() {}
@@ -49,6 +52,7 @@ struct PluginManifest: Codable, Identifiable, Hashable {
         isEnabled = try c.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
         type = try c.decodeIfPresent(String.self, forKey: .type) ?? "MOVIE"
         playerType = try c.decodeIfPresent(String.self, forKey: .playerType) ?? ""
+        adult = try c.decodeIfPresent(Bool.self, forKey: .adult) ?? false
     }
 }
 
