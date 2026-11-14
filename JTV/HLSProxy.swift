@@ -65,6 +65,47 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate {
         return URL(string: string)
     }
 
+    /// The loader-free path for playlists that flatten completely
+    /// to plain public URLs (the streamxx pattern). Safari proved
+    /// the point on the user's phone (2026-11-14): the rewritten
+    /// playlist — same bytes this loader produces — played
+    /// INSTANTLY when served as a plain playlist file, while the
+    /// same playlist served through this custom-scheme loader
+    /// never played on his device in five builds. So: fetch the
+    /// playlist, rewrite it with the exact loader rules, verify
+    /// that nothing in the result still points at this scheme or
+    /// at a dead proxy path, write it to a local file, and let
+    /// AVPlayer play the file (its segment URLs are absolute
+    /// https — the identical configuration Safari just played).
+    /// Returns nil whenever anything still needs the loader
+    /// (variant playlists, disguised segments), so the caller
+    /// falls back to the proxied asset unchanged.
+    static func materializedPlaylistURL(url: URL, headers: [String: String]) async -> URL? {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 30
+        for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode) else { return nil }
+        let scratch = HLSProxyLoader(headers: headers)
+        let prepared = scratch.prepare(data: data, finalURL: http.url ?? url)
+        guard prepared.contentType == "com.apple.mpegurl",
+              let text = String(data: prepared.data, encoding: .utf8),
+              !text.contains("\(scheme)://"),
+              !text.contains("__hls_proxy/") else { return nil }
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("hls-local", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // Stable per-URL file name (FNV-1a). The file is
+        // rewritten from a fresh fetch on every play, so a
+        // same-name file always holds the current playlist.
+        var hash: UInt64 = 1469598103934665603
+        for byte in url.absoluteString.utf8 { hash = (hash ^ UInt64(byte)) &* 1099511628211 }
+        let file = dir.appendingPathComponent("pl-\(hash).m3u8")
+        guard (try? prepared.data.write(to: file, options: .atomic)) != nil else { return nil }
+        return file
+    }
+
     // MARK: - AVAssetResourceLoaderDelegate
 
     func resourceLoader(_ resourceLoader: AVAssetResourceLoader,
