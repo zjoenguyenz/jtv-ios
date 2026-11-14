@@ -1,0 +1,403 @@
+import SwiftUI
+
+struct MovieDetailView: View {
+    let pluginId: String
+    let movie: Movie
+
+    @EnvironmentObject private var service: MovieService
+    @EnvironmentObject private var favorites: FavoritesManager
+    @EnvironmentObject private var history: WatchHistoryManager
+    @EnvironmentObject private var presenter: PlaybackPresenter
+    @EnvironmentObject private var plugins: PluginManager
+
+    @State private var bundle: MovieService.DetailBundle?
+    @State private var isLoading = true
+    @State private var loadError: String?
+    @State private var selectedServer = 0
+    @State private var showFullDescription = false
+
+    private var detail: MovieDetail? { bundle?.detail }
+    private var isManga: Bool {
+        plugins.installedPlugin(id: pluginId)?.manifest.isManga ?? false
+    }
+    private var isFavorite: Bool {
+        favorites.isFavorite(pluginId: pluginId, movieId: movie.id)
+    }
+    private var historyRecord: HistoryRecord? {
+        history.record(for: pluginId, movieId: movie.id)
+    }
+
+    var body: some View {
+        ZStack {
+            Color.clear.jtvBackground()
+
+            if isLoading {
+                ProgressView().tint(Theme.accent).scaleEffect(1.3)
+            } else if let loadError {
+                ContentUnavailableView("Không tải được phim", systemImage: "wifi.exclamationmark",
+                                       description: Text(loadError))
+            } else if let detail {
+                content(detail)
+            }
+        }
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    favorites.toggle(pluginId: pluginId, movie: snapshotMovie)
+                } label: {
+                    Image(systemName: isFavorite ? "heart.fill" : "heart")
+                        .foregroundStyle(isFavorite ? .red : .white)
+                }
+            }
+        }
+        .task(id: movie.id) {
+            await load()
+        }
+    }
+
+    private var snapshotMovie: Movie { detail?.asMovie ?? movie }
+
+    private func load() async {
+        isLoading = true
+        loadError = nil
+        do {
+            bundle = try await service.detail(pluginId: pluginId, movieId: movie.id)
+        } catch {
+            loadError = error.localizedDescription
+        }
+        isLoading = false
+    }
+
+    // MARK: - Content
+
+    private func content(_ detail: MovieDetail) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                hero(detail)
+                VStack(alignment: .leading, spacing: 18) {
+                    actionRow(detail)
+                    if let record = historyRecord, !record.episodeName.isEmpty {
+                        resumeBanner(record, detail: detail)
+                    }
+                    metaBlock(detail)
+                    if !detail.description.isEmpty {
+                        descriptionBlock(detail)
+                    }
+                    if !detail.castNames.isEmpty {
+                        castsBlock(detail)
+                    }
+                    serversBlock(detail)
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 32)
+            }
+        }
+    }
+
+    private func hero(_ detail: MovieDetail) -> some View {
+        ZStack(alignment: .bottomLeading) {
+            CachedAsyncImage(urlString: detail.backdropUrl.isEmpty ? detail.posterUrl : detail.backdropUrl)
+                .frame(maxWidth: .infinity)
+                .frame(height: 250)
+                .clipped()
+            LinearGradient(colors: [.clear, Theme.bgTop.opacity(0.55), Theme.bgTop],
+                           startPoint: .top, endPoint: .bottom)
+                .frame(height: 250)
+
+            HStack(alignment: .bottom, spacing: 14) {
+                CachedAsyncImage(urlString: detail.posterUrl)
+                    .frame(width: 92, height: 138)
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .strokeBorder(Theme.glassStroke, lineWidth: 1)
+                    )
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(detail.title)
+                        .font(.system(size: 20, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white)
+                        .lineLimit(3)
+                    if !detail.originName.isEmpty {
+                        Text(detail.originName)
+                            .font(.system(size: 12.5, weight: .medium, design: .rounded))
+                            .foregroundStyle(Theme.textDim)
+                            .lineLimit(2)
+                    }
+                    HStack(spacing: 6) {
+                        if detail.year > 0 { Badge(text: String(detail.year), color: Theme.accent) }
+                        if !detail.quality.isEmpty { Badge(text: detail.quality) }
+                        if !detail.lang.isEmpty { Badge(text: detail.lang, color: .white) }
+                        if detail.rating > 0 {
+                            HStack(spacing: 3) {
+                                Image(systemName: "star.fill")
+                                    .font(.system(size: 10))
+                                Text(String(format: "%.1f", detail.rating))
+                                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                            }
+                            .foregroundStyle(Theme.amber)
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 12)
+        }
+    }
+
+    private func actionRow(_ detail: MovieDetail) -> some View {
+        HStack(spacing: 12) {
+            Button {
+                playFirstEpisode(detail)
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: isManga ? "book.fill" : "play.fill")
+                    Text(isManga ? "Đọc ngay" : "Phát ngay")
+                        .font(.system(size: 15, weight: .bold, design: .rounded))
+                }
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 13)
+                .background(
+                    LinearGradient(colors: [Theme.accent, Theme.accent.opacity(0.65)],
+                                   startPoint: .leading, endPoint: .trailing),
+                    in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+                )
+            }
+            .disabled(detail.servers.isEmpty)
+
+            Button {
+                favorites.toggle(pluginId: pluginId, movie: snapshotMovie)
+            } label: {
+                Image(systemName: isFavorite ? "heart.fill" : "heart")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(isFavorite ? .red : .white)
+                    .frame(width: 48, height: 48)
+            }
+            .glassCard(cornerRadius: 14)
+        }
+    }
+
+    private func resumeBanner(_ record: HistoryRecord, detail: MovieDetail) -> some View {
+        Button {
+            resume(record, detail: detail)
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: record.isManga ? "book.pages.fill" : "play.circle.fill")
+                    .font(.system(size: 26))
+                    .foregroundStyle(Theme.accent)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Xem tiếp: \(record.episodeName)")
+                        .font(.system(size: 14, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white)
+                    if !record.isManga && record.duration > 0 {
+                        GeometryReader { geo in
+                            ZStack(alignment: .leading) {
+                                Capsule().fill(Color.white.opacity(0.15))
+                                Capsule().fill(Theme.accent)
+                                    .frame(width: geo.size.width * record.progress)
+                            }
+                        }
+                        .frame(height: 5)
+                    } else if record.isManga {
+                        Text("Đã đọc tới trang \(Int(record.lastPosition) + 1)")
+                            .font(.system(size: 11.5, design: .rounded))
+                            .foregroundStyle(Theme.textDim)
+                    }
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(Theme.textFaint)
+            }
+            .padding(14)
+            .glassCard(cornerRadius: 16)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func metaBlock(_ detail: MovieDetail) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if !detail.episode_current.isEmpty {
+                metaRow(label: "Tiến độ", value: detail.episode_current)
+            }
+            if !detail.category.isEmpty {
+                metaRow(label: "Thể loại", value: detail.category)
+            }
+            if !detail.country.isEmpty {
+                metaRow(label: "Quốc gia", value: detail.country)
+            }
+            if !detail.director.isEmpty {
+                metaRow(label: "Đạo diễn", value: detail.director)
+            }
+        }
+    }
+
+    private func metaRow(label: String, value: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text(label)
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .foregroundStyle(Theme.textFaint)
+                .frame(width: 74, alignment: .leading)
+            Text(value)
+                .font(.system(size: 13.5, design: .rounded))
+                .foregroundStyle(.white.opacity(0.92))
+            Spacer()
+        }
+    }
+
+    private func descriptionBlock(_ detail: MovieDetail) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            SectionHeader(title: "Nội dung")
+            Text(detail.description)
+                .font(.system(size: 13.5, design: .rounded))
+                .foregroundStyle(Theme.textDim)
+                .lineLimit(showFullDescription ? nil : 4)
+            Button(showFullDescription ? "Thu gọn" : "Xem thêm") {
+                withAnimation { showFullDescription.toggle() }
+            }
+            .font(.system(size: 12.5, weight: .semibold, design: .rounded))
+            .foregroundStyle(Theme.accent)
+        }
+    }
+
+    private func castsBlock(_ detail: MovieDetail) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionHeader(title: "Diễn viên")
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(detail.castNames, id: \.self) { name in
+                        NavigationLink {
+                            SearchResultsView(query: name, pluginId: pluginId)
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "person.crop.circle")
+                                    .foregroundStyle(Theme.accent)
+                                Text(name)
+                                    .font(.system(size: 13, weight: .medium, design: .rounded))
+                                    .foregroundStyle(.white)
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .glassCard(cornerRadius: 20)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+    }
+
+    private func serversBlock(_ detail: MovieDetail) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if detail.servers.count > 1 {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(detail.servers.indices, id: \.self) { index in
+                            Button {
+                                selectedServer = index
+                                Haptics.tap()
+                            } label: {
+                                Text(detail.servers[index].name)
+                                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                                    .foregroundStyle(selectedServer == index ? .black : .white)
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 8)
+                                    .background(
+                                        selectedServer == index ? Theme.accent : Theme.glassFill,
+                                        in: Capsule()
+                                    )
+                                    .overlay(
+                                        Capsule().strokeBorder(Theme.glassStroke, lineWidth: 1)
+                                    )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+
+            if detail.servers.indices.contains(selectedServer) {
+                let server = detail.servers[selectedServer]
+                SectionHeader(title: isManga ? "Danh sách chương" : "Danh sách tập")
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: isManga ? 96 : 64), spacing: 10)], spacing: 10) {
+                    ForEach(server.episodes) { episode in
+                        episodeCell(episode, server: server, detail: detail)
+                    }
+                }
+            } else if detail.servers.isEmpty {
+                Text(isManga ? "Chưa có chương nào." : "Chưa có tập nào.")
+                    .font(.system(size: 13.5, design: .rounded))
+                    .foregroundStyle(Theme.textDim)
+            }
+        }
+    }
+
+    private func episodeCell(_ episode: Episode, server: EpisodeServer, detail: MovieDetail) -> some View {
+        let isWatched = historyRecord?.episodeId == episode.id
+        return Button {
+            play(episode: episode, server: server, detail: detail, startPosition: 0, knownStreamURL: "")
+        } label: {
+            Text(episode.name)
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .foregroundStyle(isWatched ? Theme.accent : .white)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 11)
+                .glassCard(cornerRadius: 12)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(isWatched ? Theme.accent.opacity(0.6) : Color.clear, lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - Playback intents
+
+    private func playFirstEpisode(_ detail: MovieDetail) {
+        guard let server = detail.servers.first, let episode = server.episodes.first else { return }
+        selectedServer = 0
+        let known = bundle?.detailStream.url ?? ""
+        play(episode: episode, server: server, detail: detail, startPosition: 0,
+             knownStreamURL: MediaURL.isDirectMedia(known) ? known : "")
+    }
+
+    private func resume(_ record: HistoryRecord, detail: MovieDetail) {
+        let server = detail.servers.first { $0.name == record.serverName } ?? detail.servers.first
+        let episodes = server?.episodes ?? []
+        let episode = episodes.first { $0.id == record.episodeId }
+            ?? Episode(id: record.episodeId, name: record.episodeName, slug: record.episodeId)
+        let request = PlaybackRequest(
+            movie: snapshotMovie,
+            pluginId: pluginId,
+            pluginName: plugins.installedPlugin(id: pluginId)?.manifest.name ?? "",
+            isManga: record.isManga,
+            serverName: server?.name ?? record.serverName,
+            episode: episode,
+            allEpisodes: episodes,
+            startPosition: record.lastPosition,
+            knownStreamURL: record.streamURL,
+            fallbackHeaders: bundle?.detailStream.headers ?? [:]
+        )
+        presenter.request = request
+    }
+
+    private func play(episode: Episode, server: EpisodeServer, detail: MovieDetail,
+                      startPosition: Double, knownStreamURL: String) {
+        let request = PlaybackRequest(
+            movie: snapshotMovie,
+            pluginId: pluginId,
+            pluginName: plugins.installedPlugin(id: pluginId)?.manifest.name ?? "",
+            isManga: isManga,
+            serverName: server.name,
+            episode: episode,
+            allEpisodes: server.episodes,
+            startPosition: startPosition,
+            knownStreamURL: knownStreamURL,
+            fallbackHeaders: bundle?.detailStream.headers ?? [:]
+        )
+        Haptics.tap()
+        presenter.request = request
+    }
+}

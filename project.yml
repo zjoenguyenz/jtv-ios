@@ -1,0 +1,57 @@
+name: JTV
+options:
+  bundleIdPrefix: com.luun.nguyen
+  deploymentTarget:
+    iOS: "17.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    DEVELOPMENT_TEAM: ""
+targets:
+  JTV:
+    type: application
+    platform: iOS
+    sources:
+      - JTV/JTVApp.swift
+      - JTV/ContentView.swift
+      - JTV/Models.swift
+      - JTV/PluginEngine.swift
+      - JTV/PluginManager.swift
+      - JTV/MovieService.swift
+      - JTV/Library.swift
+      - JTV/Cache.swift
+      - JTV/Theme.swift
+      - JTV/HomeView.swift
+      - JTV/CategoryView.swift
+      - JTV/SearchView.swift
+      - JTV/DetailView.swift
+      - JTV/PlayerView.swift
+      - JTV/MangaReaderView.swift
+      - JTV/LibraryView.swift
+      - JTV/SettingsView.swift
+      - JTV/Plugins
+      - JTV/Assets.xcassets
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.luun.nguyen.jtv
+        INFOPLIST_FILE: Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: "JTV"
+        CFBundleName: "JTV"
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UIBackgroundModes:
+          - audio
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+          NSAllowsArbitraryLoadsForMedia: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
