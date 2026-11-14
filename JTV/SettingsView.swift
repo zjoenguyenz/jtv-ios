@@ -123,37 +123,39 @@ struct SettingsView: View {
                     .foregroundStyle(Theme.textDim)
             }
             ForEach(plugins.visiblePlugins) { plugin in
-                Button {
-                    plugins.activePluginId = plugin.id
-                    Haptics.select()
-                } label: {
-                    HStack(spacing: 11) {
-                        CachedAsyncImage(urlString: plugin.manifest.iconUrl)
-                            .frame(width: 30, height: 30)
-                            .clipShape(RoundedRectangle(cornerRadius: 7))
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack(spacing: 6) {
-                                Text(plugin.manifest.name)
-                                    .font(.system(size: 14.5, weight: .semibold, design: .rounded))
-                                    .foregroundStyle(.white)
-                                if plugins.isAdult(plugin.id) {
-                                    Text("18+")
-                                        .font(.system(size: 9, weight: .black, design: .rounded))
-                                        .foregroundStyle(Theme.amber)
-                                }
+                // The whole row is the tap target: tapping anywhere in
+                // the cell selects the source, not just the name text.
+                HStack(spacing: 11) {
+                    CachedAsyncImage(urlString: plugin.manifest.iconUrl)
+                        .frame(width: 30, height: 30)
+                        .clipShape(RoundedRectangle(cornerRadius: 7))
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text(plugin.manifest.name)
+                                .font(.system(size: 14.5, weight: .semibold, design: .rounded))
+                                .foregroundStyle(.white)
+                            if plugins.isAdult(plugin.id) {
+                                Text("18+")
+                                    .font(.system(size: 9, weight: .black, design: .rounded))
+                                    .foregroundStyle(Theme.amber)
                             }
-                            Text(plugin.manifest.type + (plugin.manifest.version.isEmpty ? "" : " • v\(plugin.manifest.version)"))
-                                .font(.system(size: 11.5, design: .rounded))
-                                .foregroundStyle(Theme.textFaint)
                         }
-                        Spacer()
-                        if plugins.activePluginId == plugin.id {
-                            Image(systemName: "checkmark.circle.fill")
-                                .foregroundStyle(Theme.accent)
-                        }
+                        Text(plugin.manifest.type + (plugin.manifest.version.isEmpty ? "" : " • v\(plugin.manifest.version)"))
+                            .font(.system(size: 11.5, design: .rounded))
+                            .foregroundStyle(Theme.textFaint)
+                    }
+                    Spacer()
+                    if plugins.activePluginId == plugin.id {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(Theme.accent)
                     }
                 }
-                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    plugins.activePluginId = plugin.id
+                    Haptics.select()
+                }
             }
         } header: {
             Text("Plugin đang dùng")

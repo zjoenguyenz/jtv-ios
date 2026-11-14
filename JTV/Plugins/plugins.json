@@ -45,7 +45,7 @@
       "version": "2.0.0",
       "scriptUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/plugins/sieutamphim_plugin.js",
       "iconUrl": "https://www.sieutamphim.pro/posts/2024/06/cropped-logosieutamphim-192x192.png",
-      "baseUrl": "https://www.sieutamphim.pro",
+      "baseUrl": "https://www.sieutamphim.site",
       "type": "MOVIE",
       "playerType": "embed"
     },
@@ -166,10 +166,10 @@
     {
       "id": "sayhentai",
       "name": "SayHentai",
-      "version": "1.0.5",
+      "version": "2.0.0",
       "scriptUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/plugins/sayhentai_plugin.js",
-      "iconUrl": "https://sayhentai.sh/favicon-32x32.png",
-      "baseUrl": "https://sayhentai.sh",
+      "iconUrl": "https://sayhentai.wiki/favicon.ico",
+      "baseUrl": "https://sayhentai.wiki",
       "type": "MANGA",
       "adult": true
     },

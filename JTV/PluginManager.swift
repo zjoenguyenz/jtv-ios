@@ -193,6 +193,57 @@ final class PluginManager: ObservableObject {
         return 0
     }
 
+    static func normBase(_ s: String) -> String {
+        s.hasSuffix("/") ? String(s.dropLast()) : s
+    }
+
+    /// Re-points a plugin script at a new base address. plugins.json is
+    /// the single source of truth for where a source lives: when a site
+    /// moves domain, the repo updates one line and the app rewrites the
+    /// installed script itself on the next sync — the same self-healing
+    /// the owner's football apps get from their playlist repo. Rewrites
+    /// plain, host-only and regex-escaped occurrences of the old base.
+    static func rewritingBase(_ script: String, from oldBase: String, to newBase: String) -> String {
+        let old = normBase(oldBase)
+        let new = normBase(newBase)
+        guard !old.isEmpty, !new.isEmpty, old != new else { return script }
+        func esc(_ s: String) -> String {
+            s.replacingOccurrences(of: "/", with: "\\/")
+             .replacingOccurrences(of: ".", with: "\\.")
+        }
+        func host(_ s: String) -> String { s.components(separatedBy: "://").last ?? s }
+        var out = script
+        out = out.replacingOccurrences(of: esc(old), with: esc(new))
+        out = out.replacingOccurrences(of: esc(host(old)), with: esc(host(new)))
+        out = out.replacingOccurrences(of: old, with: new)
+        out = out.replacingOccurrences(of: host(old), with: host(new))
+        return out
+    }
+
+    /// Loads a candidate script and returns its manifest when it runs
+    /// and identifies as the expected plugin.
+    private func validatedManifest(for script: String, pluginId: String) async -> PluginManifest? {
+        let engine = PluginEngine(pluginId: pluginId)
+        await engine.load(script: script)
+        guard let manifest = await engine.manifest(), manifest.id == pluginId else { return nil }
+        return manifest
+    }
+
+    /// Domain self-heal for an already-installed plugin: rewrites the
+    /// on-disk script to the base plugins.json now declares, validates
+    /// the result before it replaces anything, and returns the healed
+    /// manifest. Any failure keeps the working copy untouched.
+    private func healInstalledBase(pluginId: String, fileURL: URL, from oldBase: String, to newBase: String) async -> PluginManifest? {
+        guard let script = try? String(contentsOf: fileURL, encoding: .utf8) else { return nil }
+        let rewritten = Self.rewritingBase(script, from: oldBase, to: newBase)
+        guard rewritten != script,
+              let manifest = await validatedManifest(for: rewritten, pluginId: pluginId),
+              Self.normBase(manifest.baseUrl) == Self.normBase(newBase) else { return nil }
+        try? rewritten.write(to: fileURL, atomically: true, encoding: .utf8)
+        invalidateEngine(for: pluginId)
+        return manifest
+    }
+
     /// Plugins shown in switchers/pickers: installed, adult gate applied,
     /// not user-disabled.
     var visiblePlugins: [InstalledPlugin] {
@@ -336,12 +387,25 @@ final class PluginManager: ObservableObject {
                 var manifest = existing.manifest
                 if entry.adult { manifest.adult = true }
                 if manifest.iconUrl.isEmpty { manifest.iconUrl = entry.iconUrl }
+                // Domain self-heal: if plugins.json says the source
+                // now lives at a new address, re-point the installed
+                // script in place — no download, no version bump.
+                if !entry.baseUrl.isEmpty,
+                   Self.normBase(entry.baseUrl) != Self.normBase(manifest.baseUrl),
+                   let healed = await healInstalledBase(pluginId: entry.id, fileURL: fileURL, from: manifest.baseUrl, to: entry.baseUrl) {
+                    var m = healed
+                    if m.name.isEmpty { m.name = entry.name }
+                    if entry.adult { m.adult = true }
+                    m.scriptUrl = manifest.scriptUrl
+                    manifest = m
+                    changed = true
+                }
                 result.append(InstalledPlugin(manifest: manifest, sourceURL: existing.sourceURL))
                 continue
             }
 
             do {
-                let script = try await Net.fetchText(entry.scriptUrl)
+                var script = try await Net.fetchText(entry.scriptUrl)
                 // Validate first: the script must load and identify
                 // itself as this plugin before it earns the disk slot.
                 let engine = PluginEngine(pluginId: entry.id)
@@ -350,6 +414,19 @@ final class PluginManager: ObservableObject {
                       manifest.id == entry.id else {
                     if let existing { result.append(existing) }
                     continue
+                }
+                // plugins.json wins on where the source lives: if the
+                // downloaded script still points at an old domain,
+                // re-point it (validated) before it is written.
+                if !entry.baseUrl.isEmpty,
+                   Self.normBase(entry.baseUrl) != Self.normBase(manifest.baseUrl) {
+                    let rewritten = Self.rewritingBase(script, from: manifest.baseUrl, to: entry.baseUrl)
+                    if rewritten != script,
+                       let m2 = await validatedManifest(for: rewritten, pluginId: entry.id),
+                       Self.normBase(m2.baseUrl) == Self.normBase(entry.baseUrl) {
+                        script = rewritten
+                        manifest = m2
+                    }
                 }
                 if existing != nil,
                    Self.compareVersions(manifest.version, existing!.manifest.version) < 0 {
