@@ -70,6 +70,9 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         let controller = PlayerSurfaceViewController()
         controller.player = player
         controller.coordinator = context.coordinator
+        context.coordinator.onGiveUp = { [weak controller] in
+            controller?.showError()
+        }
         return controller
     }
 
@@ -80,10 +83,9 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         coordinator.observer.map { coordinator.player?.removeTimeObserver($0) }
         coordinator.observer = nil
         coordinator.player?.pause()
-        // The player screen is really gone (the cover closed): the
-        // app goes back to portrait-only.
-        OrientationHelper.setLock(.portrait)
-        OrientationHelper.requestGeometry(.portrait)
+        // No orientation restore here: the resolver screen owns it
+        // (its onDisappear is the one signal that always means the
+        // player screen closed).
     }
 
     final class Coordinator {
@@ -96,10 +98,14 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
 
         // HLS disguise rescue + dual transport: a stream that
         // starts plain falls back ONCE to the rescue proxy when its
-        // item fails; a stream that starts through the proxy falls
-        // back ONCE to the plain URL. The two transports are
-        // independent, so whichever one is broken on a given
-        // network, the other carries the stream.
+        // item fails OR stalls; a stream that starts through the
+        // proxy falls back ONCE to the plain URL. The two
+        // transports are independent, so whichever one is broken
+        // on a given network, the other carries the stream. If the
+        // second transport also fails or stalls, the surface is
+        // told to show an error instead of spinning forever —
+        // a stall (dead segment host) never marks the item failed,
+        // which is why failure-only detection was not enough.
         var sourceURL: URL?
         var sourceHeaders: [String: String] = [:]
         var proxyLoader: HLSProxyLoader?
@@ -107,6 +113,9 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         var didRetryViaProxy = false
         var startedViaProxy = false
         private var didFallBackToPlain = false
+        private var transportSwitched = false
+        private var stallTimer: Timer?
+        var onGiveUp: (() -> Void)?
 
         init(onProgress: @escaping (Double, Double) -> Void, onExit: @escaping (Double, Double) -> Void) {
             self.onProgress = onProgress
@@ -119,9 +128,36 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
                     DispatchQueue.main.async { self?.handleFailure() }
                 }
             }
+            armStallTimer(for: item)
+        }
+
+        /// A stream whose segments are dead does not fail — it
+        /// buffers forever with an empty loaded range. Give a new
+        /// item 12 seconds to produce ANY buffered media or
+        /// playback progress; if it produced neither, treat it
+        /// exactly like a failure (switch transport once, then
+        /// give up visibly). The window is generous on purpose:
+        /// tunnel-routed sources are slow, not stalled, and they
+        /// buffer something well inside it.
+        private func armStallTimer(for item: AVPlayerItem) {
+            stallTimer?.invalidate()
+            stallTimer = Timer.scheduledTimer(withTimeInterval: 12, repeats: false) { [weak self, weak item] _ in
+                guard let self, let item, self.player?.currentItem === item else { return }
+                let progressed = (self.player?.currentTime().seconds ?? 0) > 0.5
+                let buffered = !item.loadedTimeRanges.isEmpty
+                if !progressed && !buffered && self.player?.timeControlStatus != .playing {
+                    self.handleFailure()
+                }
+            }
         }
 
         private func handleFailure() {
+            stallTimer?.invalidate()
+            if transportSwitched {
+                onGiveUp?()
+                return
+            }
+            transportSwitched = true
             if startedViaProxy {
                 if !didFallBackToPlain { fallBackToPlain() }
             } else {
@@ -212,6 +248,8 @@ final class PlayerSurfaceViewController: UIViewController {
     private let slider = UISlider()
     private let currentLabel = UILabel()
     private let durationLabel = UILabel()
+    private let errorLabel = UILabel()
+    private var gaveUp = false
     private var uiTimer: Timer?
     private var hideTimer: Timer?
     private var controlsVisible = true
@@ -239,6 +277,21 @@ final class PlayerSurfaceViewController: UIViewController {
             spinner.centerYAnchor.constraint(equalTo: view.centerYAnchor),
         ])
         spinner.startAnimating()
+
+        errorLabel.text = "Không phát được nguồn này.\nThử nguồn khác hoặc thử lại sau."
+        errorLabel.font = .systemFont(ofSize: 15, weight: .medium)
+        errorLabel.textColor = .white
+        errorLabel.textAlignment = .center
+        errorLabel.numberOfLines = 0
+        errorLabel.isHidden = true
+        errorLabel.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(errorLabel)
+        NSLayoutConstraint.activate([
+            errorLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            errorLabel.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            errorLabel.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 32),
+            errorLabel.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -32),
+        ])
 
         let tap = UITapGestureRecognizer(target: self, action: #selector(toggleControls))
         view.addGestureRecognizer(tap)
@@ -344,6 +397,15 @@ final class PlayerSurfaceViewController: UIViewController {
         ])
     }
 
+    /// Both transports failed or stalled: stop pretending and
+    /// say so — the resolver's close button is right there.
+    func showError() {
+        gaveUp = true
+        spinner.stopAnimating()
+        controlsView.isHidden = true
+        errorLabel.isHidden = false
+    }
+
     private func refreshUI() {
         guard let player, let item = player.currentItem else { return }
         let current = player.currentTime().seconds
@@ -358,7 +420,7 @@ final class PlayerSurfaceViewController: UIViewController {
         currentLabel.text = Self.formatTime(current.isFinite ? current : 0)
         let playing = player.timeControlStatus == .playing
         playPauseButton.setImage(UIImage(systemName: playing ? "pause.fill" : "play.fill"), for: .normal)
-        let waiting = player.timeControlStatus == .waitingToPlayAtSpecifiedRate || item.status != .readyToPlay
+        let waiting = !gaveUp && (player.timeControlStatus == .waitingToPlayAtSpecifiedRate || item.status != .readyToPlay)
         if waiting { spinner.startAnimating() } else { spinner.stopAnimating() }
     }
 
@@ -631,8 +693,9 @@ private struct EmbedWebView: UIViewControllerRepresentable {
     static func dismantleUIViewController(_ controller: EmbedHostViewController, coordinator: Coordinator) {
         controller.webView?.configuration.userContentController.removeScriptMessageHandler(forName: "m3u8Interceptor")
         controller.webView?.stopLoading()
-        OrientationHelper.setLock(.portrait)
-        OrientationHelper.requestGeometry(.portrait)
+        // No orientation restore here either: promotion to the
+        // native player dismantles this surface too, and the
+        // resolver owns the restore for the whole screen.
     }
 
     final class Coordinator: NSObject, WKScriptMessageHandler {
@@ -796,12 +859,21 @@ struct PlaybackResolverView: View {
         .task {
             await resolve()
         }
-        // No orientation code lives in SwiftUI anymore: appearance
-        // hooks here fired at moments that had nothing to do with
-        // the player leaving (the presented controller covering
-        // the screen reads as "disappeared"), and their portrait
-        // restore is what snapped rotated video back upright. The
-        // UIKit player surfaces own the lock now.
+        // Orientation restore lives HERE and only here. Nothing
+        // presents over this cover anymore (no modal player, no
+        // webview fullscreen), so the resolver's onDisappear can
+        // only mean the player screen really closed. v1.9 kept
+        // the restore inside each surface's dismantle — but the
+        // embed surface is ALSO dismantled when a sniffed stream
+        // promotes the phase from embed to native video (123av,
+        // javhd), and its portrait request landed after the new
+        // surface's landscape request, snapping exactly those two
+        // sources back upright. Direct sources never create an
+        // embed, so they rotated fine.
+        .onDisappear {
+            OrientationHelper.setLock(.portrait)
+            OrientationHelper.requestGeometry(.portrait)
+        }
     }
 
     private var showsCloseButton: Bool {
