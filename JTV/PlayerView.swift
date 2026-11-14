@@ -997,7 +997,8 @@ struct PlaybackResolverView: View {
                     serverName: request.serverName,
                     episodes: request.allEpisodes.isEmpty ? [request.episode] : request.allEpisodes,
                     startEpisode: request.episode,
-                    initialStream: stream
+                    initialStream: stream,
+                    initialIndex: Int(request.startPosition)
                 )
             case .embed(let url, let headers):
                 EmbedPlayerView(url: url, headers: headers) { captured in

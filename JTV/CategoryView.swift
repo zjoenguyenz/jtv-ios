@@ -78,7 +78,7 @@ struct CategoryBrowseView: View {
             .navigationTitle("Thể loại")
             .navigationBarTitleDisplayMode(.large)
             .navigationDestination(for: MovieRoute.self) { route in
-                MovieDetailView(pluginId: route.pluginId, movie: route.movie)
+                MovieDetailView(pluginId: route.pluginId, movie: route.movie, autoResume: route.autoResume)
             }
             .task(id: pluginId) { await load() }
             .onChange(of: plugins.activePluginId) { _, _ in Task { await load() } }

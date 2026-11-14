@@ -44,7 +44,7 @@ struct HomeView: View {
                 }
             }
             .navigationDestination(for: MovieRoute.self) { route in
-                MovieDetailView(pluginId: route.pluginId, movie: route.movie)
+                MovieDetailView(pluginId: route.pluginId, movie: route.movie, autoResume: route.autoResume)
             }
             .task {
                 if !didInitialSync {

@@ -31,7 +31,7 @@ struct SearchView: View {
                         prompt: "Tìm phim, truyện…")
             .onSubmit(of: .search) { submit() }
             .navigationDestination(for: MovieRoute.self) { route in
-                MovieDetailView(pluginId: route.pluginId, movie: route.movie)
+                MovieDetailView(pluginId: route.pluginId, movie: route.movie, autoResume: route.autoResume)
             }
             .onAppear {
                 recentQueries = UserDefaults.standard.stringArray(forKey: recentKey) ?? []

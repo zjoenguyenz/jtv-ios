@@ -3,6 +3,7 @@ import SwiftUI
 struct MovieDetailView: View {
     let pluginId: String
     let movie: Movie
+    var autoResume: Bool = false
 
     @EnvironmentObject private var service: MovieService
     @EnvironmentObject private var favorites: FavoritesManager
@@ -15,16 +16,22 @@ struct MovieDetailView: View {
     @State private var loadError: String?
     @State private var selectedServer = 0
     @State private var showFullDescription = false
+    @State private var recoveredId: String?
+    @State private var didAutoResume = false
 
     private var detail: MovieDetail? { bundle?.detail }
     private var isManga: Bool {
         plugins.installedPlugin(id: pluginId)?.manifest.isManga ?? false
     }
+    /// The identity every store keys on: the id this screen
+    /// was opened with, or the id recovered by title search
+    /// when a stored favorite carried a bad one.
+    private var navId: String { recoveredId ?? movie.id }
     private var isFavorite: Bool {
-        favorites.isFavorite(pluginId: pluginId, movieId: movie.id)
+        favorites.isFavorite(pluginId: pluginId, movieId: navId)
     }
     private var historyRecord: HistoryRecord? {
-        history.record(for: pluginId, movieId: movie.id)
+        history.record(for: pluginId, movieId: navId)
     }
 
     var body: some View {
@@ -57,7 +64,7 @@ struct MovieDetailView: View {
     }
 
     /// The favorite is stored under the NAVIGATION identity
-    /// (movie.id) — the same key isFavorite and the watch
+    /// (navId) — the same key isFavorite and the watch
     /// history check. A plugin's parseDetail may hand back
     /// its own id for the detail object (an API-internal id
     /// rather than the list slug); storing the snapshot
@@ -65,7 +72,7 @@ struct MovieDetailView: View {
     /// forever unfilled, because the check never matched.
     private var snapshotMovie: Movie {
         guard var snap = detail?.asMovie else { return movie }
-        snap.id = movie.id
+        snap.id = navId
         return snap
     }
 
@@ -75,9 +82,38 @@ struct MovieDetailView: View {
         do {
             bundle = try await service.detail(pluginId: pluginId, movieId: movie.id)
         } catch {
-            loadError = error.localizedDescription
+            if let healed = await recoverByTitle() {
+                bundle = healed
+            } else {
+                loadError = error.localizedDescription
+            }
         }
         isLoading = false
+        if autoResume, !didAutoResume, let detail, let record = historyRecord {
+            didAutoResume = true
+            resume(record, detail: detail)
+        }
+    }
+
+    /// Favorites saved by older builds can carry an empty or
+    /// plugin-internal movie id, which no plugin can turn
+    /// into a detail URL ("Plugin không tạo được link dữ
+    /// liệu"). Heal such an entry by finding the title again
+    /// through the plugin's own search, then re-key the
+    /// stored favorite so the next open is direct.
+    private func recoverByTitle() async -> MovieService.DetailBundle? {
+        guard !movie.title.isEmpty,
+              let page = try? await service.search(pluginId: pluginId, keyword: movie.title, page: 1),
+              !page.items.isEmpty else { return nil }
+        let wanted = movie.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let found = page.items.first {
+            $0.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == wanted
+        } ?? (movie.id.isEmpty ? page.items[0] : nil)
+        guard let found, !found.id.isEmpty,
+              let healed = try? await service.detail(pluginId: pluginId, movieId: found.id) else { return nil }
+        recoveredId = found.id
+        favorites.repairMovieId(pluginId: pluginId, from: movie.id, title: movie.title, to: found.id)
+        return healed
     }
 
     // MARK: - Content

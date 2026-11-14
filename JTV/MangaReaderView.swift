@@ -11,6 +11,7 @@ struct MangaReaderView: View {
     let episodes: [Episode]
     let startEpisode: Episode
     let initialStream: StreamInfo
+    let initialIndex: Int
 
     @EnvironmentObject private var service: MovieService
     @EnvironmentObject private var history: WatchHistoryManager
@@ -20,10 +21,12 @@ struct MangaReaderView: View {
     @State private var stream: StreamInfo
     @State private var isLoadingChapter = false
     @State private var loadError: String?
-    @State private var currentIndex: Int = 0
+    @State private var currentIndex: Int
+    @State private var scrollTarget: Int?
 
     init(movie: Movie, pluginId: String, pluginName: String, serverName: String,
-         episodes: [Episode], startEpisode: Episode, initialStream: StreamInfo) {
+         episodes: [Episode], startEpisode: Episode, initialStream: StreamInfo,
+         initialIndex: Int = 0) {
         self.movie = movie
         self.pluginId = pluginId
         self.pluginName = pluginName
@@ -31,16 +34,42 @@ struct MangaReaderView: View {
         self.episodes = episodes
         self.startEpisode = startEpisode
         self.initialStream = initialStream
+        self.initialIndex = max(0, initialIndex)
         _currentEpisode = State(initialValue: startEpisode)
         _stream = State(initialValue: initialStream)
+        _currentIndex = State(initialValue: max(0, initialIndex))
+    }
+
+    /// Chapters in reading order. Plugins hand the episode
+    /// list in whatever order their source uses (often newest
+    /// first); when every name carries a chapter number, sort
+    /// by it so "Chap sau" always means the NEXT chapter.
+    private var orderedEpisodes: [Episode] {
+        var seen = Set<String>()
+        let unique = episodes.filter { seen.insert($0.id).inserted }
+        let numbered = unique.map { (episode: $0, number: chapterNumber(of: $0)) }
+        guard numbered.allSatisfy({ $0.number != nil }) else { return unique }
+        return numbered.sorted { $0.number! < $1.number! }.map { $0.episode }
+    }
+
+    private func chapterNumber(of episode: Episode) -> Double? {
+        var token = ""
+        for ch in episode.name {
+            if ch.isNumber || (ch == "." && !token.isEmpty) {
+                token.append(ch)
+            } else if !token.isEmpty {
+                break
+            }
+        }
+        return Double(token)
     }
 
     private var currentPosition: Int {
-        episodes.firstIndex { $0.id == currentEpisode.id } ?? 0
+        orderedEpisodes.firstIndex { $0.id == currentEpisode.id } ?? 0
     }
 
     private var canGoPrevious: Bool { currentPosition > 0 }
-    private var canGoNext: Bool { currentPosition < episodes.count - 1 }
+    private var canGoNext: Bool { currentPosition < orderedEpisodes.count - 1 }
 
     var body: some View {
         ZStack {
@@ -66,6 +95,7 @@ struct MangaReaderView: View {
                         ForEach(Array(stream.images.enumerated()), id: \.offset) { index, imageURL in
                             CachedAsyncImage(urlString: imageURL, headers: stream.headers, contentMode: .fit)
                                 .frame(maxWidth: .infinity)
+                                .id(index)
                                 .onAppear {
                                     currentIndex = index
                                     saveProgress()
@@ -75,6 +105,7 @@ struct MangaReaderView: View {
                             .padding(.vertical, 28)
                     }
                 }
+                .scrollPosition(id: $scrollTarget)
                 .overlay {
                     if isLoadingChapter {
                         ProgressView().tint(Theme.accent).scaleEffect(1.3)
@@ -88,7 +119,12 @@ struct MangaReaderView: View {
             }
         }
         .statusBarHidden(true)
-        .onAppear { saveProgress() }
+        .onAppear {
+            if initialIndex > 0, scrollTarget == nil, !stream.images.isEmpty {
+                scrollTarget = min(initialIndex, stream.images.count - 1)
+            }
+            saveProgress()
+        }
     }
 
     private var topBar: some View {
@@ -105,7 +141,7 @@ struct MangaReaderView: View {
                     .font(.system(size: 14, weight: .bold, design: .rounded))
                     .foregroundStyle(.white)
                     .lineLimit(1)
-                Text("Chap \(currentEpisode.name)  •  Trang \(min(currentIndex + 1, max(stream.images.count, 1)))/\(stream.images.count)")
+                Text("Chap \(chapterDisplayName)  •  Trang \(min(currentIndex + 1, max(stream.images.count, 1)))/\(stream.images.count)")
                     .font(.system(size: 11, weight: .medium, design: .rounded))
                     .foregroundStyle(.white.opacity(0.7))
             }
@@ -118,31 +154,55 @@ struct MangaReaderView: View {
         )
     }
 
+    /// Episode names often already carry the word ("Chapter
+    /// 68"); the top bar prefixes "Chap" itself.
+    private var chapterDisplayName: String {
+        var name = currentEpisode.name
+        for prefix in ["chapter ", "chap "] where name.lowercased().hasPrefix(prefix) {
+            name = String(name.dropFirst(prefix.count))
+            break
+        }
+        return name
+    }
+
     private var chapterNavButtons: some View {
         HStack(spacing: 14) {
-            Button {
+            chapterButton(title: "Chap trước", systemImage: "chevron.left",
+                          trailingIcon: false, enabled: canGoPrevious) {
                 Task { await goToChapter(offset: -1) }
-            } label: {
-                Label("Chap trước", systemImage: "chevron.left")
             }
-            .disabled(!canGoPrevious || isLoadingChapter)
-
-            Button {
+            chapterButton(title: "Chap sau", systemImage: "chevron.right",
+                          trailingIcon: true, enabled: canGoNext) {
                 Task { await goToChapter(offset: 1) }
-            } label: {
-                Label("Chap sau", systemImage: "chevron.right")
             }
-            .disabled(!canGoNext || isLoadingChapter)
         }
-        .buttonStyle(.bordered)
-        .tint(Theme.accent)
         .font(.system(size: 14, weight: .semibold, design: .rounded))
+    }
+
+    /// Solid pills — the bordered style sank into the
+    /// reader's black background and the buttons looked
+    /// invisible. A disabled direction stays visible as a
+    /// grey pill so the reader never looks broken.
+    private func chapterButton(title: String, systemImage: String, trailingIcon: Bool,
+                               enabled: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                if !trailingIcon { Image(systemName: systemImage) }
+                Text(title)
+                if trailingIcon { Image(systemName: systemImage) }
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 18)
+            .padding(.vertical, 11)
+            .background(enabled ? Theme.accent : Color.white.opacity(0.22), in: Capsule())
+        }
+        .disabled(!enabled || isLoadingChapter)
     }
 
     private func goToChapter(offset: Int) async {
         let target = currentPosition + offset
-        guard episodes.indices.contains(target) else { return }
-        let episode = episodes[target]
+        guard orderedEpisodes.indices.contains(target) else { return }
+        let episode = orderedEpisodes[target]
         isLoadingChapter = true
         defer { isLoadingChapter = false }
         do {
@@ -150,6 +210,7 @@ struct MangaReaderView: View {
             currentEpisode = episode
             stream = resolved
             currentIndex = 0
+            scrollTarget = 0
             saveProgress()
             Haptics.tap()
         } catch {

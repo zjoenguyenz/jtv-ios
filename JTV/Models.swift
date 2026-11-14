@@ -497,6 +497,12 @@ struct PlaybackRequest: Identifiable {
 struct MovieRoute: Hashable {
     var pluginId: String
     var movie: Movie
+    /// Set when the route comes from Continue Watching: the
+    /// detail screen replays the saved progress once loaded,
+    /// so closing the player lands back on the detail screen
+    /// (where another chapter can be picked) instead of
+    /// dropping the user at the library list.
+    var autoResume: Bool = false
 }
 
 // MARK: - URL helpers

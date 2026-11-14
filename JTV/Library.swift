@@ -43,6 +43,20 @@ final class FavoritesManager: ObservableObject {
         save()
     }
 
+    /// Re-keys a stored favorite whose snapshot carries a bad
+    /// movie id (older builds could store the detail's empty
+    /// or plugin-internal id, which made the entry impossible
+    /// to open and the heart impossible to match). Matched by
+    /// plugin + old id + title so sibling entries stay put.
+    func repairMovieId(pluginId: String, from oldId: String, title: String, to newId: String) {
+        guard oldId != newId,
+              let idx = records.firstIndex(where: {
+                  $0.pluginId == pluginId && $0.movie.id == oldId && $0.movie.title == title
+              }) else { return }
+        records[idx].movie.id = newId
+        save()
+    }
+
     func clearAll() {
         records.removeAll()
         save()
