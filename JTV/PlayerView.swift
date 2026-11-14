@@ -214,7 +214,7 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
 /// also fire while the player is merely taking the screen, which
 /// closed the cover underneath a still-playing controller and
 /// left it orphaned and unclosable.
-final class PlayerHostViewController: UIViewController, UIAdaptivePresentationDelegate {
+final class PlayerHostViewController: UIViewController, UIAdaptivePresentationControllerDelegate {
     var playerController: AVPlayerViewController?
     var onPresented: (() -> Void)?
     var onDismissed: (() -> Void)?
