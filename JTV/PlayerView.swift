@@ -22,6 +22,9 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         let item = AVPlayerItem(asset: asset)
         let player = AVPlayer(playerItem: item)
         context.coordinator.player = player
+        context.coordinator.sourceURL = url
+        context.coordinator.sourceHeaders = headers
+        context.coordinator.observe(item: item)
 
         let controller = AVPlayerViewController()
         controller.player = player
@@ -54,9 +57,47 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         private let onProgress: (Double, Double) -> Void
         private let onExit: (Double, Double) -> Void
 
+        // HLS disguise rescue: if the plain item fails to load (the
+        // CDN serves playlists/segments disguised as images, which
+        // AVPlayer refuses), retry ONCE through HLSProxyLoader.
+        var sourceURL: URL?
+        var sourceHeaders: [String: String] = [:]
+        private var proxyLoader: HLSProxyLoader?
+        private var statusObservation: NSKeyValueObservation?
+        private var didRetryViaProxy = false
+
         init(onProgress: @escaping (Double, Double) -> Void, onExit: @escaping (Double, Double) -> Void) {
             self.onProgress = onProgress
             self.onExit = onExit
+        }
+
+        func observe(item: AVPlayerItem) {
+            statusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+                if item.status == .failed {
+                    DispatchQueue.main.async { self?.retryViaProxy() }
+                }
+            }
+        }
+
+        private func retryViaProxy() {
+            guard !didRetryViaProxy,
+                  let player, let sourceURL,
+                  let proxied = HLSProxyLoader.proxiedURL(for: sourceURL) else { return }
+            didRetryViaProxy = true
+            let loader = HLSProxyLoader(headers: sourceHeaders)
+            proxyLoader = loader
+            let asset = AVURLAsset(url: proxied)
+            asset.resourceLoader.setDelegate(loader, queue: DispatchQueue(label: "jtv.hlsproxy.delegate"))
+            let item = AVPlayerItem(asset: asset)
+            // If playback had already progressed, resume where it died.
+            let pos = player.currentTime().seconds
+            if pos.isFinite, pos > 10 {
+                startPosition = pos
+                didSeek = false
+            }
+            player.replaceCurrentItem(with: item)
+            observe(item: item)
+            seekAndPlay()
         }
 
         func seekAndPlay() {

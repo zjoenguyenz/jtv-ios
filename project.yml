@@ -28,6 +28,7 @@ targets:
       - JTV/SearchView.swift
       - JTV/DetailView.swift
       - JTV/PlayerView.swift
+      - JTV/HLSProxy.swift
       - JTV/MangaReaderView.swift
       - JTV/LibraryView.swift
       - JTV/SettingsView.swift
