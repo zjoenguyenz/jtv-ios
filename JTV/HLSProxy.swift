@@ -24,6 +24,7 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate {
     private let headers: [String: String]
     private let session: URLSession
     private var tasks: [ObjectIdentifier: URLSessionDataTask] = [:]
+    private var cancelled: Set<ObjectIdentifier> = []
     private let lock = NSLock()
     /// Playlists already rewritten, by requested URL. Only playlists
     /// are cached (they are tiny); segments are fetched per request
@@ -84,9 +85,22 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate {
         var request = URLRequest(url: url)
         request.timeoutInterval = 30
         for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
-              let http = response as? HTTPURLResponse,
-              (200..<300).contains(http.statusCode) else { return nil }
+        // Same retry policy as the loader: the origins behind
+        // these playlists drop response bodies mid-transfer, and
+        // one dropped fetch used to abandon the whole ladder.
+        var fetched: (data: Data, http: HTTPURLResponse)?
+        for attempt in 1...3 {
+            if let (data, response) = try? await URLSession.shared.data(for: request),
+               let http = response as? HTTPURLResponse {
+                if (200..<300).contains(http.statusCode) {
+                    fetched = (data, http)
+                    break
+                }
+                if http.statusCode < 500 { return nil } // dead/geo: fail fast
+            }
+            if attempt < 3 { try? await Task.sleep(nanoseconds: UInt64(attempt) * 1_000_000_000) }
+        }
+        guard let (data, http) = fetched else { return nil }
         let scratch = HLSProxyLoader(headers: headers)
         let prepared = scratch.prepare(data: data, finalURL: http.url ?? url)
         guard prepared.contentType == "com.apple.mpegurl",
@@ -125,12 +139,43 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate {
 
         var request = URLRequest(url: original)
         for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }
+        startFetch(request, original: original, key: key, loadingRequest: loadingRequest, attempt: 1)
+        return true
+    }
+
+    /// One loader fetch, with the TV player's retry policy
+    /// (Joe TV's RetryPolicy, proven on these same sources):
+    /// network hiccups and 5xx retry up to 3 attempts with
+    /// 1 s / 2 s backoff — Film4K's origin measurably drops
+    /// response bodies mid-transfer, and a single dropped
+    /// fetch used to kill the whole item — while a dead or
+    /// geo-blocked response (4xx) fails at once so the
+    /// transport ladder can move on instead of burning time.
+    private func startFetch(_ request: URLRequest, original: URL, key: String,
+                            loadingRequest: AVAssetResourceLoadingRequest, attempt: Int) {
+        let id = ObjectIdentifier(loadingRequest)
         let task = session.dataTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
             self.lock.lock()
-            self.tasks.removeValue(forKey: ObjectIdentifier(loadingRequest))
+            self.tasks.removeValue(forKey: id)
+            let wasCancelled = self.cancelled.remove(id) != nil
             self.lock.unlock()
-            if loadingRequest.isFinished { return }
+            if wasCancelled || loadingRequest.isFinished { return }
+            let status = (response as? HTTPURLResponse)?.statusCode
+            let retryable = error != nil || (status.map { $0 >= 500 } ?? false)
+            if retryable, attempt < 3 {
+                DispatchQueue.global().asyncAfter(deadline: .now() + Double(attempt)) { [weak self] in
+                    guard let self, !loadingRequest.isFinished else { return }
+                    self.lock.lock()
+                    let cancelledNow = self.cancelled.remove(id) != nil
+                    self.lock.unlock()
+                    if !cancelledNow {
+                        self.startFetch(request, original: original, key: key,
+                                        loadingRequest: loadingRequest, attempt: attempt + 1)
+                    }
+                }
+                return
+            }
             if let error {
                 loadingRequest.finishLoading(with: error)
                 return
@@ -154,16 +199,17 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate {
             self.respond(loadingRequest, data: served.data, contentType: served.contentType)
         }
         lock.lock()
-        tasks[ObjectIdentifier(loadingRequest)] = task
+        tasks[id] = task
         lock.unlock()
         task.resume()
-        return true
     }
 
     func resourceLoader(_ resourceLoader: AVAssetResourceLoader,
                         didCancel loadingRequest: AVAssetResourceLoadingRequest) {
         lock.lock()
-        let task = tasks.removeValue(forKey: ObjectIdentifier(loadingRequest))
+        let id = ObjectIdentifier(loadingRequest)
+        let task = tasks.removeValue(forKey: id)
+        cancelled.insert(id)
         lock.unlock()
         task?.cancel()
     }

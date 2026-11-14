@@ -128,6 +128,8 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         private var didFallBackToPlain = false
         private var transportSwitched = false
         private var stallTimer: Timer?
+        private var stallTicks = 0
+        private var sawProgress = false
         var onGiveUp: ((String?) -> Void)?
         private var didMaterialize = false
         private var ladderPending = false
@@ -262,23 +264,50 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         }
 
         /// A stream whose segments are dead does not fail — it
-        /// buffers forever with an empty loaded range. Give a new
-        /// item 12 seconds to produce ANY buffered media or
-        /// playback progress; if it produced neither, treat it
-        /// exactly like a failure (switch transport once, then
-        /// give up visibly). The window is generous on purpose:
-        /// tunnel-routed sources are slow, not stalled, and they
-        /// buffer something well inside it.
+        /// buffers forever with an empty loaded range. Poll
+        /// every 4 seconds; any playback progress or newly
+        /// buffered media resets the clock. The give-up budget
+        /// mirrors the TV player on these same sources: before
+        /// the first progress it is 48 seconds — that player
+        /// retries a slow load for ~30 s and starts whenever
+        /// 1.5 s has buffered, while the old flat 12 s window
+        /// strangled slow starts (KKPhim through the tunnel,
+        /// Film4K's weak origin) and reported them as dead.
+        /// Once playback has begun, 24 seconds without
+        /// progress is a stall. A user pause never counts.
         private func armStallTimer(for item: AVPlayerItem) {
             stallTimer?.invalidate()
-            stallTimer = Timer.scheduledTimer(withTimeInterval: 12, repeats: false) { [weak self, weak item] _ in
-                guard let self, let item, self.player?.currentItem === item else { return }
-                let progressed = (self.player?.currentTime().seconds ?? 0) > 0.5
-                let buffered = !item.loadedTimeRanges.isEmpty
-                if !progressed && !buffered && self.player?.timeControlStatus != .playing {
+            stallTicks = 0
+            sawProgress = false
+            var lastTime = -1.0
+            var lastBufferedEnd = -1.0
+            var timer: Timer?
+            timer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self, weak item] _ in
+                guard let self, let item, self.player?.currentItem === item else {
+                    timer?.invalidate()
+                    return
+                }
+                if self.player?.timeControlStatus == .paused {
+                    self.stallTicks = 0
+                    return
+                }
+                let now = self.player?.currentTime().seconds ?? 0
+                let bufferedEnd = item.loadedTimeRanges.last?.timeRangeValue.end.seconds ?? -1
+                if now > lastTime + 0.25 || bufferedEnd > lastBufferedEnd + 0.25 {
+                    lastTime = now
+                    lastBufferedEnd = bufferedEnd
+                    self.stallTicks = 0
+                    if now > 0.5 || bufferedEnd > 0 { self.sawProgress = true }
+                    return
+                }
+                self.stallTicks += 1
+                let budget = self.sawProgress ? 6 : 12  // 4 s ticks: 24 s / 48 s
+                if self.stallTicks >= budget {
+                    timer?.invalidate()
                     self.handleFailure()
                 }
             }
+            stallTimer = timer
         }
 
         private func handleFailure() {
