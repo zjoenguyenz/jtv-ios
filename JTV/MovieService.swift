@@ -150,14 +150,14 @@ final class MovieService: ObservableObject {
         if !request.knownStreamURL.isEmpty && MediaURL.isDirectMedia(request.knownStreamURL) {
             var headers = request.fallbackHeaders
             if headers.isEmpty { headers = await defaultHeaders(for: pluginId) }
-            return .video(StreamInfo(url: request.knownStreamURL, headers: headers))
+            return .video(await markProxyIfNeeded(StreamInfo(url: request.knownStreamURL, headers: headers)))
         }
 
         // Direct media target.
         if MediaURL.isDirectMedia(target) {
             var headers = request.fallbackHeaders
             if headers.isEmpty { headers = await defaultHeaders(for: pluginId) }
-            return .video(StreamInfo(url: target, headers: headers))
+            return .video(await markProxyIfNeeded(StreamInfo(url: target, headers: headers)))
         }
 
         guard let engine = try? await engine(for: pluginId) else {
@@ -214,7 +214,7 @@ final class MovieService: ObservableObject {
                 }
                 var resolved = step
                 if resolved.headers.isEmpty { resolved.headers = currentHeaders }
-                return .video(resolved)
+                return .video(await markProxyIfNeeded(resolved))
             }
             // Self-embed (123av's shape): the parser points back at
             // the very page we already fetched. Refetching it changes
@@ -241,6 +241,23 @@ final class MovieService: ObservableObject {
         // Last resort: open the embed in the sniffing webview.
         guard let url = URL(string: lastEmbedURL) else { throw MovieServiceError.unresolvedEpisode }
         return .embed(url: url, headers: await defaultHeaders(for: pluginId))
+    }
+
+    /// Some playlists route their segments through a throwaway
+    /// proxy host (streamxx's /__hls_proxy/…) that can be dead
+    /// while the playlist itself still loads from an edge cache:
+    /// AVPlayer then stalls on the first segment instead of
+    /// failing, so the HLS-proxy rescue retry never engages. Peek
+    /// at the playlist; when it uses that wrapper, mark the stream
+    /// so the player starts through the rescue proxy immediately
+    /// (the proxy unwraps the segment URLs itself).
+    private func markProxyIfNeeded(_ stream: StreamInfo) async -> StreamInfo {
+        guard stream.url.lowercased().contains(".m3u8") else { return stream }
+        guard let text = try? await Net.fetchText(stream.url, headers: stream.headers) else { return stream }
+        guard text.contains("__hls_proxy/") else { return stream }
+        var marked = stream
+        marked.requiresProxy = true
+        return marked
     }
 
     /// Resolves one manga chapter (used by the reader's prev/next).

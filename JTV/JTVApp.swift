@@ -15,12 +15,23 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
 }
 
 enum OrientationHelper {
+    private static var activeScene: UIWindowScene? {
+        UIApplication.shared.connectedScenes
+            .first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene
+    }
+
     static func setLock(_ mask: UIInterfaceOrientationMask) {
         AppDelegate.orientationLock = mask
-        guard let scene = UIApplication.shared.connectedScenes
-            .first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene else { return }
+        guard let scene = activeScene else { return }
         scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask))
         scene.windows.first?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+    }
+
+    /// Asks the scene to actually rotate (used when playback
+    /// starts: video opens in landscape; leaving the player asks
+    /// for portrait back).
+    static func requestGeometry(_ mask: UIInterfaceOrientationMask) {
+        activeScene?.requestGeometryUpdate(.iOS(interfaceOrientations: mask))
     }
 }
 

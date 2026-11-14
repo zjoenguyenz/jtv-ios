@@ -10,6 +10,7 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
     let url: URL
     let headers: [String: String]
     let startPosition: Double
+    var startViaProxy: Bool = false
     var onProgress: (Double, Double) -> Void
     var onExit: (Double, Double) -> Void
     var onClose: () -> Void
@@ -19,7 +20,20 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
     }
 
     func makeUIViewController(context: Context) -> PlayerHostViewController {
-        let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
+        let asset: AVURLAsset
+        if startViaProxy, let proxied = HLSProxyLoader.proxiedURL(for: url) {
+            // The playlist's segments sit behind a dead proxy host
+            // (see MovieService.markProxyIfNeeded): build the first
+            // item through the rescue loader — it unwraps them.
+            let loader = HLSProxyLoader(headers: headers)
+            context.coordinator.proxyLoader = loader
+            context.coordinator.didRetryViaProxy = true
+            let proxiedAsset = AVURLAsset(url: proxied)
+            proxiedAsset.resourceLoader.setDelegate(loader, queue: DispatchQueue(label: "jtv.hlsproxy.delegate"))
+            asset = proxiedAsset
+        } else {
+            asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
+        }
         let item = AVPlayerItem(asset: asset)
         let player = AVPlayer(playerItem: item)
         context.coordinator.player = player
@@ -80,9 +94,9 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         // AVPlayer refuses), retry ONCE through HLSProxyLoader.
         var sourceURL: URL?
         var sourceHeaders: [String: String] = [:]
-        private var proxyLoader: HLSProxyLoader?
+        var proxyLoader: HLSProxyLoader?
         private var statusObservation: NSKeyValueObservation?
-        private var didRetryViaProxy = false
+        var didRetryViaProxy = false
 
         init(onProgress: @escaping (Double, Double) -> Void, onExit: @escaping (Double, Double) -> Void) {
             self.onProgress = onProgress
@@ -165,12 +179,22 @@ final class PlayerHostViewController: UIViewController {
         view.backgroundColor = .black
     }
 
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .allButUpsideDown }
+    override var shouldAutorotate: Bool { true }
+
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         if !didPresent, let playerController {
             didPresent = true
+            playerController.modalPresentationStyle = .fullScreen
             present(playerController, animated: true) { [weak self] in
                 self?.onPresented?()
+                // Video plays landscape: ask the scene to rotate
+                // (the masks above plus the lock the resolver screen
+                // opened permit it; the user can rotate back freely).
+                if let scene = self?.view.window?.windowScene {
+                    scene.requestGeometryUpdate(.iOS(interfaceOrientations: .landscape))
+                }
             }
         } else if didPresent, !didFinish {
             // The player controller was dismissed and the host is
@@ -198,6 +222,7 @@ struct PlayerView: View {
                     url: url,
                     headers: stream.headers,
                     startPosition: request.startPosition,
+                    startViaProxy: stream.requiresProxy,
                     onProgress: { save(position: $0, duration: $1, force: false) },
                     onExit: { save(position: $0, duration: $1, force: true) },
                     onClose: { dismiss() }
@@ -294,13 +319,39 @@ private struct EmbedWebView: UIViewRepresentable {
       if (origFetch) {
         window.fetch = function() {
           var a = arguments[0];
-          report(typeof a === 'string' ? a : (a && a.url) || '');
-          return origFetch.apply(this, arguments);
+          var reqUrl = typeof a === 'string' ? a : (a && a.url) || '';
+          report(reqUrl);
+          var p = origFetch.apply(this, arguments);
+          // Player APIs (123av's /stream) hand the real stream URL
+          // back in a JSON RESPONSE — the request URL never looks
+          // like media, and the page may then play through a blob /
+          // managed-media-source pipeline whose video.src the
+          // poller cannot use. Read the response too.
+          if (reqUrl.indexOf('/stream') !== -1) {
+            p.then(function(r) {
+              try {
+                r.clone().json().then(function(j) {
+                  var s = j && j.media && j.media.stream;
+                  if (s) report(s);
+                }).catch(function() {});
+              } catch (e) {}
+            }).catch(function() {});
+          }
+          return p;
         };
       }
       var origOpen = XMLHttpRequest.prototype.open;
       XMLHttpRequest.prototype.open = function(method, u) {
         report(u);
+        if (typeof u === 'string' && u.indexOf('/stream') !== -1) {
+          this.addEventListener('load', function() {
+            try {
+              var j = JSON.parse(this.responseText);
+              var s = j && j.media && j.media.stream;
+              if (s) report(s);
+            } catch (e) {}
+          });
+        }
         return origOpen.apply(this, arguments);
       };
       if (window.PerformanceObserver) {
@@ -456,7 +507,22 @@ struct PlaybackResolverView: View {
         // the rest of the app stays portrait. The lock lives in the
         // app delegate; the resolver is the one screen that opens it.
         .onAppear { OrientationHelper.setLock(.allButUpsideDown) }
-        .onDisappear { OrientationHelper.setLock(.portrait) }
+        .onDisappear {
+            OrientationHelper.setLock(.portrait)
+            OrientationHelper.requestGeometry(.portrait)
+        }
+        .onChange(of: wantsLandscape) { _, wants in
+            if wants { OrientationHelper.requestGeometry(.landscape) }
+        }
+    }
+
+    /// Landscape is requested once playback actually starts (video
+    /// or embed), not while the resolver spinner is on screen.
+    private var wantsLandscape: Bool {
+        switch phase {
+        case .video, .embed: return true
+        default: return false
+        }
     }
 
     private func resolve() async {

@@ -44,17 +44,6 @@
       "adult": true
     },
     {
-      "id": "sextop2",
-      "name": "Sextop2",
-      "version": "1.1.6",
-      "scriptUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/plugins/sextop2_plugin.js",
-      "iconUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/icons/sextop2.webp",
-      "baseUrl": "https://sextop1.forum",
-      "type": "VIDEO",
-      "playerType": "embed",
-      "adult": true
-    },
-    {
       "id": "topxx",
       "name": "TopXX",
       "version": "1.0.1",

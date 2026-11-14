@@ -439,14 +439,20 @@ struct StreamInfo: Codable {
     var isEmbed: Bool = false
     /// Form body for POST-config hops (e.g. vlxx's ajax player call).
     var postBody: String? = nil
+    /// Start playback through the HLS rescue proxy immediately
+    /// (the playlist's segments sit behind a dead proxy host — see
+    /// MovieService.markProxyIfNeeded). Set by the app only;
+    /// plugin payloads decode it as false.
+    var requiresProxy: Bool = false
 
-    enum CodingKeys: String, CodingKey { case url, headers, subtitles, images, isEmbed, postBody }
+    enum CodingKeys: String, CodingKey { case url, headers, subtitles, images, isEmbed, postBody, requiresProxy }
 
     init(url: String = "", headers: [String: String] = [:],
          subtitles: [SubtitleTrack] = [], images: [String] = [], isEmbed: Bool = false,
-         postBody: String? = nil) {
+         postBody: String? = nil, requiresProxy: Bool = false) {
         self.url = url; self.headers = headers; self.subtitles = subtitles
         self.images = images; self.isEmbed = isEmbed; self.postBody = postBody
+        self.requiresProxy = requiresProxy
     }
 
     init(from decoder: Decoder) throws {
@@ -457,6 +463,7 @@ struct StreamInfo: Codable {
         images = try c.decodeIfPresent([String].self, forKey: .images) ?? []
         isEmbed = try c.decodeIfPresent(Bool.self, forKey: .isEmbed) ?? false
         postBody = try c.decodeIfPresent(String.self, forKey: .postBody) ?? nil
+        requiresProxy = try c.decodeIfPresent(Bool.self, forKey: .requiresProxy) ?? false
     }
 
     var streamURL: URL? { url.isEmpty ? nil : URL(string: url) }
