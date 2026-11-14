@@ -236,10 +236,30 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate {
     }
 
     private static func wrap(_ uri: String, base: URL) -> String {
-        guard let absolute = URL(string: uri, relativeTo: base)?.absoluteURL,
-              absolute.scheme == "http" || absolute.scheme == "https",
-              let proxied = proxiedURL(for: absolute) else { return uri }
+        guard var absolute = URL(string: uri, relativeTo: base)?.absoluteURL,
+              absolute.scheme == "http" || absolute.scheme == "https" else { return uri }
+        // streamxx-style HLS proxies wrap the real file URL as
+        // /__hls_proxy/<base64>. When that proxy dies, the playlist
+        // still loads (edge cache) but every segment returns 502 —
+        // while the wrapped origin file stays publicly fetchable
+        // (topxx, verified 2026-11-14). Unwrap and fetch it directly.
+        if let decoded = decodeProxyWrapped(absolute) { absolute = decoded }
+        guard let proxied = proxiedURL(for: absolute) else { return uri }
         return proxied.absoluteString
+    }
+
+    private static func decodeProxyWrapped(_ url: URL) -> URL? {
+        guard url.path.contains("/__hls_proxy/") else { return nil }
+        var b64 = url.lastPathComponent
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        while b64.count % 4 != 0 { b64 += "=" }
+        guard let data = Data(base64Encoded: b64),
+              let string = String(data: data, encoding: .utf8),
+              string.hasPrefix("http"),
+              let decoded = URL(string: string),
+              (decoded.scheme == "http" || decoded.scheme == "https") else { return nil }
+        return decoded
     }
 
     /// Rewrites every URI="..." attribute on a tag line (EXT-X-MAP,

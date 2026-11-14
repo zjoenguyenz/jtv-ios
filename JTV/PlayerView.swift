@@ -12,12 +12,13 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
     let startPosition: Double
     var onProgress: (Double, Double) -> Void
     var onExit: (Double, Double) -> Void
+    var onClose: () -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(onProgress: onProgress, onExit: onExit)
     }
 
-    func makeUIViewController(context: Context) -> AVPlayerViewController {
+    func makeUIViewController(context: Context) -> PlayerHostViewController {
         let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
         let item = AVPlayerItem(asset: asset)
         let player = AVPlayer(playerItem: item)
@@ -30,27 +31,44 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         controller.player = player
         controller.allowsPictureInPicturePlayback = true
         controller.showsPlaybackControls = true
+        context.coordinator.playerController = controller
 
         let interval = CMTime(seconds: 5, preferredTimescale: 1)
         context.coordinator.observer = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak coordinator = context.coordinator] _ in
             coordinator?.reportProgress()
         }
         context.coordinator.startPosition = startPosition
-        context.coordinator.seekAndPlay()
-        return controller
+
+        // The player controller is PRESENTED modally by the host
+        // instead of embedded. Embedded, the app had to draw its own
+        // close X on top of AVKit's built-in chevron (two buttons
+        // stacked in the same corner) and the player could not
+        // rotate. Presented, AVKit shows exactly one close control,
+        // its chevron really dismisses, and landscape works.
+        let host = PlayerHostViewController()
+        host.playerController = controller
+        host.onPresented = { [weak coordinator = context.coordinator] in
+            coordinator?.seekAndPlay()
+        }
+        host.onDismissed = onClose
+        return host
     }
 
-    func updateUIViewController(_ controller: AVPlayerViewController, context: Context) {}
+    func updateUIViewController(_ controller: PlayerHostViewController, context: Context) {}
 
-    static func dismantleUIViewController(_ controller: AVPlayerViewController, coordinator: Coordinator) {
+    static func dismantleUIViewController(_ controller: PlayerHostViewController, coordinator: Coordinator) {
         coordinator.reportExit()
         coordinator.observer.map { coordinator.player?.removeTimeObserver($0) }
         coordinator.observer = nil
-        controller.player?.pause()
+        if let presented = controller.presentedViewController {
+            presented.dismiss(animated: false)
+        }
+        controller.playerController?.player?.pause()
     }
 
     final class Coordinator {
         var player: AVPlayer?
+        var playerController: AVPlayerViewController?
         var observer: Any?
         var startPosition: Double = 0
         private var didSeek = false
@@ -132,6 +150,37 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
     }
 }
 
+/// Plain host that presents the AVPlayerViewController full-screen
+/// and reports back when the user dismisses it (AVKit's chevron),
+/// so the SwiftUI cover can close too.
+final class PlayerHostViewController: UIViewController {
+    var playerController: AVPlayerViewController?
+    var onPresented: (() -> Void)?
+    var onDismissed: (() -> Void)?
+    private var didPresent = false
+    private var didFinish = false
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        if !didPresent, let playerController {
+            didPresent = true
+            present(playerController, animated: true) { [weak self] in
+                self?.onPresented?()
+            }
+        } else if didPresent, !didFinish {
+            // The player controller was dismissed and the host is
+            // visible again — hand control back to SwiftUI.
+            didFinish = true
+            onDismissed?()
+        }
+    }
+}
+
 // MARK: - Player screen
 
 struct PlayerView: View {
@@ -150,39 +199,20 @@ struct PlayerView: View {
                     headers: stream.headers,
                     startPosition: request.startPosition,
                     onProgress: { save(position: $0, duration: $1, force: false) },
-                    onExit: { save(position: $0, duration: $1, force: true) }
+                    onExit: { save(position: $0, duration: $1, force: true) },
+                    onClose: { dismiss() }
                 )
                 .ignoresSafeArea()
             } else {
-                ContentUnavailableView("Không có link phát", systemImage: "exclamationmark.triangle",
-                                       description: Text("Nguồn không trả về link phát cho tập này."))
+                VStack(spacing: 14) {
+                    ContentUnavailableView("Không có link phát", systemImage: "exclamationmark.triangle",
+                                           description: Text("Nguồn không trả về link phát cho tập này."))
+                    Button("Đóng") { dismiss() }
+                        .buttonStyle(.bordered)
+                        .tint(Theme.accent)
+                }
             }
 
-            VStack {
-                HStack {
-                    Button {
-                        dismiss()
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 14, weight: .bold))
-                            .foregroundStyle(.white)
-                            .frame(width: 36, height: 36)
-                            .background(.ultraThinMaterial, in: Circle())
-                    }
-                    Spacer()
-                }
-                Spacer()
-                if !stream.subtitles.isEmpty {
-                    Text("Phụ đề: " + stream.subtitles.map { $0.displayName }.joined(separator: ", "))
-                        .font(.system(size: 11, weight: .medium, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.75))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .padding(.bottom, 10)
-                }
-            }
-            .padding()
         }
         .statusBarHidden(true)
     }
@@ -212,9 +242,34 @@ struct EmbedPlayerView: View {
     let headers: [String: String]
     var onCapture: (String) -> Void
 
+    @Environment(\.dismiss) private var dismiss
+
     var body: some View {
-        EmbedWebView(url: url, headers: headers, onCapture: onCapture)
-            .ignoresSafeArea()
+        ZStack {
+            Color.black.ignoresSafeArea()
+            EmbedWebView(url: url, headers: headers, onCapture: onCapture)
+                .ignoresSafeArea()
+            // The embed page brings no chrome of ours, and a
+            // fullScreenCover has no exit gesture — without this
+            // overlay the user is trapped in the web player. One
+            // close button, top-left, like everywhere else.
+            VStack {
+                HStack {
+                    Button {
+                        dismiss()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 36, height: 36)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+                    Spacer()
+                }
+                Spacer()
+            }
+            .padding()
+        }
     }
 }
 
@@ -365,7 +420,17 @@ struct PlaybackResolverView: View {
                 )
             case .embed(let url, let headers):
                 EmbedPlayerView(url: url, headers: headers) { captured in
-                    let stream = StreamInfo(url: captured, headers: headers)
+                    // Media CDNs behind embed players (123av's family,
+                    // verified by direct fetch) accept media requests
+                    // only with a Referer from the embed host itself —
+                    // the plugin-site referer gets a 403 on playlist
+                    // and segments alike. The webview page load keeps
+                    // the original headers (that referer also exempts
+                    // the page from its popunder); only the media
+                    // handoff swaps the referer to the embed page.
+                    var mediaHeaders = headers
+                    mediaHeaders["Referer"] = url.absoluteString
+                    let stream = StreamInfo(url: captured, headers: mediaHeaders)
                     phase = .video(stream)
                 }
             case .failed(let message):
@@ -387,6 +452,11 @@ struct PlaybackResolverView: View {
         .task {
             await resolve()
         }
+        // Every playback (native or embed, any source) may rotate;
+        // the rest of the app stays portrait. The lock lives in the
+        // app delegate; the resolver is the one screen that opens it.
+        .onAppear { OrientationHelper.setLock(.allButUpsideDown) }
+        .onDisappear { OrientationHelper.setLock(.portrait) }
     }
 
     private func resolve() async {

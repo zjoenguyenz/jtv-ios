@@ -216,6 +216,15 @@ final class MovieService: ObservableObject {
                 if resolved.headers.isEmpty { resolved.headers = currentHeaders }
                 return .video(resolved)
             }
+            // Self-embed (123av's shape): the parser points back at
+            // the very page we already fetched. Refetching it changes
+            // nothing — hand it to the sniffing webview now, keeping
+            // the plugin's step headers for the page load.
+            if step.url == currentURL, let pageURL = URL(string: step.url) {
+                var pageHeaders = step.headers
+                if pageHeaders.isEmpty { pageHeaders = currentHeaders }
+                return .embed(url: pageURL, headers: pageHeaders)
+            }
             // Follow the hop.
             lastEmbedURL = step.url
             currentURL = step.url

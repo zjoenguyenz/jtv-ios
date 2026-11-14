@@ -1,8 +1,32 @@
 import SwiftUI
+import UIKit
 import AVFoundation
+
+/// App-wide orientation lock. The app is portrait-only everywhere
+/// except the playback screen, which opens the lock while visible
+/// (PlaybackResolverView) so any source can rotate to landscape.
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    static var orientationLock: UIInterfaceOrientationMask = .portrait
+
+    func application(_ application: UIApplication,
+                     supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
+        AppDelegate.orientationLock
+    }
+}
+
+enum OrientationHelper {
+    static func setLock(_ mask: UIInterfaceOrientationMask) {
+        AppDelegate.orientationLock = mask
+        guard let scene = UIApplication.shared.connectedScenes
+            .first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene else { return }
+        scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask))
+        scene.windows.first?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+    }
+}
 
 @main
 struct JTVApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var plugins: PluginManager
     @StateObject private var service: MovieService
     @StateObject private var favorites: FavoritesManager
