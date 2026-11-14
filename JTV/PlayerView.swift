@@ -73,7 +73,13 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         context.coordinator.onGiveUp = { [weak controller] message in
             controller?.showError(message: message)
         }
-        if startViaProxy {
+        if PlaylistSynthesizer.streamxxID(from: url) != nil {
+            // streamxx streams never need their origin host:
+            // the playlist is synthesized from the segment
+            // store (see PlaylistSynthesizer). The item built
+            // above is only a placeholder until it lands.
+            context.coordinator.beginSynthesis()
+        } else if startViaProxy {
             // For playlists that flatten to direct URLs, start
             // the playback ladder (loopback server first — the
             // shape Safari proved); the loader item above is the
@@ -277,6 +283,19 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
 
         private func handleFailure() {
             stallTimer?.invalidate()
+            // Synthesis ladder (streamxx pattern) outranks the
+            // other transports: while synthesis is in flight,
+            // wait for it; then loopback → file → fall through.
+            if synthPending {
+                if let item = player?.currentItem { armStallTimer(for: item) }
+                return
+            }
+            if synthStage == 1, let fileURL = synthFileURL {
+                synthStage = 2
+                swapItem(AVPlayerItem(url: fileURL))
+                return
+            }
+            if synthStage == 2 { synthStage = 3 }
             if startedViaProxy, didMaterialize {
                 // Proxy-first ladder (see upgradeProxyStream):
                 // loopback server → local file → plain URL,
