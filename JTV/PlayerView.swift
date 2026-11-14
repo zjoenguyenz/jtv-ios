@@ -70,8 +70,15 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         let controller = PlayerSurfaceViewController()
         controller.player = player
         controller.coordinator = context.coordinator
-        context.coordinator.onGiveUp = { [weak controller] in
-            controller?.showError()
+        context.coordinator.onGiveUp = { [weak controller] message in
+            controller?.showError(message: message)
+        }
+        if startViaProxy {
+            // For playlists that flatten to direct URLs, start
+            // the playback ladder (loopback server first — the
+            // shape Safari proved); the loader item above is the
+            // placeholder until the ladder's first rung lands.
+            context.coordinator.upgradeProxyStream()
         }
         return controller
     }
@@ -115,37 +122,76 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         private var didFallBackToPlain = false
         private var transportSwitched = false
         private var stallTimer: Timer?
-        var onGiveUp: (() -> Void)?
+        var onGiveUp: ((String?) -> Void)?
         private var didMaterialize = false
+        private var ladderPending = false
+        private var materializedFileURL: URL?
+        private var proxyStage = 0   // 0 loader, 1 loopback server, 2 local file, 3 plain
 
-        /// The loader-free upgrade for proxy-first streams whose
-        /// playlist flattens to direct URLs (see
-        /// HLSProxyLoader.materializedPlaylistURL): as soon as the
-        /// materialized local playlist is ready, swap the loader
-        /// item for a plain file item. If materialization declines
-        /// (anything still needs the loader), nothing changes and
-        /// the loader item carries on. If the file item itself
-        /// later fails or stalls, the normal transport-switch
-        /// machinery treats it like any other failed attempt.
-        func upgradeToMaterializedPlaylist() {
+        /// The playback ladder for proxy-first streams whose
+        /// playlist flattens to direct URLs (the streamxx
+        /// pattern — see HLSProxyLoader.materializedPlaylist).
+        /// Safari proved a NETWORK-served copy of the rewritten
+        /// playlist plays on the user's phone, while the custom-
+        /// scheme loader never did across five builds and the
+        /// local file did not either. So the ladder tries, in
+        /// order: (1) the same bytes served from a loopback HTTP
+        /// server as an ordinary network playlist — the closest
+        /// in-app replica of the Safari proof; (2) the local
+        /// file; (3) the original URL; the loader item built at
+        /// surface creation is the placeholder underneath, and
+        /// the existing fail/stall machinery advances the ladder.
+        /// If materialization declines (anything still needs the
+        /// loader), the ladder never starts and behaviour is
+        /// exactly the pre-ladder dual transport.
+        func upgradeProxyStream() {
             guard !didMaterialize, let sourceURL else { return }
             didMaterialize = true
+            ladderPending = true
             let headers = sourceHeaders
             Task { [weak self] in
-                guard let fileURL = await HLSProxyLoader.materializedPlaylistURL(url: sourceURL, headers: headers) else { return }
+                let prepared = await HLSProxyLoader.materializedPlaylist(url: sourceURL, headers: headers)
                 await MainActor.run {
-                    guard let self, let player = self.player else { return }
-                    let pos = player.currentTime().seconds
-                    if pos.isFinite, pos > 10 {
-                        self.startPosition = pos
-                        self.didSeek = false
+                    guard let self else { return }
+                    self.ladderPending = false
+                    guard let prepared else {
+                        // Declined: if the placeholder item
+                        // already died while waiting, advance the
+                        // normal fallback now.
+                        if self.player?.currentItem?.status == .failed { self.handleFailure() }
+                        return
                     }
-                    let item = AVPlayerItem(url: fileURL)
-                    player.replaceCurrentItem(with: item)
-                    self.observe(item: item)
-                    self.seekAndPlay()
+                    self.materializedFileURL = prepared.fileURL
+                    LocalHLSServer.shared.register(prepared.data) { [weak self] url in
+                        DispatchQueue.main.async {
+                            guard let self else { return }
+                            if let url {
+                                self.proxyStage = 1
+                                self.swapItem(AVPlayerItem(url: url))
+                            } else {
+                                self.proxyStage = 2
+                                self.swapItem(AVPlayerItem(url: prepared.fileURL))
+                            }
+                        }
+                    }
                 }
             }
+        }
+
+        private func swapItem(_ item: AVPlayerItem) {
+            guard let player else { return }
+            let pos = player.currentTime().seconds
+            if pos.isFinite, pos > 10 {
+                startPosition = pos
+                didSeek = false
+            }
+            player.replaceCurrentItem(with: item)
+            observe(item: item)
+            seekAndPlay()
+        }
+
+        private func lastErrorText() -> String? {
+            player?.currentItem?.error?.localizedDescription
         }
 
         init(onProgress: @escaping (Double, Double) -> Void, onExit: @escaping (Double, Double) -> Void) {
@@ -184,8 +230,32 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
 
         private func handleFailure() {
             stallTimer?.invalidate()
+            if startedViaProxy, didMaterialize {
+                // Proxy-first ladder (see upgradeProxyStream):
+                // loopback server → local file → plain URL,
+                // then give up with the player's own error text.
+                if ladderPending {
+                    // The ladder has not landed yet; give the
+                    // current item another stall window instead
+                    // of giving up underneath it.
+                    if let item = player?.currentItem { armStallTimer(for: item) }
+                    return
+                }
+                if proxyStage == 1, let fileURL = materializedFileURL {
+                    proxyStage = 2
+                    swapItem(AVPlayerItem(url: fileURL))
+                    return
+                }
+                if proxyStage <= 2, !didFallBackToPlain {
+                    proxyStage = 3
+                    fallBackToPlain()
+                    return
+                }
+                onGiveUp?(lastErrorText())
+                return
+            }
             if transportSwitched {
-                onGiveUp?()
+                onGiveUp?(lastErrorText())
                 return
             }
             transportSwitched = true
@@ -430,10 +500,18 @@ final class PlayerSurfaceViewController: UIViewController {
 
     /// Both transports failed or stalled: stop pretending and
     /// say so — the resolver's close button is right there.
-    func showError() {
+    func showError(message: String? = nil) {
         gaveUp = true
         spinner.stopAnimating()
         controlsView.isHidden = true
+        if let message, !message.isEmpty {
+            // Surface the player's own error text under the
+            // plain-language line: it names the exact failure
+            // (a rejected playlist, an unreachable host), which
+            // is the evidence needed to fix a source for good
+            // instead of guessing at it.
+            errorLabel.text = "Không phát được nguồn này.\n\(message)"
+        }
         errorLabel.isHidden = false
     }
 

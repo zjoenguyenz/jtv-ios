@@ -29,6 +29,7 @@ targets:
       - JTV/DetailView.swift
       - JTV/PlayerView.swift
       - JTV/HLSProxy.swift
+      - JTV/LocalHLSServer.swift
       - JTV/MangaReaderView.swift
       - JTV/LibraryView.swift
       - JTV/SettingsView.swift
@@ -44,8 +45,8 @@ targets:
       properties:
         CFBundleDisplayName: "JTV"
         CFBundleName: "JTV"
-        CFBundleShortVersionString: "1.12"
-        CFBundleVersion: "16"
+        CFBundleShortVersionString: "1.13"
+        CFBundleVersion: "17"
         UILaunchScreen: {}
         UIBackgroundModes:
           - audio

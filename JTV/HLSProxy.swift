@@ -69,18 +69,18 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate {
     /// to plain public URLs (the streamxx pattern). Safari proved
     /// the point on the user's phone (2026-11-14): the rewritten
     /// playlist — same bytes this loader produces — played
-    /// INSTANTLY when served as a plain playlist file, while the
-    /// same playlist served through this custom-scheme loader
-    /// never played on his device in five builds. So: fetch the
-    /// playlist, rewrite it with the exact loader rules, verify
-    /// that nothing in the result still points at this scheme or
-    /// at a dead proxy path, write it to a local file, and let
-    /// AVPlayer play the file (its segment URLs are absolute
-    /// https — the identical configuration Safari just played).
-    /// Returns nil whenever anything still needs the loader
-    /// (variant playlists, disguised segments), so the caller
-    /// falls back to the proxied asset unchanged.
-    static func materializedPlaylistURL(url: URL, headers: [String: String]) async -> URL? {
+    /// INSTANTLY when served as a plain playlist over the network,
+    /// while the same playlist served through this custom-scheme
+    /// loader never played on his device. So: fetch the playlist,
+    /// rewrite it with the exact loader rules, verify that
+    /// nothing in the result still points at this scheme or at a
+    /// dead proxy path, and hand the caller BOTH a local file
+    /// copy and the bytes themselves (the caller also serves the
+    /// bytes from a loopback HTTP server — the in-app replica of
+    /// the shape Safari played). Returns nil whenever anything
+    /// still needs the loader (variant playlists, disguised
+    /// segments), so the caller keeps the proxied asset.
+    static func materializedPlaylist(url: URL, headers: [String: String]) async -> (fileURL: URL, data: Data)? {
         var request = URLRequest(url: url)
         request.timeoutInterval = 30
         for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }
@@ -103,7 +103,7 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate {
         for byte in url.absoluteString.utf8 { hash = (hash ^ UInt64(byte)) &* 1099511628211 }
         let file = dir.appendingPathComponent("pl-\(hash).m3u8")
         guard (try? prepared.data.write(to: file, options: .atomic)) != nil else { return nil }
-        return file
+        return (fileURL: file, data: prepared.data)
     }
 
     // MARK: - AVAssetResourceLoaderDelegate
@@ -263,8 +263,20 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate {
     static func rewritePlaylist(_ text: String, base: URL) -> String {
         var out: [String] = []
         out.reserveCapacity(1024)
+        var maxInf: Double = 0
+        var targetIdx: Int? = nil
+        var targetVal: Double = 0
         for rawLine in text.components(separatedBy: "\n") {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("#EXTINF:") {
+                let num = line.dropFirst("#EXTINF:".count).prefix { $0 != "," }
+                if let v = Double(String(num)) { maxInf = max(maxInf, v) }
+            }
+            if line.hasPrefix("#EXT-X-TARGETDURATION:") {
+                targetIdx = out.count
+                let num = line.dropFirst("#EXT-X-TARGETDURATION:".count)
+                targetVal = Double(String(num).trimmingCharacters(in: .whitespaces)) ?? 0
+            }
             if line.hasPrefix("#") {
                 out.append(rewriteTagLine(line, base: base))
             } else if line.isEmpty {
@@ -272,6 +284,15 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate {
             } else {
                 out.append(wrap(line, base: base))
             }
+        }
+        // Some origins ship EXTINF values above their own
+        // TARGETDURATION (streamxx: 33.333 s segments under a 33
+        // target) — a spec violation a strict parser may reject.
+        // Raise the target to cover the longest segment. This is
+        // spec-correct for every playlist, so it applies to all
+        // rewritten playlists, not just that origin's.
+        if let idx = targetIdx, maxInf > targetVal {
+            out[idx] = "#EXT-X-TARGETDURATION:\(Int(maxInf.rounded(.up)))"
         }
         return out.joined(separator: "\n")
     }
