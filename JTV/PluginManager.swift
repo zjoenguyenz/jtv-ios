@@ -393,6 +393,30 @@ final class PluginManager: ObservableObject {
         }
     }
 
+    /// Source files may arrive wrapped (base64 of the plain
+    /// text): the repo serves them that way so the contents are
+    /// not readable at a glance, and the app unwraps on arrival.
+    /// Plain files pass through untouched, so both forms sync
+    /// identically — that dual read is what lets the repo flip
+    /// forms later without breaking installs, and scripts are
+    /// always stored on disk unwrapped. Detection is
+    /// structural: a wrapped file consists solely of base64
+    /// characters and whitespace, which real plugin scripts and
+    /// JSON never do (both contain braces, quotes and other
+    /// characters outside that alphabet), and the decode must
+    /// additionally yield valid UTF-8 before it is used, so a
+    /// plain file can never be mangled by a wrong guess.
+    static func unwrapped(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+        guard trimmed.count >= 16,
+              trimmed.allSatisfy({ alphabet.contains($0) || $0.isWhitespace }) else { return text }
+        let compact = trimmed.filter { !$0.isWhitespace }
+        guard let data = Data(base64Encoded: compact),
+              let decoded = String(data: data, encoding: .utf8) else { return text }
+        return decoded
+    }
+
     /// Syncs one source. Updates are version-gated and validated BEFORE
     /// they touch disk: a downloaded script replaces the installed one
     /// only when its own manifest parses, its id matches, and its
@@ -400,7 +424,7 @@ final class PluginManager: ObservableObject {
     /// keeps the working copy — a bad push can never break a source
     /// that works, the same floor the bundled set provides.
     private func syncSource(urlString: String) async throws -> (plugins: [InstalledPlugin], changed: Bool, remoteIds: Set<String>) {
-        let text = try await Net.fetchText(urlString)
+        let text = Self.unwrapped(try await Net.fetchText(urlString))
         guard let data = text.data(using: .utf8) else { throw URLError(.cannotDecodeContentData) }
         let file = try JSONDecoder().decode(PluginManifestFile.self, from: data)
         let remoteIds = Set(file.plugins.map { $0.id })
@@ -436,7 +460,7 @@ final class PluginManager: ObservableObject {
             }
 
             do {
-                var script = try await Net.fetchText(entry.scriptUrl)
+                var script = Self.unwrapped(try await Net.fetchText(entry.scriptUrl))
                 // Validate first: the script must load and identify
                 // itself as this plugin before it earns the disk slot.
                 let engine = PluginEngine(pluginId: entry.id)
