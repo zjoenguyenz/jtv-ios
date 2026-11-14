@@ -101,10 +101,6 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate {
         // same-name file always holds the current playlist.
         var hash: UInt64 = 1469598103934665603
         for byte in url.absoluteString.utf8 { hash = (hash ^ UInt64(byte)) &* 1099511628211 }
-        // Also write the file copy (the ladder's second rung).
-        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("hls-local", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let file = dir.appendingPathComponent("pl-\(hash).m3u8")
         guard (try? prepared.data.write(to: file, options: .atomic)) != nil else { return nil }
         return (fileURL: file, data: prepared.data)
