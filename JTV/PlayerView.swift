@@ -20,6 +20,14 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
     }
 
     func makeUIViewController(context: Context) -> PlayerHostViewController {
+        // Playback may rotate; the rest of the app may not. The
+        // surface owns the lock: opened here, restored in dismantle
+        // (the one callback that only runs when the player screen
+        // is really gone — appearance callbacks also fire when the
+        // presented player merely covers the screen, and restoring
+        // portrait from one of those is what snapped v1.7's video
+        // back upright a moment after it rotated).
+        OrientationHelper.setLock(.allButUpsideDown)
         let asset: AVURLAsset
         if startViaProxy, let proxied = HLSProxyLoader.proxiedURL(for: url) {
             // The playlist's segments sit behind a dead proxy host
@@ -39,6 +47,7 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         context.coordinator.player = player
         context.coordinator.sourceURL = url
         context.coordinator.sourceHeaders = headers
+        context.coordinator.startedViaProxy = startViaProxy
         context.coordinator.observe(item: item)
 
         let controller = AVPlayerViewController()
@@ -78,6 +87,10 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
             presented.dismiss(animated: false)
         }
         controller.playerController?.player?.pause()
+        // The player screen is really gone (the cover closed): the
+        // app goes back to portrait-only.
+        OrientationHelper.setLock(.portrait)
+        OrientationHelper.requestGeometry(.portrait)
     }
 
     final class Coordinator {
@@ -92,11 +105,19 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         // HLS disguise rescue: if the plain item fails to load (the
         // CDN serves playlists/segments disguised as images, which
         // AVPlayer refuses), retry ONCE through HLSProxyLoader.
+        // Streams that START through the proxy (segment-proxy
+        // playlists, see MovieService) get the mirror-image safety
+        // net: if the proxied item fails, fall back ONCE to the
+        // plain URL — the two transports are independent, so
+        // whichever one is broken on a given network, the other
+        // carries the stream.
         var sourceURL: URL?
         var sourceHeaders: [String: String] = [:]
         var proxyLoader: HLSProxyLoader?
         private var statusObservation: NSKeyValueObservation?
         var didRetryViaProxy = false
+        var startedViaProxy = false
+        private var didFallBackToPlain = false
 
         init(onProgress: @escaping (Double, Double) -> Void, onExit: @escaping (Double, Double) -> Void) {
             self.onProgress = onProgress
@@ -106,9 +127,27 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         func observe(item: AVPlayerItem) {
             statusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
                 if item.status == .failed {
-                    DispatchQueue.main.async { self?.retryViaProxy() }
+                    DispatchQueue.main.async { self?.handleFailure() }
                 }
             }
+        }
+
+        private func handleFailure() {
+            if startedViaProxy {
+                if !didFallBackToPlain { fallBackToPlain() }
+            } else {
+                retryViaProxy()
+            }
+        }
+
+        private func fallBackToPlain() {
+            guard let player, let sourceURL else { return }
+            didFallBackToPlain = true
+            let asset = AVURLAsset(url: sourceURL, options: ["AVURLAssetHTTPHeaderFieldsKey": sourceHeaders])
+            let item = AVPlayerItem(asset: asset)
+            player.replaceCurrentItem(with: item)
+            observe(item: item)
+            seekAndPlay()
         }
 
         private func retryViaProxy() {
@@ -167,7 +206,15 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
 /// Plain host that presents the AVPlayerViewController full-screen
 /// and reports back when the user dismisses it (AVKit's chevron),
 /// so the SwiftUI cover can close too.
-final class PlayerHostViewController: UIViewController {
+///
+/// Dismissal is learned ONLY from the presentation controller's
+/// delegate callback — a deterministic UIKit signal. v1.7 inferred
+/// it from the host's viewDidAppear ("visible again = player
+/// dismissed"), but appearance callbacks in this hierarchy can
+/// also fire while the player is merely taking the screen, which
+/// closed the cover underneath a still-playing controller and
+/// left it orphaned and unclosable.
+final class PlayerHostViewController: UIViewController, UIAdaptivePresentationDelegate {
     var playerController: AVPlayerViewController?
     var onPresented: (() -> Void)?
     var onDismissed: (() -> Void)?
@@ -184,24 +231,25 @@ final class PlayerHostViewController: UIViewController {
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
-        if !didPresent, let playerController {
-            didPresent = true
-            playerController.modalPresentationStyle = .fullScreen
-            present(playerController, animated: true) { [weak self] in
-                self?.onPresented?()
-                // Video plays landscape: ask the scene to rotate
-                // (the masks above plus the lock the resolver screen
-                // opened permit it; the user can rotate back freely).
-                if let scene = self?.view.window?.windowScene {
-                    scene.requestGeometryUpdate(.iOS(interfaceOrientations: .landscape))
-                }
+        guard !didPresent, let playerController else { return }
+        didPresent = true
+        playerController.modalPresentationStyle = .fullScreen
+        playerController.presentationController?.delegate = self
+        present(playerController, animated: true) { [weak self] in
+            self?.onPresented?()
+            // Video plays landscape: ask the scene to rotate
+            // (the masks above plus the lock the surface opened
+            // permit it; the user can rotate back freely).
+            if let scene = self?.view.window?.windowScene {
+                scene.requestGeometryUpdate(.iOS(interfaceOrientations: .landscape))
             }
-        } else if didPresent, !didFinish {
-            // The player controller was dismissed and the host is
-            // visible again — hand control back to SwiftUI.
-            didFinish = true
-            onDismissed?()
         }
+    }
+
+    func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+        guard didPresent, !didFinish else { return }
+        didFinish = true
+        onDismissed?()
     }
 }
 
@@ -267,38 +315,20 @@ struct EmbedPlayerView: View {
     let headers: [String: String]
     var onCapture: (String) -> Void
 
-    @Environment(\.dismiss) private var dismiss
-
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             EmbedWebView(url: url, headers: headers, onCapture: onCapture)
                 .ignoresSafeArea()
-            // The embed page brings no chrome of ours, and a
-            // fullScreenCover has no exit gesture — without this
-            // overlay the user is trapped in the web player. One
-            // close button, top-left, like everywhere else.
-            VStack {
-                HStack {
-                    Button {
-                        dismiss()
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 14, weight: .bold))
-                            .foregroundStyle(.white)
-                            .frame(width: 36, height: 36)
-                            .background(.ultraThinMaterial, in: Circle())
-                    }
-                    Spacer()
-                }
-                Spacer()
-            }
-            .padding()
+            // No close chrome of its own: the resolver screen draws
+            // one persistent close button above every phase (this
+            // one included), so the exit is always in the same
+            // place and can never be lost inside the web content.
         }
     }
 }
 
-private struct EmbedWebView: UIViewRepresentable {
+private struct EmbedWebView: UIViewControllerRepresentable {
     let url: URL
     let headers: [String: String]
     var onCapture: (String) -> Void
@@ -374,7 +404,10 @@ private struct EmbedWebView: UIViewRepresentable {
         Coordinator(onCapture: onCapture)
     }
 
-    func makeUIView(context: Context) -> WKWebView {
+    func makeUIViewController(context: Context) -> EmbedHostViewController {
+        // The embed surface owns the orientation lock, exactly
+        // like the native one: opened here, restored in dismantle.
+        OrientationHelper.setLock(.allButUpsideDown)
         let userScript = WKUserScript(source: Self.snifferJS, injectionTime: .atDocumentStart, forMainFrameOnly: false)
         let controller = WKUserContentController()
         controller.addUserScript(userScript)
@@ -393,14 +426,19 @@ private struct EmbedWebView: UIViewRepresentable {
         var request = URLRequest(url: url)
         for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }
         webView.load(request)
-        return webView
+
+        let host = EmbedHostViewController()
+        host.webView = webView
+        return host
     }
 
-    func updateUIView(_ webView: WKWebView, context: Context) {}
+    func updateUIViewController(_ controller: EmbedHostViewController, context: Context) {}
 
-    static func dismantleUIView(_ webView: WKWebView, coordinator: Coordinator) {
-        webView.configuration.userContentController.removeScriptMessageHandler(forName: "m3u8Interceptor")
-        webView.stopLoading()
+    static func dismantleUIViewController(_ controller: EmbedHostViewController, coordinator: Coordinator) {
+        controller.webView?.configuration.userContentController.removeScriptMessageHandler(forName: "m3u8Interceptor")
+        controller.webView?.stopLoading()
+        OrientationHelper.setLock(.portrait)
+        OrientationHelper.requestGeometry(.portrait)
     }
 
     final class Coordinator: NSObject, WKScriptMessageHandler {
@@ -417,6 +455,37 @@ private struct EmbedWebView: UIViewRepresentable {
                   !captured, MediaURL.isDirectMedia(urlString) else { return }
             captured = true
             onCapture(urlString)
+        }
+    }
+}
+
+/// UIKit host for the embed webview: gives the embed the same
+/// orientation behaviour as the native player (landscape on
+/// appear, autorotate while open) with deterministic lifecycle —
+/// viewDidAppear here only ever REQUESTS landscape, it never
+/// restores anything, so a spurious appearance cannot fight it.
+final class EmbedHostViewController: UIViewController {
+    var webView: WKWebView?
+    private var didRequestLandscape = false
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+        if let webView {
+            webView.frame = view.bounds
+            webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            view.addSubview(webView)
+        }
+    }
+
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .allButUpsideDown }
+    override var shouldAutorotate: Bool { true }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        if !didRequestLandscape {
+            didRequestLandscape = true
+            view.window?.windowScene?.requestGeometryUpdate(.iOS(interfaceOrientations: .landscape))
         }
     }
 }
@@ -499,29 +568,52 @@ struct PlaybackResolverView: View {
                 }
                 .padding(24)
             }
+
+            // One persistent exit for the whole player screen,
+            // drawn above every phase except the manga reader
+            // (which has its own chrome). While the native player
+            // is presented it sits in a separate hierarchy above
+            // this cover, so the button is simply not visible then
+            // — AVKit's own close rules. In every other state
+            // (resolving, embed, failed, or a native host left
+            // behind by a dismissal that did not propagate) this
+            // button is here and always closes the screen. v1.6/
+            // v1.7 trapped the user inside embed players and
+            // orphaned native players; an exit that depends on the
+            // content is not an exit.
+            if showsCloseButton {
+                VStack {
+                    HStack {
+                        Button { dismiss() } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 15, weight: .bold))
+                                .foregroundStyle(.white)
+                                .frame(width: 40, height: 40)
+                                .background(Color.black.opacity(0.45), in: Circle())
+                                .overlay(Circle().strokeBorder(Color.white.opacity(0.25), lineWidth: 1))
+                        }
+                        Spacer()
+                    }
+                    Spacer()
+                }
+                .padding()
+            }
         }
         .task {
             await resolve()
         }
-        // Every playback (native or embed, any source) may rotate;
-        // the rest of the app stays portrait. The lock lives in the
-        // app delegate; the resolver is the one screen that opens it.
-        .onAppear { OrientationHelper.setLock(.allButUpsideDown) }
-        .onDisappear {
-            OrientationHelper.setLock(.portrait)
-            OrientationHelper.requestGeometry(.portrait)
-        }
-        .onChange(of: wantsLandscape) { _, wants in
-            if wants { OrientationHelper.requestGeometry(.landscape) }
-        }
+        // No orientation code lives in SwiftUI anymore: appearance
+        // hooks here fired at moments that had nothing to do with
+        // the player leaving (the presented controller covering
+        // the screen reads as "disappeared"), and their portrait
+        // restore is what snapped rotated video back upright. The
+        // UIKit player surfaces own the lock now.
     }
 
-    /// Landscape is requested once playback actually starts (video
-    /// or embed), not while the resolver spinner is on screen.
-    private var wantsLandscape: Bool {
+    private var showsCloseButton: Bool {
         switch phase {
-        case .video, .embed: return true
-        default: return false
+        case .manga: return false
+        default: return true
         }
     }
 

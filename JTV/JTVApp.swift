@@ -3,8 +3,10 @@ import UIKit
 import AVFoundation
 
 /// App-wide orientation lock. The app is portrait-only everywhere
-/// except the playback screen, which opens the lock while visible
-/// (PlaybackResolverView) so any source can rotate to landscape.
+/// except during playback, where the player surfaces themselves
+/// (UIKit representables) open the lock on creation and restore it
+/// when SwiftUI dismantles them — the only lifecycle signals that
+/// cannot fire spuriously when a modal player takes the screen.
 final class AppDelegate: NSObject, UIApplicationDelegate {
     static var orientationLock: UIInterfaceOrientationMask = .portrait
 
@@ -20,11 +22,16 @@ enum OrientationHelper {
             .first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene
     }
 
+    /// Sets the orientation MASK only. It must never request a
+    /// geometry change as a side effect: a mask request is satisfied
+    /// by staying in the current orientation whenever that
+    /// orientation is inside the mask, and coupling the two turned
+    /// every "restore portrait" into an active fight with the
+    /// player's own landscape request. Rotation happens only
+    /// through requestGeometry, called at explicit moments.
     static func setLock(_ mask: UIInterfaceOrientationMask) {
         AppDelegate.orientationLock = mask
-        guard let scene = activeScene else { return }
-        scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask))
-        scene.windows.first?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+        activeScene?.windows.first?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
     }
 
     /// Asks the scene to actually rotate (used when playback

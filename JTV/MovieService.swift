@@ -150,14 +150,14 @@ final class MovieService: ObservableObject {
         if !request.knownStreamURL.isEmpty && MediaURL.isDirectMedia(request.knownStreamURL) {
             var headers = request.fallbackHeaders
             if headers.isEmpty { headers = await defaultHeaders(for: pluginId) }
-            return .video(await markProxyIfNeeded(StreamInfo(url: request.knownStreamURL, headers: headers)))
+            return .video(await markProxyIfNeeded(StreamInfo(url: request.knownStreamURL, headers: headers), pluginId: pluginId))
         }
 
         // Direct media target.
         if MediaURL.isDirectMedia(target) {
             var headers = request.fallbackHeaders
             if headers.isEmpty { headers = await defaultHeaders(for: pluginId) }
-            return .video(await markProxyIfNeeded(StreamInfo(url: target, headers: headers)))
+            return .video(await markProxyIfNeeded(StreamInfo(url: target, headers: headers), pluginId: pluginId))
         }
 
         guard let engine = try? await engine(for: pluginId) else {
@@ -214,7 +214,7 @@ final class MovieService: ObservableObject {
                 }
                 var resolved = step
                 if resolved.headers.isEmpty { resolved.headers = currentHeaders }
-                return .video(await markProxyIfNeeded(resolved))
+                return .video(await markProxyIfNeeded(resolved, pluginId: pluginId))
             }
             // Self-embed (123av's shape): the parser points back at
             // the very page we already fetched. Refetching it changes
@@ -251,7 +251,22 @@ final class MovieService: ObservableObject {
     /// at the playlist; when it uses that wrapper, mark the stream
     /// so the player starts through the rescue proxy immediately
     /// (the proxy unwraps the segment URLs itself).
-    private func markProxyIfNeeded(_ stream: StreamInfo) async -> StreamInfo {
+    ///
+    /// Film4K is marked unconditionally: its segments are fMP4
+    /// files wrapped in PNG images (the TV app's v1.6.4 round
+    /// closed its Film4K saga — the service itself is healthy,
+    /// just slow through the tunnel, and the app's fetch layer is
+    /// already patient). A wrapped segment makes AVPlayer stall
+    /// rather than fail, which is exactly the case the plain-first
+    /// retry cannot rescue; starting through the loader (which
+    /// strips the wrappers) is the reliable order, and v1.8's
+    /// proxied→plain fallback covers the reverse if ever needed.
+    private func markProxyIfNeeded(_ stream: StreamInfo, pluginId: String) async -> StreamInfo {
+        if pluginId == "film4k", stream.url.lowercased().contains(".m3u8") {
+            var marked = stream
+            marked.requiresProxy = true
+            return marked
+        }
         guard stream.url.lowercased().contains(".m3u8") else { return stream }
         guard let text = try? await Net.fetchText(stream.url, headers: stream.headers) else { return stream }
         guard text.contains("__hls_proxy/") else { return stream }
