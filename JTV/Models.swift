@@ -437,13 +437,16 @@ struct StreamInfo: Codable {
     var subtitles: [SubtitleTrack] = []
     var images: [String] = []
     var isEmbed: Bool = false
+    /// Form body for POST-config hops (e.g. vlxx's ajax player call).
+    var postBody: String? = nil
 
-    enum CodingKeys: String, CodingKey { case url, headers, subtitles, images, isEmbed }
+    enum CodingKeys: String, CodingKey { case url, headers, subtitles, images, isEmbed, postBody }
 
     init(url: String = "", headers: [String: String] = [:],
-         subtitles: [SubtitleTrack] = [], images: [String] = [], isEmbed: Bool = false) {
+         subtitles: [SubtitleTrack] = [], images: [String] = [], isEmbed: Bool = false,
+         postBody: String? = nil) {
         self.url = url; self.headers = headers; self.subtitles = subtitles
-        self.images = images; self.isEmbed = isEmbed
+        self.images = images; self.isEmbed = isEmbed; self.postBody = postBody
     }
 
     init(from decoder: Decoder) throws {
@@ -453,6 +456,7 @@ struct StreamInfo: Codable {
         subtitles = try c.decodeIfPresent([SubtitleTrack].self, forKey: .subtitles) ?? []
         images = try c.decodeIfPresent([String].self, forKey: .images) ?? []
         isEmbed = try c.decodeIfPresent(Bool.self, forKey: .isEmbed) ?? false
+        postBody = try c.decodeIfPresent(String.self, forKey: .postBody) ?? nil
     }
 
     var streamURL: URL? { url.isEmpty ? nil : URL(string: url) }

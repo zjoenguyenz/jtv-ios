@@ -94,6 +94,39 @@ enum Net {
         throw lastError
     }
 
+    /// POST variant for plugin hop configs that carry a postBody
+    /// (e.g. vlxx's /ajax.php player call). Same retry policy.
+    static func fetchTextPOST(_ urlString: String, body: String, headers: [String: String] = [:]) async throws -> String {
+        guard let url = URL(string: urlString) else {
+            throw URLError(.badURL)
+        }
+        var lastError: Error = URLError(.unknown)
+        for attempt in 0..<3 {
+            do {
+                var req = makeRequest(url: url, headers: headers)
+                req.httpMethod = "POST"
+                req.timeoutInterval = 20
+                if req.value(forHTTPHeaderField: "Content-Type") == nil {
+                    req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+                }
+                req.httpBody = body.data(using: .utf8)
+                let (data, response) = try await session.data(for: req)
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 200
+                if !(200...299).contains(status) {
+                    throw URLError(.badServerResponse)
+                }
+                return String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+            } catch {
+                if (error as? URLError)?.code == .cancelled { throw error }
+                lastError = error
+                if attempt < 2 {
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                }
+            }
+        }
+        throw lastError
+    }
+
     static func fetchData(_ urlString: String, headers: [String: String] = [:]) async throws -> Data {
         guard let url = URL(string: urlString) else { throw URLError(.badURL) }
         let (data, _) = try await session.data(for: makeRequest(url: url, headers: headers))

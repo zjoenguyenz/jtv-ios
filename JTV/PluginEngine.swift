@@ -169,27 +169,29 @@ final class PluginEngine {
         return (url?.isEmpty == false) ? url : nil
     }
 
-    func parseMovieDetail(text: String) async -> MovieDetail? {
+    func parseMovieDetail(text: String, url: String = "") async -> MovieDetail? {
         guard await hasFunction("parseMovieDetail"),
-              let json = try? await callString("parseMovieDetail", args: [text]) else { return nil }
+              let json = try? await callString("parseMovieDetail", args: [text, url]) else { return nil }
         let trimmed = json.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed == "null" || trimmed.isEmpty { return nil }
         return try? decode(MovieDetail.self, from: trimmed, function: "parseMovieDetail")
     }
 
     /// parseDetailResponse on any fetched payload (detail JSON, chapter
-    /// JSON, or embed HTML depending on the plugin).
-    func parseStream(text: String) async -> StreamInfo {
+    /// JSON, or embed HTML depending on the plugin). The plugin contract
+    /// is (payload, sourceURL) — parsers branch on the URL (e.g. njav's
+    /// /vv/ vs /jm/ steps), so the URL must always be passed.
+    func parseStream(text: String, url: String = "") async -> StreamInfo {
         guard await hasFunction("parseDetailResponse"),
-              let json = try? await callString("parseDetailResponse", args: [text]) else {
+              let json = try? await callString("parseDetailResponse", args: [text, url]) else {
             return StreamInfo()
         }
         return (try? decode(StreamInfo.self, from: json, function: "parseDetailResponse")) ?? StreamInfo()
     }
 
-    func parseEmbed(html: String) async -> StreamInfo? {
+    func parseEmbed(html: String, url: String = "") async -> StreamInfo? {
         guard await hasFunction("parseEmbedResponse"),
-              let json = try? await callString("parseEmbedResponse", args: [html]) else { return nil }
+              let json = try? await callString("parseEmbedResponse", args: [html, url]) else { return nil }
         return try? decode(StreamInfo.self, from: json, function: "parseEmbedResponse")
     }
 
