@@ -101,6 +101,10 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate {
         // same-name file always holds the current playlist.
         var hash: UInt64 = 1469598103934665603
         for byte in url.absoluteString.utf8 { hash = (hash ^ UInt64(byte)) &* 1099511628211 }
+        // Also write the file copy (the ladder's second rung).
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("hls-local", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let file = dir.appendingPathComponent("pl-\(hash).m3u8")
         guard (try? prepared.data.write(to: file, options: .atomic)) != nil else { return nil }
         return (fileURL: file, data: prepared.data)
@@ -371,5 +375,173 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate {
         case "mp3": return "public.mp3"
         default: return "public.data"
         }
+    }
+}
+
+// MARK: - Playlist synthesis for the streamxx pattern
+
+/// For embed.streamxx.net playlists the app never needs the
+/// origin host at all. Measured across several titles
+/// (2026-11-14), every segment of every title lives at one
+/// regular address —
+/// https://f005.backblazeb2.com/file/central-repository/hls-backups/<streamId>/playlistNNNNN.ts
+/// — numbered from 0 with no gaps, and the stream id in that
+/// address is the same id the plugin puts in the streamxx URL.
+/// The origin playlist host stalls or refuses the user's phone
+/// on every in-app path tried (six builds: the resolver reaches
+/// the player, then no item ever parses a playlist), while
+/// Backblaze answers his phone directly — proven in Safari,
+/// where the unwrapped playlist played instantly. So the
+/// player builds the playlist itself: probe which segments
+/// exist (HEAD requests), measure each segment's real duration
+/// from its first and last PCR timestamps (two small range
+/// fetches per segment; the method measured 33.300 s against a
+/// true 33.333 s on the reference title), then serve the
+/// synthesized playlist from the loopback server, with the
+/// file copy as the next rung. Any step failing declines the
+/// synthesis and the existing transports carry on unchanged.
+enum PlaylistSynthesizer {
+
+    static func streamxxID(from url: URL) -> String? {
+        guard url.host == "embed.streamxx.net" else { return nil }
+        let parts = url.pathComponents
+        guard let i = parts.firstIndex(of: "stream"), i + 1 < parts.count else { return nil }
+        let id = parts[i + 1]
+        return id.isEmpty ? nil : id
+    }
+
+    private static func segmentName(_ idx: Int) -> String {
+        String(format: "playlist%05d.ts", idx)
+    }
+
+    static func synthesize(streamID: String) async -> (data: Data, fileURL: URL)? {
+        let base = "https://f005.backblazeb2.com/file/central-repository/hls-backups/\(streamID)"
+        let session = URLSession.shared
+
+        func head(_ idx: Int) async -> Int? {
+            guard let u = URL(string: "\(base)/\(segmentName(idx))") else { return nil }
+            var req = URLRequest(url: u)
+            req.httpMethod = "HEAD"
+            req.timeoutInterval = 15
+            guard let (_, resp) = try? await session.data(for: req),
+                  let http = resp as? HTTPURLResponse, http.statusCode == 200 else { return nil }
+            return http.expectedContentLength > 0 ? Int(http.expectedContentLength) : nil
+        }
+
+        // Probe existence in batches of six; segments are
+        // contiguous from 0, so the first miss ends the title.
+        var sizes: [Int] = []
+        var idx = 0
+        outer: while sizes.count < 400 {
+            let batch = await withTaskGroup(of: (Int, Int?).self) { group in
+                for k in 0..<6 {
+                    let i = idx + k
+                    group.addTask { (i, await head(i)) }
+                }
+                var results: [(Int, Int?)] = []
+                for await r in group { results.append(r) }
+                return results.sorted { $0.0 < $1.0 }
+            }
+            for (_, size) in batch {
+                guard let size else { break outer }
+                sizes.append(size)
+            }
+            idx += 6
+        }
+        guard !sizes.isEmpty else { return nil }
+
+        // Measure durations in parallel.
+        let durations = await withTaskGroup(of: (Int, Double).self) { group in
+            for (i, size) in sizes.enumerated() {
+                group.addTask { (i, await segmentDuration(base: base, index: i, size: size, session: session) ?? 0) }
+            }
+            var ds = [Double](repeating: 0, count: sizes.count)
+            for await (i, d) in group { ds[i] = d }
+            return ds
+        }
+        let measured = durations.filter { $0 > 0 }
+        let fallback = measured.isEmpty ? 10.0 : measured.sorted()[measured.count / 2]
+        // EXTINF gets a small upward bias: overstating a
+        // segment's length slightly is harmless, understating
+        // it can make a strict parser distrust the playlist.
+        let exts: [Double] = durations.map { ($0 > 0 ? $0 : fallback) + 0.05 }
+        var lines = ["#EXTM3U", "#EXT-X-VERSION:3",
+                     "#EXT-X-TARGETDURATION:\(Int((exts.max() ?? 0).rounded(.up)))",
+                     "#EXT-X-MEDIA-SEQUENCE:0"]
+        for (i, d) in exts.enumerated() {
+            lines.append(String(format: "#EXTINF:%.3f,", d))
+            lines.append("\(base)/\(segmentName(i))")
+        }
+        lines.append("#EXT-X-ENDLIST")
+        let data = Data(lines.joined(separator: "\n").utf8)
+
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("hls-local", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let file = dir.appendingPathComponent("synth-\(streamID).m3u8")
+        guard (try? data.write(to: file, options: .atomic)) != nil else { return nil }
+        return (data: data, fileURL: file)
+    }
+
+    /// Duration of one TS segment from its PCR timestamps: the
+    /// first PCR in the head slice and the last PCR in the tail
+    /// slice. The tail slice starts at an arbitrary byte offset,
+    /// so its packet alignment is found first (0x47 repeating
+    /// every 188 bytes).
+    private static func segmentDuration(base: String, index: Int, size: Int, session: URLSession) async -> Double? {
+        guard let u = URL(string: "\(base)/\(segmentName(index))") else { return nil }
+        func range(_ r: String) async -> Data? {
+            var req = URLRequest(url: u)
+            req.timeoutInterval = 15
+            req.setValue("bytes=\(r)", forHTTPHeaderField: "Range")
+            guard let (d, resp) = try? await session.data(for: req),
+                  let http = resp as? HTTPURLResponse,
+                  http.statusCode == 206 || http.statusCode == 200 else { return nil }
+            return d
+        }
+        let span = 48 * 1024
+        async let headD = range("0-\(span - 1)")
+        async let tailD = range("\(max(0, size - span))-\(size - 1)")
+        guard let head = await headD, let first = pcrs(head, aligned: true).first else { return nil }
+        var end = pcrs(await tailD ?? Data(), aligned: false).last
+        if end == nil { end = pcrs(head, aligned: true).last }
+        guard let last = end else { return nil }
+        var d = last - first
+        if d < 0 { d += 95443.72 }  // PCR base wraps at 2^33 / 90000 s
+        return d > 0 && d < 3600 ? d : nil
+    }
+
+    private static func pcrs(_ data: Data, aligned: Bool) -> [Double] {
+        var out: [Double] = []
+        var start = 0
+        if !aligned {
+            var found = false
+            for i in 0..<188 where i + 376 < data.count {
+                if data[i] == 0x47 && data[i + 188] == 0x47 && data[i + 376] == 0x47 {
+                    start = i
+                    found = true
+                    break
+                }
+            }
+            if !found { return out }
+        }
+        var i = start
+        while i + 188 <= data.count {
+            if data[i] == 0x47 {
+                let adaptation = (data[i + 3] >> 4) & 0x3
+                if adaptation == 2 || adaptation == 3 {
+                    let afl = Int(data[i + 4])
+                    if afl >= 7 && data[i + 5] & 0x10 != 0 {
+                        let b = i + 6
+                        let base = (UInt64(data[b]) << 25) | (UInt64(data[b + 1]) << 17)
+                            | (UInt64(data[b + 2]) << 9) | (UInt64(data[b + 3]) << 1)
+                            | (UInt64(data[b + 4]) >> 7)
+                        out.append(Double(base) / 90000.0)
+                    }
+                }
+            }
+            i += 188
+        }
+        return out
     }
 }

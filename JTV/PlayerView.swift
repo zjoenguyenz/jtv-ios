@@ -127,6 +127,53 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         private var ladderPending = false
         private var materializedFileURL: URL?
         private var proxyStage = 0   // 0 loader, 1 loopback server, 2 local file, 3 plain
+        private var synthPending = false
+        private var synthStage = 0   // 0 none, 1 loopback, 2 file, 3 exhausted
+        private var synthFileURL: URL?
+
+        /// The synthesis path for embed.streamxx.net streams
+        /// (see PlaylistSynthesizer): the origin playlist host
+        /// never answers this phone usefully, so the playlist is
+        /// rebuilt from the segment store directly and swapped
+        /// in — loopback server first, the file copy as the next
+        /// rung, the ordinary transports after that. Runs for
+        /// these streams INSTEAD of the materialize ladder, and
+        /// regardless of whether the stream was proxy-marked
+        /// (the marking preflight needs the same dead host, so
+        /// on this network it usually fails and the stream
+        /// arrives unmarked).
+        func beginSynthesis() {
+            guard let sourceURL, PlaylistSynthesizer.streamxxID(from: sourceURL) != nil else { return }
+            synthPending = true
+            let id = PlaylistSynthesizer.streamxxID(from: sourceURL)!
+            Task { [weak self] in
+                let result = await PlaylistSynthesizer.synthesize(streamID: id)
+                await MainActor.run {
+                    guard let self else { return }
+                    self.synthPending = false
+                    guard let result else {
+                        if self.player?.currentItem?.status == .failed { self.handleFailure() }
+                        return
+                    }
+                    self.synthFileURL = result.fileURL
+                    LocalHLSServer.shared.register(result.data) { [weak self] url in
+                        DispatchQueue.main.async {
+                            guard let self else { return }
+                            // Never swap away from content that
+                            // is already playing.
+                            if (self.player?.currentTime().seconds ?? 0) > 0.5 { return }
+                            if let url {
+                                self.synthStage = 1
+                                self.swapItem(AVPlayerItem(url: url))
+                            } else {
+                                self.synthStage = 2
+                                self.swapItem(AVPlayerItem(url: result.fileURL))
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         /// The playback ladder for proxy-first streams whose
         /// playlist flattens to direct URLs (the streamxx
