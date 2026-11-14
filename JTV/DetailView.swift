@@ -56,7 +56,18 @@ struct MovieDetailView: View {
         }
     }
 
-    private var snapshotMovie: Movie { detail?.asMovie ?? movie }
+    /// The favorite is stored under the NAVIGATION identity
+    /// (movie.id) — the same key isFavorite and the watch
+    /// history check. A plugin's parseDetail may hand back
+    /// its own id for the detail object (an API-internal id
+    /// rather than the list slug); storing the snapshot
+    /// under that id saved the favorite yet left the heart
+    /// forever unfilled, because the check never matched.
+    private var snapshotMovie: Movie {
+        guard var snap = detail?.asMovie else { return movie }
+        snap.id = movie.id
+        return snap
+    }
 
     private func load() async {
         isLoading = true
