@@ -321,6 +321,9 @@ final class PluginManager: ObservableObject {
         var newInstalled: [InstalledPlugin] = []
         var newSources: [PluginSource] = []
         var anyChanged = false
+        /// Id sets from sources that synced successfully this pass —
+        /// the authority for the deletion rule below.
+        var authoritative: [String: Set<String>] = [:]
 
         for source in sources {
             do {
@@ -328,6 +331,7 @@ final class PluginManager: ObservableObject {
                 newInstalled.append(contentsOf: synced.plugins)
                 newSources.append(PluginSource(url: source.url, pluginIds: synced.plugins.map { $0.id }))
                 anyChanged = anyChanged || synced.changed
+                authoritative[source.url] = synced.remoteIds
             } catch {
                 if (error as? URLError)?.code == .badServerResponse {
                     // 404/403 from the raw host — for the owner's own
@@ -343,8 +347,34 @@ final class PluginManager: ObservableObject {
             }
         }
 
+        // Deletion is authoritative (user order): a plugin the repo
+        // no longer lists is removed from the device entirely —
+        // script file, engine, list entry — instead of merely being
+        // hidden until the next launch. The bundled floor answers to
+        // the default source's list. A source that failed to sync,
+        // or whose list came back empty, purges nothing: a bad fetch
+        // or a bad push can never wipe the library.
+        var purgedIds = Set<String>()
+        for (sourceURL, remoteIds) in authoritative where !remoteIds.isEmpty {
+            for plugin in installed where plugin.sourceURL == sourceURL && !remoteIds.contains(plugin.id) {
+                purgedIds.insert(plugin.id)
+            }
+            if sourceURL == Self.defaultSourceURL {
+                for plugin in installed where plugin.sourceURL == "bundled" && !remoteIds.contains(plugin.id) {
+                    purgedIds.insert(plugin.id)
+                }
+            }
+        }
+        for pluginId in purgedIds {
+            try? FileManager.default.removeItem(at: scriptFileURL(for: pluginId))
+            invalidateEngine(for: pluginId)
+            disabledIds.remove(pluginId)
+        }
+        if !purgedIds.isEmpty { anyChanged = true }
+        newInstalled.removeAll { purgedIds.contains($0.id) }
+
         // Bundled plugins are not owned by any remote source; always keep them.
-        newInstalled.append(contentsOf: installed.filter { $0.sourceURL == "bundled" })
+        newInstalled.append(contentsOf: installed.filter { $0.sourceURL == "bundled" && !purgedIds.contains($0.id) })
 
         // De-duplicate by plugin id (first source wins).
         var seen = Set<String>()
@@ -369,10 +399,11 @@ final class PluginManager: ObservableObject {
     /// version is newer (or the plugin is new). A failed or older entry
     /// keeps the working copy — a bad push can never break a source
     /// that works, the same floor the bundled set provides.
-    private func syncSource(urlString: String) async throws -> (plugins: [InstalledPlugin], changed: Bool) {
+    private func syncSource(urlString: String) async throws -> (plugins: [InstalledPlugin], changed: Bool, remoteIds: Set<String>) {
         let text = try await Net.fetchText(urlString)
         guard let data = text.data(using: .utf8) else { throw URLError(.cannotDecodeContentData) }
         let file = try JSONDecoder().decode(PluginManifestFile.self, from: data)
+        let remoteIds = Set(file.plugins.map { $0.id })
 
         var result: [InstalledPlugin] = []
         var changed = false
@@ -449,7 +480,7 @@ final class PluginManager: ObservableObject {
                 if let existing { result.append(existing) }
             }
         }
-        return (result, changed)
+        return (result, changed, remoteIds)
     }
 
     // MARK: - Source management
