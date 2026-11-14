@@ -112,7 +112,7 @@
     {
       "id": "film4k",
       "name": "Film4K",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scriptUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/plugins/mod13.js",
       "iconUrl": "",
       "adult": false,

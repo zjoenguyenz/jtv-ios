@@ -13,7 +13,7 @@ function getManifest() {
     return JSON.stringify({
         "id": "film4k",
         "name": "Film4K",
-        "version": "1.0.0",
+        "version": "1.0.1",
         "baseUrl": "https://film4k.net",
         "iconUrl": "",
         "isEnabled": true,
