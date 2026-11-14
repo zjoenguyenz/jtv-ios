@@ -32,13 +32,13 @@ final class MovieService: ObservableObject {
         return engine
     }
 
-    private func manifest(for pluginId: String) -> PluginManifest? {
-        manager.installedPlugin(id: pluginId)?.manifest
+    private func manifest(for pluginId: String) async -> PluginManifest? {
+        await manager.installedPlugin(id: pluginId)?.manifest
     }
 
-    func defaultHeaders(for pluginId: String) -> [String: String] {
+    func defaultHeaders(for pluginId: String) async -> [String: String] {
         var headers = ["User-Agent": Net.desktopUA]
-        if let base = manifest(for: pluginId)?.baseUrl, !base.isEmpty {
+        if let base = await manifest(for: pluginId)?.baseUrl, !base.isEmpty {
             headers["Referer"] = base.hasSuffix("/") ? base : base + "/"
         }
         return headers
@@ -140,14 +140,14 @@ final class MovieService: ObservableObject {
         // Fast resume: a previously resolved direct stream.
         if !request.knownStreamURL.isEmpty && MediaURL.isDirectMedia(request.knownStreamURL) {
             var headers = request.fallbackHeaders
-            if headers.isEmpty { headers = defaultHeaders(for: pluginId) }
+            if headers.isEmpty { headers = await defaultHeaders(for: pluginId) }
             return .video(StreamInfo(url: request.knownStreamURL, headers: headers))
         }
 
         // Direct media target.
         if MediaURL.isDirectMedia(target) {
             var headers = request.fallbackHeaders
-            if headers.isEmpty { headers = defaultHeaders(for: pluginId) }
+            if headers.isEmpty { headers = await defaultHeaders(for: pluginId) }
             return .video(StreamInfo(url: target, headers: headers))
         }
 
@@ -161,23 +161,23 @@ final class MovieService: ObservableObject {
             let stream = await engine.parseStream(text: text)
             if !stream.images.isEmpty {
                 var resolved = stream
-                if resolved.headers.isEmpty { resolved.headers = defaultHeaders(for: pluginId) }
+                if resolved.headers.isEmpty { resolved.headers = await defaultHeaders(for: pluginId) }
                 return .manga(resolved)
             }
             throw MovieServiceError.unresolvedEpisode
         }
 
         // Embed page: fetch HTML and let the plugin extract the stream.
-        let html = try await Net.fetchText(target, headers: defaultHeaders(for: pluginId))
+        let html = try await Net.fetchText(target, headers: await defaultHeaders(for: pluginId))
         if let embed = await engine.parseEmbed(html: html), embed.hasPlayableURL {
             var resolved = embed
-            if resolved.headers.isEmpty { resolved.headers = defaultHeaders(for: pluginId) }
+            if resolved.headers.isEmpty { resolved.headers = await defaultHeaders(for: pluginId) }
             return .video(resolved)
         }
         let parsed = await engine.parseStream(text: html)
         if parsed.hasPlayableURL {
             var resolved = parsed
-            if resolved.headers.isEmpty { resolved.headers = defaultHeaders(for: pluginId) }
+            if resolved.headers.isEmpty { resolved.headers = await defaultHeaders(for: pluginId) }
             return .video(resolved)
         }
         if !parsed.images.isEmpty {
@@ -186,7 +186,7 @@ final class MovieService: ObservableObject {
 
         // Last resort: open the embed in the sniffing webview.
         guard let url = URL(string: target) else { throw MovieServiceError.unresolvedEpisode }
-        return .embed(url: url, headers: defaultHeaders(for: pluginId))
+        return .embed(url: url, headers: await defaultHeaders(for: pluginId))
     }
 
     /// Resolves one manga chapter (used by the reader's prev/next).
@@ -198,7 +198,7 @@ final class MovieService: ObservableObject {
         let stream = await engine.parseStream(text: text)
         guard !stream.images.isEmpty else { throw MovieServiceError.unresolvedEpisode }
         var resolved = stream
-        if resolved.headers.isEmpty { resolved.headers = defaultHeaders(for: pluginId) }
+        if resolved.headers.isEmpty { resolved.headers = await defaultHeaders(for: pluginId) }
         return resolved
     }
 }

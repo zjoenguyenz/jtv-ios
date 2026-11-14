@@ -108,6 +108,12 @@ struct NameValue: Codable, Identifiable, Hashable {
             value = try c.decodeIfPresent(String.self, forKey: .slug) ?? ""
         }
     }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(name, forKey: .name)
+        try c.encode(value, forKey: .value)
+    }
 }
 
 /// getFilterConfig() result: a "sort" group plus any other groups the
@@ -376,7 +382,7 @@ struct MovieDetail: Codable {
         if let t = try? c.decodeIfPresent(String.self, forKey: .tmdbId) {
             tmdbId = t ?? ""
         } else if let ti = try? c.decodeIfPresent(Int.self, forKey: .tmdbId) {
-            tmdbId = ti.map(String.init) ?? ""
+            tmdbId = String(ti)
         } else { tmdbId = "" }
         tmdbSeason = try c.decodeIfPresent(Int.self, forKey: .tmdbSeason) ?? 0
         tmdbType = try c.decodeIfPresent(String.self, forKey: .tmdbType) ?? ""

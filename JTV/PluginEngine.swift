@@ -58,8 +58,8 @@ final class PluginEngine {
     func hasFunction(_ name: String) async -> Bool {
         await run { ctx in
             guard let ctx else { return false }
-            let v = ctx.objectForKeyedSubscript(name)
-            return v != nil && !v.isUndefined && !v.isNull
+            guard let v = ctx.objectForKeyedSubscript(name) else { return false }
+            return !v.isUndefined && !v.isNull
         }
     }
 
