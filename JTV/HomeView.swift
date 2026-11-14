@@ -235,9 +235,7 @@ struct HomeView: View {
     }
 
     private func continueCard(_ record: HistoryRecord) -> some View {
-        Button {
-            resumeFromHistory(record)
-        } label: {
+        NavigationLink(value: MovieRoute(pluginId: record.pluginId, movie: record.movie, autoResume: true)) {
             VStack(alignment: .leading, spacing: 7) {
                 ZStack(alignment: .bottomLeading) {
                     CachedAsyncImage(urlString: record.movie.displayBackdrop)
@@ -291,21 +289,6 @@ struct HomeView: View {
                 Label("Xoá khỏi đang xem tiếp", systemImage: "trash")
             }
         }
-    }
-
-    private func resumeFromHistory(_ record: HistoryRecord) {
-        let episode = Episode(id: record.episodeId, name: record.episodeName, slug: record.episodeId)
-        presenter.request = PlaybackRequest(
-            movie: record.movie,
-            pluginId: record.pluginId,
-            pluginName: record.pluginName,
-            isManga: record.isManga,
-            serverName: record.serverName,
-            episode: episode,
-            allEpisodes: [episode],
-            startPosition: record.isManga ? 0 : record.lastPosition,
-            knownStreamURL: record.streamURL
-        )
     }
 
     // MARK: - Sections
