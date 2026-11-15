@@ -17,7 +17,7 @@ function getManifest() {
     return JSON.stringify({
         "id": "vsmov",
         "name": "VSMov",
-        "version": "1.0.0",
+        "version": "1.0.1",
         "baseUrl": "https://vsmov.com",
         "iconUrl": "https://vsmov.com/favicon.ico",
         "isEnabled": true,
@@ -102,7 +102,11 @@ function getUrlYears() { return ""; }
 // =============================================================================
 
 function vsPoster(path, pathImage) {
-    if (!path) return "";
+    // The API sometimes returns poster_url as an object ({})
+    // instead of a string (seen 2026-11-15 on item "ngoa-long"):
+    // .indexOf on it threw and wiped the whole list. Non-string
+    // paths simply mean "no poster".
+    if (typeof path !== "string" || !path) return "";
     if (path.indexOf("http") === 0) return path;
     if (path.charAt(0) === "/") return "https://vsmov.com" + path;
     return (pathImage || VS_IMG_DEFAULT) + path;
@@ -115,18 +119,25 @@ function parseListResponse(apiResponseJson) {
         var pathImage = response.pathImage || (response.data && response.data.pathImage) || "";
         var pagination = response.pagination || (response.data && response.data.pagination) || {};
 
+        // Per-item guard: one malformed entry must never wipe
+        // the whole list (the 2026-11-15 poster_url incident).
         var movies = items.map(function (item) {
-            return {
-                id: item.slug,
-                title: item.name,
-                posterUrl: vsPoster(item.poster_url, pathImage),
-                backdropUrl: vsPoster(item.thumb_url, pathImage),
-                year: item.year || 0,
-                quality: item.quality || "",
-                episode_current: item.episode_current || "",
-                lang: item.lang || ""
-            };
-        });
+            try {
+                if (!item || !item.slug) return null;
+                return {
+                    id: item.slug,
+                    title: item.name,
+                    posterUrl: vsPoster(item.poster_url, pathImage),
+                    backdropUrl: vsPoster(item.thumb_url, pathImage),
+                    year: item.year || 0,
+                    quality: item.quality || "",
+                    episode_current: item.episode_current || "",
+                    lang: item.lang || ""
+                };
+            } catch (e) {
+                return null;
+            }
+        }).filter(function (m) { return m !== null; });
 
         return JSON.stringify({
             items: movies,

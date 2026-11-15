@@ -103,7 +103,7 @@
     {
       "id": "vsmov",
       "name": "VSMov",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "scriptUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/plugins/mod12.js",
       "iconUrl": "",
       "adult": false,
