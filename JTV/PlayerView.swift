@@ -492,8 +492,30 @@ final class PlayerSurfaceViewController: UIViewController {
         let tap = UITapGestureRecognizer(target: self, action: #selector(toggleControls))
         view.addGestureRecognizer(tap)
 
+        let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
+        view.addGestureRecognizer(pinch)
+
         uiTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.refreshUI()
+        }
+    }
+
+    /// Two-finger pinch toggles the video's screen fit
+    /// (user request, 2026-11-15, for movie sources): pinch
+    /// OUT stretches the picture to fill the whole screen,
+    /// cropping the letterbox bars; pinch IN returns to the
+    /// full frame. Thresholds sit past a casual touch so a
+    /// stray two-finger tap never flips the mode, and the
+    /// gravity guard makes each pinch flip at most once.
+    @objc private func handlePinch(_ gesture: UIPinchGestureRecognizer) {
+        guard gesture.state == .changed || gesture.state == .ended else { return }
+        let layer = videoView.playerLayer
+        if gesture.scale > 1.15, layer.videoGravity != .resizeAspectFill {
+            layer.videoGravity = .resizeAspectFill
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        } else if gesture.scale < 0.87, layer.videoGravity != .resizeAspect {
+            layer.videoGravity = .resizeAspect
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
         }
     }
 

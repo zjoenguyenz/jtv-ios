@@ -206,13 +206,42 @@ struct MangaReaderView: View {
         return name
     }
 
+    /// "Chap <n>" label for any episode, built the same way as
+    /// the top bar's chapter name (episode names often already
+    /// carry the word "Chapter").
+    private func chapLabel(for episode: Episode) -> String {
+        var name = episode.name
+        for prefix in ["chapter ", "chap "] where name.lowercased().hasPrefix(prefix) {
+            name = String(name.dropFirst(prefix.count))
+            break
+        }
+        return "Chap \(name)"
+    }
+
+    /// The nav buttons carry the TARGET chapter's number, not
+    /// the words trước/sau, so the reader always shows where
+    /// each button lands (user request, 2026-11-15). A missing
+    /// neighbour falls back to the plain word — that pill is
+    /// disabled anyway.
+    private var previousChapterTitle: String {
+        let idx = currentPosition - 1
+        guard orderedEpisodes.indices.contains(idx) else { return "Chap trước" }
+        return chapLabel(for: orderedEpisodes[idx])
+    }
+
+    private var nextChapterTitle: String {
+        let idx = currentPosition + 1
+        guard orderedEpisodes.indices.contains(idx) else { return "Chap sau" }
+        return chapLabel(for: orderedEpisodes[idx])
+    }
+
     private var chapterNavButtons: some View {
         HStack(spacing: 14) {
-            chapterButton(title: "Chap trước", systemImage: "chevron.left",
+            chapterButton(title: previousChapterTitle, systemImage: "chevron.left",
                           trailingIcon: false, enabled: canGoPrevious) {
                 Task { await goToChapter(offset: -1) }
             }
-            chapterButton(title: "Chap sau", systemImage: "chevron.right",
+            chapterButton(title: nextChapterTitle, systemImage: "chevron.right",
                           trailingIcon: true, enabled: canGoNext) {
                 Task { await goToChapter(offset: 1) }
             }
