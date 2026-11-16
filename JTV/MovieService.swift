@@ -133,7 +133,23 @@ final class MovieService: ObservableObject {
         async let parsedStream = engine.parseStream(text: text, url: url)
         let (detail, stream) = await (parsedDetail, parsedStream)
         guard let detail else { throw MovieServiceError.emptyDetail }
-        return DetailBundle(detail: detail, detailStream: stream)
+        // Two-stage detail (torrenthub): a meta payload's detail
+        // carries ONE placeholder episode whose id starts with
+        // "jtvstreams:" — the streams payload lives at that id's
+        // own detail URL. Fetch it, parse it, and swap its server
+        // list in, so the page shows the real source list instead
+        // of the placeholder. Any other plugin is unaffected: none
+        // emits the prefix.
+        var resolvedDetail = detail
+        if let placeholder = detail.servers.first?.episodes.first,
+           placeholder.id.hasPrefix("jtvstreams:"),
+           let stage2URL = await engine.urlForDetail(slug: placeholder.id),
+           let stage2Text = try? await Net.fetchText(stage2URL),
+           let stage2 = await engine.parseMovieDetail(text: stage2Text, url: stage2URL),
+           !stage2.servers.isEmpty {
+            resolvedDetail.servers = stage2.servers
+        }
+        return DetailBundle(detail: resolvedDetail, detailStream: stream)
     }
 
     // MARK: - Playback resolution
@@ -147,10 +163,22 @@ final class MovieService: ObservableObject {
         guard !target.isEmpty else { throw MovieServiceError.unresolvedEpisode }
 
         // Fast resume: a previously resolved direct stream.
-        if !request.knownStreamURL.isEmpty && MediaURL.isDirectMedia(request.knownStreamURL) {
+        // (Skipped for torrenthub: debrid download links expire,
+        // and re-minting one from the hash is cheap when cached.)
+        if pluginId != "torrenthub", !request.knownStreamURL.isEmpty && MediaURL.isDirectMedia(request.knownStreamURL) {
             var headers = request.fallbackHeaders
             if headers.isEmpty { headers = await defaultHeaders(for: pluginId) }
             return .video(await markProxyIfNeeded(StreamInfo(url: request.knownStreamURL, headers: headers), pluginId: pluginId))
+        }
+
+        // Debrid torrent target (torrenthub): the episode id is an
+        // info-hash, not a URL — the native debrid resolver turns
+        // it into a direct file link (Real-Debrid primary, TorBox
+        // fallback), flagging containers AVPlayer cannot open for
+        // the KSPlayer surface.
+        if target.hasPrefix("jtvhash:") {
+            let hash = String(target.dropFirst("jtvhash:".count))
+            return .video(try await DebridResolver.resolve(hash: hash))
         }
 
         // Direct media target.

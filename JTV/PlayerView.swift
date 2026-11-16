@@ -1010,7 +1010,11 @@ struct PlaybackResolverView: View {
                         .foregroundStyle(Theme.textFaint)
                 }
             case .video(let stream):
-                PlayerView(stream: stream, request: request)
+                if stream.useCompatEngine {
+                    KSPlayerView(stream: stream, request: request)
+                } else {
+                    PlayerView(stream: stream, request: request)
+                }
             case .manga(let stream):
                 MangaReaderView(
                     movie: request.movie,

@@ -21,7 +21,7 @@ final class PluginManager: ObservableObject {
 
     static let adultPluginIds: Set<String> = [
         "missav", "123av", "avdbapi", "sextop1", "sextop2", "topxx",
-        "javhd", "vlxx", "njav", "sayhentai", "misskon",
+        "javhd", "vlxx", "njav", "sayhentai", "misskon", "torrenthub",
     ]
 
     @Published private(set) var sources: [PluginSource] = []

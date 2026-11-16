@@ -7,6 +7,12 @@ struct SettingsView: View {
     @State private var showAdultConfirm = false
     @State private var addError: String?
 
+    // Debrid tokens for the Torrent tab — the same UserDefaults
+    // keys DebridTokens reads (a Settings value wins over the
+    // build-time baked one).
+    @AppStorage(DebridTokens.rdKey) private var rdToken = ""
+    @AppStorage(DebridTokens.torboxKey) private var torboxToken = ""
+
     private var appVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
     }
@@ -23,6 +29,7 @@ struct SettingsView: View {
                     activePluginSection
                     pluginTogglesSection
                     contentSection
+                    torrentSection
                     aboutSection
                 }
                 .listStyle(.insetGrouped)
@@ -222,6 +229,30 @@ struct SettingsView: View {
             Text("Nội dung")
         } footer: {
             Text("Khi tắt, mọi plugin 18+ bị ẩn khỏi app.")
+        }
+        .listRowBackground(Theme.glassFill)
+    }
+
+    // MARK: - Torrent (debrid tokens)
+
+    private var torrentSection: some View {
+        Section {
+            SecureField("Token Real-Debrid", text: $rdToken)
+                .foregroundStyle(.white)
+                .autocorrectionDisabled(true)
+                .textInputAutocapitalization(.never)
+            SecureField("Token TorBox", text: $torboxToken)
+                .foregroundStyle(.white)
+                .autocorrectionDisabled(true)
+                .textInputAutocapitalization(.never)
+            if DebridTokens.isConfigured {
+                Label("Đã cấu hình ✓", systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(Theme.accent)
+            }
+        } header: {
+            Text("Torrent (Real-Debrid / TorBox)")
+        } footer: {
+            Text("Dùng cho tab Torrent. Token chỉ lưu trên máy này; để trống nếu bản cài đặt đã nạp sẵn.")
         }
         .listRowBackground(Theme.glassFill)
     }

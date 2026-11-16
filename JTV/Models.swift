@@ -444,8 +444,13 @@ struct StreamInfo: Codable {
     /// MovieService.markProxyIfNeeded). Set by the app only;
     /// plugin payloads decode it as false.
     var requiresProxy: Bool = false
+    /// Play this stream on the KSPlayer (FFmpeg) surface instead of
+    /// AVPlayer — set by the app only, by DebridResolver, when the
+    /// resolved file's container is one AVFoundation cannot open
+    /// (MKV/AVI/…). Plugin payloads decode it as false.
+    var useCompatEngine: Bool = false
 
-    enum CodingKeys: String, CodingKey { case url, headers, subtitles, images, isEmbed, postBody, requiresProxy }
+    enum CodingKeys: String, CodingKey { case url, headers, subtitles, images, isEmbed, postBody, requiresProxy, useCompatEngine }
 
     init(url: String = "", headers: [String: String] = [:],
          subtitles: [SubtitleTrack] = [], images: [String] = [], isEmbed: Bool = false,

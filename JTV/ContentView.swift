@@ -4,6 +4,7 @@ import SwiftUI
 /// Settings) with the shared full-screen playback cover on top.
 struct ContentView: View {
     @EnvironmentObject private var presenter: PlaybackPresenter
+    @EnvironmentObject private var plugins: PluginManager
     @State private var showSplash = true
     @State private var selectedTab = 0
 
@@ -25,6 +26,14 @@ struct ContentView: View {
                 LibraryView()
                     .tabItem { Label("Thư viện", systemImage: "books.vertical.fill") }
                     .tag(3)
+
+                // The Torrent tab exists only while the session
+                // 18+ gate is on (the gate resets every launch).
+                if plugins.adultEnabled {
+                    TorrentTabView()
+                        .tabItem { Label("Torrent", systemImage: "arrow.down.circle.fill") }
+                        .tag(5)
+                }
 
                 SettingsView()
                     .tabItem { Label("Cài đặt", systemImage: "gearshape.fill") }
