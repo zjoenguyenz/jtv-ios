@@ -1,7 +1,7 @@
 // =============================================================================
-// SayHentai plugin v2.0.0 — rewritten 2026-11-13 for the site's new home.
+// SayHentai plugin v2.0.1 — rewritten 2026-11-13 for the site's new home.
 // The operator abandoned the old Madara site at sayhentai.cx (now stuck
-// behind a hard Cloudflare wall) and moved to sayhentai.wiki, a different
+// behind a hard Cloudflare wall) and moved to sayhentai.sale, a different
 // platform (Halim-style theme): list /danh-sach, detail /truyen/<slug>.html,
 // reader /doc-truyen/<slug>/chapter-<n>.html, images on image.shtcdn.top.
 // No Cloudflare challenge on .wiki (verified from VM + on-device Safari).
@@ -11,9 +11,9 @@ function getManifest() {
     return JSON.stringify({
         "id": "sayhentai",
         "name": "SayHentai",
-        "version": "2.0.0",
-        "baseUrl": "https://sayhentai.wiki",
-        "iconUrl": "https://sayhentai.wiki/favicon.ico",
+        "version": "2.0.1",
+        "baseUrl": "https://sayhentai.sale",
+        "iconUrl": "https://sayhentai.sale/favicon.ico",
         "isEnabled": true,
         "isAdult": true,
         "type": "MANGA",
@@ -56,7 +56,7 @@ function getFilterConfig() {
 // URL GENERATION
 // =============================================================================
 
-var BASE = "https://sayhentai.wiki";
+var BASE = "https://sayhentai.sale";
 
 function getUrlList(slug, filtersJson) {
     var filters = JSON.parse(filtersJson || "{}");
@@ -122,8 +122,8 @@ function parseListResponse(html) {
     for (var i = 1; i < chunks.length; i++) {
         var chunk = chunks[i].substring(0, 4000);
 
-        var linkMatch = chunk.match(/<a[^>]*class="halim-thumb"[^>]*href="https:\/\/sayhentai\.wiki\/truyen\/([a-z0-9-]+?)(?:\.html)?"[^>]*title="([^"]*)"/i) ||
-            chunk.match(/<a[^>]*href="https:\/\/sayhentai\.wiki\/truyen\/([a-z0-9-]+?)(?:\.html)?"[^>]*>/i);
+        var linkMatch = chunk.match(/<a[^>]*class="halim-thumb"[^>]*href="https:\/\/sayhentai\.sale\/truyen\/([a-z0-9-]+?)(?:\.html)?"[^>]*title="([^"]*)"/i) ||
+            chunk.match(/<a[^>]*href="https:\/\/sayhentai\.sale\/truyen\/([a-z0-9-]+?)(?:\.html)?"[^>]*>/i);
         if (!linkMatch) continue;
 
         var slug = linkMatch[1];
@@ -219,7 +219,7 @@ function parseMovieDetail(html) {
         // Chapters: <li class="chapter"><a href=".../doc-truyen/<slug>/<chap>.html" title="Chapter N">
         var chapters = [];
         var seenChap = {};
-        var chapRegex = /<li[^>]*class="chapter"[^>]*>\s*<a[^>]+href="(https:\/\/sayhentai\.wiki\/doc-truyen\/[^"]+)"[^>]*>/gi;
+        var chapRegex = /<li[^>]*class="chapter"[^>]*>\s*<a[^>]+href="(https:\/\/sayhentai\.sale\/doc-truyen\/[^"]+)"[^>]*>/gi;
         var cMatch;
         while ((cMatch = chapRegex.exec(html)) !== null) {
             if (!seenChap[cMatch[1]]) {
@@ -229,7 +229,7 @@ function parseMovieDetail(html) {
         }
         // Fallback (e.g. oneshot pages without li.chapter): any reader links.
         if (chapters.length === 0) {
-            var anyRegex = /<a[^>]+href="(https:\/\/sayhentai\.wiki\/doc-truyen\/[^"]+)"[^>]*>/gi;
+            var anyRegex = /<a[^>]+href="(https:\/\/sayhentai\.sale\/doc-truyen\/[^"]+)"[^>]*>/gi;
             var aMatch;
             while ((aMatch = anyRegex.exec(html)) !== null) {
                 if (!seenChap[aMatch[1]]) {
@@ -267,7 +267,7 @@ function parseMovieDetail(html) {
         // (the plain /the-loai/ link set elsewhere is the site-wide menu).
         var categories = [];
         var seenCat = {};
-        var catRegex = /<a[^>]+title="([^"]+)"[^>]*rel="category tag"[^>]*href="https:\/\/sayhentai\.wiki\/the-loai\/([a-z0-9-]+)"/gi;
+        var catRegex = /<a[^>]+title="([^"]+)"[^>]*rel="category tag"[^>]*href="https:\/\/sayhentai\.sale\/the-loai\/([a-z0-9-]+)"/gi;
         var cm;
         while ((cm = catRegex.exec(html)) !== null) {
             if (/^\d+$/.test(cm[2])) continue;
@@ -313,7 +313,7 @@ function parseDetailResponse(html) {
             images: images,
             headers: {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Referer": "https://sayhentai.wiki/"
+                "Referer": "https://sayhentai.sale/"
             }
         });
     } catch (e) {
@@ -324,7 +324,7 @@ function parseDetailResponse(html) {
 function parseCategoriesResponse(html) {
     var categories = [];
     var seen = {};
-    var catRegex = /<a[^>]+href="https:\/\/sayhentai\.wiki\/the-loai\/([a-z0-9-]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+    var catRegex = /<a[^>]+href="https:\/\/sayhentai\.sale\/the-loai\/([a-z0-9-]+)"[^>]*>([\s\S]*?)<\/a>/gi;
     var m;
     while ((m = catRegex.exec(html)) !== null) {
         if (/^\d+$/.test(m[1])) continue;
