@@ -257,11 +257,11 @@ final class MovieService: ObservableObject {
             bits.append(token.uppercased())
             if bits.count >= 2 { break }
         }
-        if let sizeLine = lines.first(where: { $0.contains("💾") }) {
-            bits.append(sizeLine.replacingOccurrences(of: "💾", with: "").trimmingCharacters(in: .whitespaces))
+        if let size = title.range(of: #"\d+(\.\d+)?\s?(GB|MB)"#, options: .regularExpression) {
+            bits.append(String(title[size]))
         }
-        if let seedLine = lines.first(where: { $0.contains("👤") }) {
-            bits.append("🌱 " + seedLine.replacingOccurrences(of: "👤", with: "").trimmingCharacters(in: .whitespaces))
+        if let seeds = title.range(of: #"👤\s*\d+"#, options: .regularExpression) {
+            bits.append("🌱 " + title[seeds].dropFirst(1).trimmingCharacters(in: .whitespaces))
         }
         return bits.isEmpty ? file : file + "\n" + bits.joined(separator: " · ")
     }
