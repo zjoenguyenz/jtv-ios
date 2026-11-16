@@ -1384,28 +1384,32 @@ struct PlaybackResolverView: View {
     private func resolve() async {
         phase = .resolving
         do {
-            // v1.22: a hard deadline on the resolver screen — the
-            // old unbounded chain could spin for minutes on a dying
-            // source (each fetch retrying behind the next). The
-            // underlying work is not cancelled (a slow source may
-            // still land in the page cache), but the user is never
-            // held hostage: timeout surfaces as a failure with a
-            // working Thử lại button. v1.22.1: torrent targets get
-            // a longer leash — a debrid server-side download
-            // legitimately takes minutes, and the chain carries
-            // its own 900 s budget; the 45 s cap is for page
-            // sources only.
-            let deadline: UInt64 = (request.episode.id.hasPrefix("jtvhash:") || request.episode.id.hasPrefix("jtvts:"))
-                ? 300_000_000_000 : 45_000_000_000
-            let resolution = try await withThrowingTaskGroup(of: PlaybackResolution.self) { group in
-                group.addTask { try await service.resolveEpisode(request) }
-                group.addTask {
-                    try await Task.sleep(nanoseconds: deadline)
-                    throw MovieServiceError.timedOut
+            // v1.22: a hard deadline on the resolver screen for
+            // PAGE sources — the old unbounded chain could spin for
+            // minutes on a dying source (each fetch retrying behind
+            // the next). The underlying work is not cancelled (a
+            // slow source may still land in the page cache), but the
+            // user is never held hostage: timeout surfaces as a
+            // failure with a working Thử lại button. Torrent targets
+            // are EXEMPT (v1.22.2, restoring v1.21): the debrid
+            // chain carries its own per-provider budgets, and a
+            // server-side torrent download legitimately takes
+            // minutes — capping the screen below the chain's budget
+            // only produced false failures.
+            let resolution: PlaybackResolution
+            if request.episode.id.hasPrefix("jtvhash:") {
+                resolution = try await service.resolveEpisode(request)
+            } else {
+                resolution = try await withThrowingTaskGroup(of: PlaybackResolution.self) { group in
+                    group.addTask { try await service.resolveEpisode(request) }
+                    group.addTask {
+                        try await Task.sleep(nanoseconds: 45_000_000_000)
+                        throw MovieServiceError.timedOut
+                    }
+                    let first = try await group.next()!
+                    group.cancelAll()
+                    return first
                 }
-                let first = try await group.next()!
-                group.cancelAll()
-                return first
             }
             switch resolution {
             case .video(let stream): phase = .video(stream)

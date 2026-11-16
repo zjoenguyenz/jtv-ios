@@ -50,14 +50,16 @@ enum DebridError: LocalizedError {
 /// Turns a torrent info-hash (the torrenthub plugin's `jtvhash:`
 /// episode ids) into a direct file URL via a debrid service.
 ///
-/// Provider preference (owner ruling 2026-11-16): TorBox first,
-/// then Premiumize, then Real-Debrid (whose flow is ported from
-/// the TV app's RdApi: addMagnet → pick file → selectFiles →
-/// poll → unrestrict) — among providers that HAVE the torrent:
-/// a provider still downloading server-side only gets a short
-/// first-pass window before the next provider is tried, and a
-/// cached link anywhere wins over a download everywhere. The
-/// file pick prefers the largest VIDEO file, preferring
+/// Chain (v1.22.2 — the v1.21 shape, restored after a line-by-line
+/// diff against commit 55cd609): Real-Debrid primary with its own
+/// full budget (flow ported from the TV app's RdApi: addMagnet →
+/// pick file → selectFiles → poll → unrestrict), TorBox fallback
+/// with its own full budget, Premiumize last. The v1.22 windowed
+/// TorBox-first orchestration was removed: on the owner's device
+/// v1.21 played torrents with this exact chain, while v1.22
+/// starved RD behind a shared window and v1.22.1 served
+/// TorBox-first links the player could not connect to. The file
+/// pick prefers the largest VIDEO file, preferring
 /// AVPlayer-friendly containers (mp4/m4v/mov) so most titles stay
 /// on the native player; anything else is flagged
 /// `useCompatEngine` and the resolver screen routes it to the
@@ -73,84 +75,35 @@ enum DebridResolver {
     static func resolve(hash: String) async throws -> StreamInfo {
         let clean = hash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard clean.count >= 32 else { throw DebridError.message("Mã torrent không hợp lệ.") }
-        let tb = DebridTokens.torbox, pm = DebridTokens.premiumize, rd = DebridTokens.rd
-        guard !tb.isEmpty || !pm.isEmpty || !rd.isEmpty else { throw DebridError.noToken }
-        let globalDeadline = Date().addingTimeInterval(budget)
-        // v1.22.1: every pass gets a window measured from ITS OWN
-        // start. The v1.22 build measured all windows from the
-        // resolve start, so the first provider's window silently
-        // starved every later one — Real-Debrid (the provider that
-        // had actually served this phone in v1.21) never got a real
-        // turn, and the chain parked on the settle pass. The chain
-        // log rides along in the final error so a failure screenshot
-        // names the exact stage instead of a naked system string.
-        var log: [String] = []
-        var lastError: Error?
-        var downloading: [(order: Int, name: String, run: (Date) async throws -> StreamInfo)] = []
-
-        func attempt(_ name: String, _ order: Int, _ window: TimeInterval,
-                     _ body: @escaping (Date) async throws -> StreamInfo) async -> StreamInfo? {
+        // v1.22.2: the v1.21 chain, restored. Each provider runs
+        // with its OWN full budget inside its own flow, exactly as
+        // the build that played torrents on the owner's device.
+        // Premiumize is appended last — it can only ever serve a
+        // title the proven pair already failed on.
+        var lastError: Error = DebridError.noToken
+        if !DebridTokens.rd.isEmpty {
             do {
-                return try await body(Date().addingTimeInterval(window))
-            } catch DebridError.downloading {
-                log.append("\(name): đang tải")
-                downloading.append((order, name, body))
-                return nil
+                return try await resolveRD(hash: clean, token: DebridTokens.rd)
             } catch {
-                log.append("\(name): \(error.localizedDescription.prefix(60))")
                 lastError = error
-                return nil
             }
         }
-
-        // Premiumize cache probe: directdl answers with real links
-        // in ONE call when the torrent is already on their system.
-        // The hit is HELD, not returned yet: TorBox outranks
-        // Premiumize in the owner's order, so a cached TorBox copy
-        // still wins inside its quick window; the held hit is the
-        // instant fallback when TorBox yields.
-        var pmCached: StreamInfo?
-        if !pm.isEmpty {
-            pmCached = try? await premiumizeDirectDL(hash: clean, token: pm)
-            if pmCached == nil { log.append("PM: chưa có sẵn") }
-        }
-
-        // TorBox quick pass: a CACHED TorBox torrent finishes
-        // inside a short window and wins by the owner's preference;
-        // a still-downloading one yields instead of parking.
-        if !tb.isEmpty,
-           let hit = await attempt("TorBox", 0, 25, { dl in try await resolveTorBox(hash: clean, token: tb, deadline: dl) }) {
-            return hit
-        }
-        if let pmCached { return pmCached }
-
-        // Real-Debrid pass — the chain shape that served v1.21.
-        if !rd.isEmpty,
-           let hit = await attempt("RD", 2, 60, { dl in try await resolveRD(hash: clean, token: rd, deadline: dl) }) {
-            return hit
-        }
-
-        // Premiumize full pass (create + poll) when the probe missed.
-        if !pm.isEmpty,
-           let hit = await attempt("PM", 1, 45, { dl in try await resolvePremiumize(hash: clean, token: pm, deadline: dl) }) {
-            return hit
-        }
-
-        // Every configured provider is still downloading: settle
-        // on the most preferred one for the remaining budget.
-        if let first = downloading.sorted(by: { $0.order < $1.order }).first {
+        if !DebridTokens.torbox.isEmpty {
             do {
-                return try await first.run(globalDeadline)
-            } catch DebridError.downloading {
-                throw DebridError.message("Torrent vẫn đang tải trên \(first.name) quá lâu. [\(log.joined(separator: " · "))]")
+                return try await resolveTorBox(hash: clean, token: DebridTokens.torbox)
             } catch {
-                throw DebridError.message("\(first.name): \(error.localizedDescription.prefix(80)) [\(log.joined(separator: " · "))]")
+                lastError = error
             }
         }
-        if let lastError {
-            throw DebridError.message("\(lastError.localizedDescription.prefix(80)) [\(log.joined(separator: " · "))]")
+        if !DebridTokens.premiumize.isEmpty {
+            do {
+                return try await resolvePremiumize(hash: clean, token: DebridTokens.premiumize,
+                                                    deadline: Date().addingTimeInterval(budget))
+            } catch {
+                lastError = error
+            }
         }
-        throw DebridError.message("Không lấy được link torrent. [\(log.joined(separator: " · "))]")
+        throw lastError
     }
 
     static func needsCompatEngine(filename: String) -> Bool {
@@ -160,7 +113,7 @@ enum DebridResolver {
 
     // MARK: - Real-Debrid
 
-    private static func resolveRD(hash: String, token: String, deadline: Date) async throws -> StreamInfo {
+    private static func resolveRD(hash: String, token: String) async throws -> StreamInfo {
         let base = "https://api.real-debrid.com/rest/1.0"
         let magnet = "magnet:?xt=urn:btih:" + hash
         let added = try await rdRequest(base, token, "POST", "/torrents/addMagnet", form: ["magnet": magnet])
@@ -179,6 +132,7 @@ enum DebridResolver {
         }
         _ = try await rdRequest(base, token, "POST", "/torrents/selectFiles/\(id)", form: ["files": String(pick.id)])
 
+        let deadline = Date().addingTimeInterval(budget)
         var link: String?
         while link == nil {
             let poll = try await rdRequest(base, token, "GET", "/torrents/info/\(id)", form: nil)
@@ -188,7 +142,7 @@ enum DebridResolver {
             if let links = poll["links"] as? [String], let first = links.first, !first.isEmpty {
                 link = first
             } else {
-                if Date() > deadline { throw DebridError.downloading }
+                if Date() > deadline { throw DebridError.timeout }
                 try await Task.sleep(nanoseconds: 3_000_000_000)
             }
         }
@@ -227,7 +181,7 @@ enum DebridResolver {
 
     // MARK: - TorBox
 
-    private static func resolveTorBox(hash: String, token: String, deadline: Date) async throws -> StreamInfo {
+    private static func resolveTorBox(hash: String, token: String) async throws -> StreamInfo {
         let base = "https://api.torbox.app/v1/api"
         let magnet = "magnet:?xt=urn:btih:" + hash
         let created = try await torboxRequest(base, token, "POST", "/torrents/createtorrent", form: ["magnet": magnet])
@@ -236,6 +190,7 @@ enum DebridResolver {
             throw DebridError.message("TorBox không nhận magnet này.")
         }
 
+        let deadline = Date().addingTimeInterval(budget)
         var downloadURL: String?
         var pickedName = ""
         while downloadURL == nil {
@@ -258,7 +213,7 @@ enum DebridResolver {
                 }
             }
             if downloadURL == nil {
-                if Date() > deadline { throw DebridError.downloading }
+                if Date() > deadline { throw DebridError.timeout }
                 try await Task.sleep(nanoseconds: 5_000_000_000)
             }
         }

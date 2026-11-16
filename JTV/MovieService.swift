@@ -178,17 +178,11 @@ final class MovieService: ObservableObject {
     func detailStreams(pluginId: String, movieId: String, detail: MovieDetail) async -> MovieDetail {
         guard let placeholder = detail.servers.first?.episodes.first,
               placeholder.id.hasPrefix("jtvstreams:") else { return detail }
-        // Lane A (IMDb ids): fetch the streams from a
-        // debrid-CONFIGURED Torrentio natively — the mechanism the
-        // TV apps use, and the reason their torrent links feel
-        // instant: cached torrents arrive with direct links in the
-        // list itself. Tokens never enter the plugin/JS layer.
-        if pluginId == "torrenthub", movieId.hasPrefix("tt"),
-           let servers = await torrentioConfiguredStreams(imdbId: movieId), !servers.isEmpty {
-            var resolved = detail
-            resolved.servers = servers
-            return resolved
-        }
+        // v1.22.2: stage 2 goes through the PLUGIN only — the exact
+        // v1.21 path. The v1.22 native debrid-configured Torrentio
+        // fetch (jtvts: episodes + resolve-link chase) was removed
+        // in the same restoration as the DebridResolver chain: it
+        // was never device-proven, while the plugin path was.
         guard let engine = try? await engine(for: pluginId),
               let stage2URL = await engine.urlForDetail(slug: placeholder.id),
               let stage2Text = try? await Net.fetchText(stage2URL),
@@ -203,89 +197,6 @@ final class MovieService: ObservableObject {
         var bundle = try await detailMeta(pluginId: pluginId, movieId: movieId)
         bundle.detail = await detailStreams(pluginId: pluginId, movieId: movieId, detail: bundle.detail)
         return bundle
-    }
-
-    // MARK: - Torrentio (debrid-configured, native)
-
-    /// The TV-style Torrentio config segment built from the user's
-    /// debrid tokens, in the owner's preference order (TorBox →
-    /// Premiumize → Real-Debrid). Empty when nothing is configured
-    /// (bare Torrentio: hash-only entries).
-    private func torrentioConfig() -> String {
-        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
-        func enc(_ value: String) -> String { value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value }
-        var parts: [String] = []
-        if !DebridTokens.torbox.isEmpty { parts.append("torbox=" + enc(DebridTokens.torbox)) }
-        if !DebridTokens.premiumize.isEmpty { parts.append("premiumize=" + enc(DebridTokens.premiumize)) }
-        if !DebridTokens.rd.isEmpty { parts.append("realdebrid=" + enc(DebridTokens.rd)) }
-        return parts.joined(separator: "|")
-    }
-
-    private func torrentioConfiguredStreams(imdbId: String) async -> [EpisodeServer]? {
-        let config = torrentioConfig()
-        let base = config.isEmpty ? "https://torrentio.strem.fun" : "https://torrentio.strem.fun/" + config
-        guard let url = URL(string: "\(base)/stream/movie/\(imdbId).json") else { return nil }
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 30
-        request.setValue(Net.desktopUA, forHTTPHeaderField: "User-Agent")
-        guard let (data, response) = try? await Net.session.data(for: request),
-              (200..<300).contains((response as? HTTPURLResponse)?.statusCode ?? 0),
-              let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let entries = json["streams"] as? [[String: Any]], !entries.isEmpty else { return nil }
-        var episodes: [Episode] = []
-        for entry in entries.prefix(40) {
-            guard let hash = (entry["infoHash"] as? String)?.lowercased(), !hash.isEmpty else { continue }
-            let title = (entry["title"] as? String) ?? ""
-            let name = (entry["name"] as? String) ?? "Torrentio"
-            let label = Self.torrentioLabel(name: name, title: title)
-            if let direct = entry["url"] as? String, !direct.isEmpty {
-                episodes.append(Episode(id: "jtvts:\(hash)|\(direct)", name: label))
-            } else {
-                episodes.append(Episode(id: "jtvhash:\(hash)", name: label))
-            }
-        }
-        guard !episodes.isEmpty else { return nil }
-        return [EpisodeServer(name: "Torrentio", episodes: episodes)]
-    }
-
-    static func torrentioLabel(name: String, title: String) -> String {
-        let lines = title.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
-        let file = lines.first ?? name
-        var bits: [String] = []
-        let hay = title.lowercased()
-        for token in ["2160p", "1080p", "720p", "480p", "4k", "uhd", "bluray", "blu-ray", "web-dl", "webrip", "hdrip", "remux", "cam"] where hay.contains(token) {
-            bits.append(token.uppercased())
-            if bits.count >= 2 { break }
-        }
-        if let size = title.range(of: #"\d+(\.\d+)?\s?(GB|MB)"#, options: .regularExpression) {
-            bits.append(String(title[size]))
-        }
-        if let seeds = title.range(of: #"👤\s*\d+"#, options: .regularExpression) {
-            bits.append("🌱 " + title[seeds].dropFirst(1).trimmingCharacters(in: .whitespaces))
-        }
-        return bits.isEmpty ? file : file + "\n" + bits.joined(separator: " · ")
-    }
-
-    /// Chases one debrid-configured Torrentio resolve link. A real
-    /// file URL means the provider had the torrent cached — play
-    /// it now (the TV-fast path). A /videos/downloading_* or
-    /// failed_* placeholder, or anything webpage-shaped, returns
-    /// nil so the caller falls back to the native debrid chain
-    /// with the entry's hash.
-    private func chaseTorrentioResolve(_ urlString: String) async -> StreamInfo? {
-        guard let url = URL(string: urlString) else { return nil }
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 20
-        request.setValue(Net.desktopUA, forHTTPHeaderField: "User-Agent")
-        request.setValue("bytes=0-1023", forHTTPHeaderField: "Range")
-        guard let (_, response) = try? await URLSession.shared.data(for: request),
-              let final = response.url else { return nil }
-        let finalString = final.absoluteString
-        let path = final.path.lowercased()
-        if path.contains("/videos/downloading") || path.contains("/videos/failed") { return nil }
-        if final.host == "torrentio.strem.fun" { return nil }
-        if Self.looksLikeWebPage(finalString) { return nil }
-        return StreamInfo(url: finalString, headers: [:], useCompatEngine: DebridResolver.needsCompatEngine(filename: final.lastPathComponent))
     }
 
     // MARK: - Embed prefetch (v1.22)
@@ -346,28 +257,12 @@ final class MovieService: ObservableObject {
 
         // Debrid torrent target (torrenthub): the episode id is an
         // info-hash, not a URL — the native debrid resolver turns
-        // it into a direct file link (TorBox → Premiumize →
-        // Real-Debrid), flagging containers AVPlayer cannot open
+        // it into a direct file link (Real-Debrid → TorBox →
+        // Premiumize), flagging containers AVPlayer cannot open
         // for the KSPlayer surface.
         if target.hasPrefix("jtvhash:") {
             let hash = String(target.dropFirst("jtvhash:".count))
             return .video(try await DebridResolver.resolve(hash: hash))
-        }
-
-        // Lane A entry from the debrid-configured Torrentio list
-        // (v1.22): the episode carries a resolve link. Chase it
-        // once — a cached torrent lands on the file URL directly;
-        // a downloading/failed placeholder falls back to the
-        // native chain with the entry's hash.
-        if target.hasPrefix("jtvts:") {
-            let payload = String(target.dropFirst("jtvts:".count))
-            let parts = payload.split(separator: "|", maxSplits: 1).map(String.init)
-            if parts.count == 2 {
-                if let chased = await chaseTorrentioResolve(parts[1]) {
-                    return .video(chased)
-                }
-                return .video(try await DebridResolver.resolve(hash: parts[0]))
-            }
         }
 
         // Direct media target.
