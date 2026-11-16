@@ -454,10 +454,10 @@ struct StreamInfo: Codable {
 
     init(url: String = "", headers: [String: String] = [:],
          subtitles: [SubtitleTrack] = [], images: [String] = [], isEmbed: Bool = false,
-         postBody: String? = nil, requiresProxy: Bool = false) {
+         postBody: String? = nil, requiresProxy: Bool = false, useCompatEngine: Bool = false) {
         self.url = url; self.headers = headers; self.subtitles = subtitles
         self.images = images; self.isEmbed = isEmbed; self.postBody = postBody
-        self.requiresProxy = requiresProxy
+        self.requiresProxy = requiresProxy; self.useCompatEngine = useCompatEngine
     }
 
     init(from decoder: Decoder) throws {
@@ -469,6 +469,7 @@ struct StreamInfo: Codable {
         isEmbed = try c.decodeIfPresent(Bool.self, forKey: .isEmbed) ?? false
         postBody = try c.decodeIfPresent(String.self, forKey: .postBody) ?? nil
         requiresProxy = try c.decodeIfPresent(Bool.self, forKey: .requiresProxy) ?? false
+        useCompatEngine = try c.decodeIfPresent(Bool.self, forKey: .useCompatEngine) ?? false
     }
 
     var streamURL: URL? { url.isEmpty ? nil : URL(string: url) }
