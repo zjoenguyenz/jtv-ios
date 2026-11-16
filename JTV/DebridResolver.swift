@@ -75,56 +75,65 @@ enum DebridResolver {
         guard clean.count >= 32 else { throw DebridError.message("Mã torrent không hợp lệ.") }
         let tb = DebridTokens.torbox, pm = DebridTokens.premiumize, rd = DebridTokens.rd
         guard !tb.isEmpty || !pm.isEmpty || !rd.isEmpty else { throw DebridError.noToken }
-        let started = Date()
-        let globalDeadline = started.addingTimeInterval(budget)
-        var lastError: Error = DebridError.noToken
-        var downloading: [(order: Int, run: (Date) async throws -> StreamInfo)] = []
+        let globalDeadline = Date().addingTimeInterval(budget)
+        // v1.22.1: every pass gets a window measured from ITS OWN
+        // start. The v1.22 build measured all windows from the
+        // resolve start, so the first provider's window silently
+        // starved every later one — Real-Debrid (the provider that
+        // had actually served this phone in v1.21) never got a real
+        // turn, and the chain parked on the settle pass. The chain
+        // log rides along in the final error so a failure screenshot
+        // names the exact stage instead of a naked system string.
+        var log: [String] = []
+        var lastError: Error?
+        var downloading: [(order: Int, name: String, run: (Date) async throws -> StreamInfo)] = []
+
+        func attempt(_ name: String, _ order: Int, _ window: TimeInterval,
+                     _ body: @escaping (Date) async throws -> StreamInfo) async -> StreamInfo? {
+            do {
+                return try await body(Date().addingTimeInterval(window))
+            } catch DebridError.downloading {
+                log.append("\(name): đang tải")
+                downloading.append((order, name, body))
+                return nil
+            } catch {
+                log.append("\(name): \(error.localizedDescription.prefix(60))")
+                lastError = error
+                return nil
+            }
+        }
 
         // Premiumize cache probe: directdl answers with real links
         // in ONE call when the torrent is already on their system.
+        // The hit is HELD, not returned yet: TorBox outranks
+        // Premiumize in the owner's order, so a cached TorBox copy
+        // still wins inside its quick window; the held hit is the
+        // instant fallback when TorBox yields.
         var pmCached: StreamInfo?
         if !pm.isEmpty {
             pmCached = try? await premiumizeDirectDL(hash: clean, token: pm)
+            if pmCached == nil { log.append("PM: chưa có sẵn") }
         }
 
-        // TorBox pass. When Premiumize already has the file, the
-        // window is short: a cached TorBox torrent resolves inside
-        // it and wins by preference; a still-downloading one yields
-        // to the cached Premiumize link instead of parking the user.
-        if !tb.isEmpty {
-            let window = started.addingTimeInterval(pmCached != nil ? 20 : 45)
-            do {
-                return try await resolveTorBox(hash: clean, token: tb, deadline: window)
-            } catch DebridError.downloading {
-                downloading.append((0, { dl in try await resolveTorBox(hash: clean, token: tb, deadline: dl) }))
-            } catch {
-                lastError = error
-            }
+        // TorBox quick pass: a CACHED TorBox torrent finishes
+        // inside a short window and wins by the owner's preference;
+        // a still-downloading one yields instead of parking.
+        if !tb.isEmpty,
+           let hit = await attempt("TorBox", 0, 25, { dl in try await resolveTorBox(hash: clean, token: tb, deadline: dl) }) {
+            return hit
         }
         if let pmCached { return pmCached }
 
-        // Premiumize full pass (create + poll) when the probe missed.
-        if !pm.isEmpty {
-            let window = started.addingTimeInterval(45)
-            do {
-                return try await resolvePremiumize(hash: clean, token: pm, deadline: window)
-            } catch DebridError.downloading {
-                downloading.append((1, { dl in try await resolvePremiumize(hash: clean, token: pm, deadline: dl) }))
-            } catch {
-                lastError = error
-            }
+        // Real-Debrid pass — the chain shape that served v1.21.
+        if !rd.isEmpty,
+           let hit = await attempt("RD", 2, 60, { dl in try await resolveRD(hash: clean, token: rd, deadline: dl) }) {
+            return hit
         }
 
-        // Real-Debrid pass.
-        if !rd.isEmpty {
-            let window = started.addingTimeInterval(45)
-            do {
-                return try await resolveRD(hash: clean, token: rd, deadline: window)
-            } catch DebridError.downloading {
-                downloading.append((2, { dl in try await resolveRD(hash: clean, token: rd, deadline: dl) }))
-            } catch {
-                lastError = error
-            }
+        // Premiumize full pass (create + poll) when the probe missed.
+        if !pm.isEmpty,
+           let hit = await attempt("PM", 1, 45, { dl in try await resolvePremiumize(hash: clean, token: pm, deadline: dl) }) {
+            return hit
         }
 
         // Every configured provider is still downloading: settle
@@ -133,10 +142,15 @@ enum DebridResolver {
             do {
                 return try await first.run(globalDeadline)
             } catch DebridError.downloading {
-                throw DebridError.timeout
+                throw DebridError.message("Torrent vẫn đang tải trên \(first.name) quá lâu. [\(log.joined(separator: " · "))]")
+            } catch {
+                throw DebridError.message("\(first.name): \(error.localizedDescription.prefix(80)) [\(log.joined(separator: " · "))]")
             }
         }
-        throw lastError
+        if let lastError {
+            throw DebridError.message("\(lastError.localizedDescription.prefix(80)) [\(log.joined(separator: " · "))]")
+        }
+        throw DebridError.message("Không lấy được link torrent. [\(log.joined(separator: " · "))]")
     }
 
     static func needsCompatEngine(filename: String) -> Bool {
@@ -196,7 +210,13 @@ enum DebridResolver {
             request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
             request.httpBody = formBody(form)
         }
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch let error as URLError {
+            throw DebridError.message("Real-Debrid: lỗi kết nối (mã \(error.code.rawValue))")
+        }
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard (200..<300).contains(code) else {
             throw DebridError.http(code, String(data: data, encoding: .utf8)?.prefix(160).description ?? "")
@@ -254,7 +274,13 @@ enum DebridResolver {
         ]
         var request = URLRequest(url: components.url!)
         request.timeoutInterval = 30
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch let error as URLError {
+            throw DebridError.message("TorBox: lỗi kết nối khi xin link (mã \(error.code.rawValue))")
+        }
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         let body = String(data: data, encoding: .utf8) ?? ""
         guard (200..<300).contains(code) else {
@@ -278,7 +304,13 @@ enum DebridResolver {
             request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
             request.httpBody = formBody(form)
         }
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch let error as URLError {
+            throw DebridError.message("TorBox: lỗi kết nối (mã \(error.code.rawValue))")
+        }
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard (200..<300).contains(code) else {
             throw DebridError.http(code, String(data: data, encoding: .utf8)?.prefix(160).description ?? "")
@@ -369,7 +401,13 @@ enum DebridResolver {
             request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
             request.httpBody = formBody(form)
         }
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch let error as URLError {
+            throw DebridError.message("Premiumize: lỗi kết nối (mã \(error.code.rawValue))")
+        }
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard (200..<300).contains(code) else {
             throw DebridError.http(code, String(data: data, encoding: .utf8)?.prefix(160).description ?? "")

@@ -13,7 +13,7 @@ enum MovieServiceError: Error, LocalizedError {
         case .noURL: return "Plugin không tạo được link dữ liệu."
         case .emptyDetail: return "Không tải được thông tin phim."
         case .unresolvedEpisode: return "Không tìm được link phát cho tập này."
-        case .timedOut: return "Lấy link quá lâu (>45 giây). Kiểm tra mạng/VPN rồi bấm Thử lại."
+        case .timedOut: return "Lấy link quá lâu. Kiểm tra mạng/VPN rồi bấm Thử lại."
         }
     }
 }
@@ -226,9 +226,9 @@ final class MovieService: ObservableObject {
         let base = config.isEmpty ? "https://torrentio.strem.fun" : "https://torrentio.strem.fun/" + config
         guard let url = URL(string: "\(base)/stream/movie/\(imdbId).json") else { return nil }
         var request = URLRequest(url: url)
-        request.timeoutInterval = 20
+        request.timeoutInterval = 30
         request.setValue(Net.desktopUA, forHTTPHeaderField: "User-Agent")
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
+        guard let (data, response) = try? await Net.session.data(for: request),
               (200..<300).contains((response as? HTTPURLResponse)?.statusCode ?? 0),
               let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let entries = json["streams"] as? [[String: Any]], !entries.isEmpty else { return nil }

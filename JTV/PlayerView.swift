@@ -573,6 +573,11 @@ final class PlayerSurfaceViewController: UIViewController {
     private var hideTimer: Timer?
     private var controlsVisible = true
     private var isScrubbing = false
+    /// The user's own play/pause intent (v1.22.1). With
+    /// waitsToMinimizeStalling off, AVPlayer stays paused after a
+    /// seek or a buffer stall until told to play again — the app
+    /// must honour the INTENT, not the player's momentary state.
+    private var userPaused = false
     private var didStartPlayback = false
     private var didRequestLandscape = false
 
@@ -798,6 +803,13 @@ final class PlayerSurfaceViewController: UIViewController {
         playPauseButton.setImage(UIImage(systemName: playing ? "pause.fill" : "play.fill"), for: .normal)
         let waiting = !gaveUp && (player.timeControlStatus == .waitingToPlayAtSpecifiedRate || item.status != .readyToPlay)
         if waiting { spinner.startAnimating() } else { spinner.stopAnimating() }
+        // v1.22.1 intent keeper: a seek or a stall can leave the
+        // player paused although the user never paused — when the
+        // intent is "playing" and the item can keep up, resume.
+        if !userPaused, !isScrubbing, player.timeControlStatus == .paused,
+           item.status == .readyToPlay, item.isPlaybackLikelyToKeepUp {
+            player.play()
+        }
         // Now Playing (Lock Screen / Control Center / headset),
         // pushed at ~1 Hz — the 0.25 s UI cadence would spam it.
         if Date().timeIntervalSince(lastNowPlayingPush) > 1 {
@@ -820,22 +832,33 @@ final class PlayerSurfaceViewController: UIViewController {
     private func setupRemoteCommands() {
         let center = MPRemoteCommandCenter.shared()
         remoteTargets.append((center.playCommand, center.playCommand.addTarget { [weak self] _ in
+            self?.userPaused = false
             self?.player?.play()
             return .success
         }))
         remoteTargets.append((center.pauseCommand, center.pauseCommand.addTarget { [weak self] _ in
+            self?.userPaused = true
             self?.player?.pause()
             return .success
         }))
         remoteTargets.append((center.togglePlayPauseCommand, center.togglePlayPauseCommand.addTarget { [weak self] _ in
-            guard let player = self?.player else { return .commandFailed }
-            if player.timeControlStatus == .playing { player.pause() } else { player.play() }
+            guard let self, let player = self.player else { return .commandFailed }
+            if player.timeControlStatus == .playing {
+                player.pause()
+                self.userPaused = true
+            } else {
+                player.play()
+                self.userPaused = false
+            }
             return .success
         }))
         remoteTargets.append((center.changePlaybackPositionCommand, center.changePlaybackPositionCommand.addTarget { [weak self] event in
-            guard let positionEvent = event as? MPChangePlaybackPositionCommandEvent,
-                  let player = self?.player else { return .commandFailed }
-            player.seek(to: CMTime(seconds: positionEvent.positionTime, preferredTimescale: 600))
+            guard let self, let positionEvent = event as? MPChangePlaybackPositionCommandEvent,
+                  let player = self.player else { return .commandFailed }
+            player.seek(to: CMTime(seconds: positionEvent.positionTime, preferredTimescale: 600)) { [weak self] _ in
+                guard let self, !self.userPaused else { return }
+                self.player?.play()
+            }
             return .success
         }))
     }
@@ -881,7 +904,13 @@ final class PlayerSurfaceViewController: UIViewController {
 
     @objc private func togglePlay() {
         guard let player else { return }
-        if player.timeControlStatus == .playing { player.pause() } else { player.play() }
+        if player.timeControlStatus == .playing {
+            player.pause()
+            userPaused = true
+        } else {
+            player.play()
+            userPaused = false
+        }
         refreshUI()
         scheduleControlsHide()
     }
@@ -892,7 +921,10 @@ final class PlayerSurfaceViewController: UIViewController {
     private func skip(by delta: Double) {
         guard let player else { return }
         let target = max(0, player.currentTime().seconds + delta)
-        player.seek(to: CMTime(seconds: target, preferredTimescale: 600))
+        player.seek(to: CMTime(seconds: target, preferredTimescale: 600)) { [weak self] _ in
+            guard let self, !self.userPaused else { return }
+            self.player?.play()
+        }
         scheduleControlsHide()
     }
 
@@ -904,7 +936,10 @@ final class PlayerSurfaceViewController: UIViewController {
     @objc private func scrubEnded() {
         isScrubbing = false
         guard let player else { return }
-        player.seek(to: CMTime(seconds: Double(slider.value), preferredTimescale: 600))
+        player.seek(to: CMTime(seconds: Double(slider.value), preferredTimescale: 600)) { [weak self] _ in
+            guard let self, !self.userPaused else { return }
+            self.player?.play()
+        }
         scheduleControlsHide()
     }
 
@@ -1349,17 +1384,23 @@ struct PlaybackResolverView: View {
     private func resolve() async {
         phase = .resolving
         do {
-            // v1.22: a hard 45 s deadline on the resolver screen —
-            // the old unbounded chain could spin for minutes on a
-            // dying source (each fetch retrying behind the next).
-            // The underlying work is not cancelled (a slow source
-            // may still land in the page cache), but the user is
-            // never held hostage: timeout surfaces as a failure
-            // with a working Thử lại button.
+            // v1.22: a hard deadline on the resolver screen — the
+            // old unbounded chain could spin for minutes on a dying
+            // source (each fetch retrying behind the next). The
+            // underlying work is not cancelled (a slow source may
+            // still land in the page cache), but the user is never
+            // held hostage: timeout surfaces as a failure with a
+            // working Thử lại button. v1.22.1: torrent targets get
+            // a longer leash — a debrid server-side download
+            // legitimately takes minutes, and the chain carries
+            // its own 900 s budget; the 45 s cap is for page
+            // sources only.
+            let deadline: UInt64 = (request.episode.id.hasPrefix("jtvhash:") || request.episode.id.hasPrefix("jtvts:"))
+                ? 300_000_000_000 : 45_000_000_000
             let resolution = try await withThrowingTaskGroup(of: PlaybackResolution.self) { group in
                 group.addTask { try await service.resolveEpisode(request) }
                 group.addTask {
-                    try await Task.sleep(nanoseconds: 45_000_000_000)
+                    try await Task.sleep(nanoseconds: deadline)
                     throw MovieServiceError.timedOut
                 }
                 let first = try await group.next()!
