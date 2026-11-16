@@ -32,7 +32,7 @@ function getManifest() {
     return JSON.stringify({
         "id": "torrenthub",
         "name": "Torrent 18+",
-        "version": "1.0.0",
+        "version": "1.0.1",
         "baseUrl": "https://addon.debrid.in",
         "iconUrl": "",
         "isEnabled": true,
@@ -255,19 +255,26 @@ function thStreamLabel(release, metaLine, nameField) {
     var quality = qm ? qm[1] : "";
     var cm = text.match(/\.(mkv|mp4|avi|m4v|ts|wmv)\b/i);
     var container = cm ? cm[1].toUpperCase() : "";
-    var seeds = 0, size = "";
+    var seeds = 0, size = "", sizeMB = 0;
     if (metaLine) {
         var sm = metaLine.match(/👤\s*(\d+)/);
         if (sm) seeds = parseInt(sm[1]);
         var zm = metaLine.match(/💾\s*([0-9.]+\s*[KMGT]B)/i);
-        if (zm) size = zm[1].replace(/\s+/g, " ");
+        if (zm) {
+            size = zm[1].replace(/\s+/g, " ");
+            var sp = size.match(/([0-9.]+)\s*([KMGT]B)/i);
+            if (sp) {
+                var mult = { KB: 1 / 1024, MB: 1, GB: 1024, TB: 1024 * 1024 }[sp[2].toUpperCase()] || 0;
+                sizeMB = parseFloat(sp[1]) * mult;
+            }
+        }
     }
     var parts = [];
     if (quality) parts.push(quality);
     if (container) parts.push(container);
     if (size) parts.push(size);
     if (seeds > 0) parts.push("👤 " + seeds);
-    return { label: parts.join(" · "), seeds: seeds, rank: thQualityRank(quality) };
+    return { label: parts.join(" · "), seeds: seeds, rank: thQualityRank(quality), sizeMB: sizeMB };
 }
 
 function thEpisodesFromStreams(streams, isTorrentio) {
@@ -287,7 +294,8 @@ function thEpisodesFromStreams(streams, isTorrentio) {
                 name: label,
                 slug: "s" + i,
                 _seeds: info.seeds,
-                _rank: info.rank
+                _rank: info.rank,
+                _sizeMB: info.sizeMB
             });
         } else if (s.url) {
             eps.push({
@@ -295,13 +303,22 @@ function thEpisodesFromStreams(streams, isTorrentio) {
                 name: (s.name || "Trực tiếp") + (s.title ? " · " + String(s.title).split("\n")[0] : ""),
                 slug: "s" + i,
                 _seeds: 0,
-                _rank: 0
+                _rank: 0,
+                _sizeMB: 0
             });
         }
     }
+    // Owner's selection criterion (2026-11-16): QUALITY first —
+    // FHD (1080p) is the floor of the top group, higher quality
+    // above it; within one quality tier the fastest source wins
+    // (most seeds), then the larger file. Weaker/unknown quality
+    // only after every FHD-or-better source. (Before this the sort
+    // was seeds-first, which put high-seed 720p/unknown files above
+    // 2160p/1080p ones.)
     eps.sort(function (a, b) {
+        if (b._rank !== a._rank) return b._rank - a._rank;
         if (b._seeds !== a._seeds) return b._seeds - a._seeds;
-        return b._rank - a._rank;
+        return b._sizeMB - a._sizeMB;
     });
     if (eps.length > 40) eps = eps.slice(0, 40);
     var out = [];
