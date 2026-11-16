@@ -1,6 +1,7 @@
 import SwiftUI
 import AVKit
 import WebKit
+import MediaPlayer
 
 // MARK: - Native player surface
 
@@ -26,6 +27,11 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
     let headers: [String: String]
     let startPosition: Double
     var startViaProxy: Bool = false
+    /// Movie title for the Now Playing info (v1.22).
+    var title: String = ""
+    /// Re-resolves the episode from scratch (v1.22 self-heal's
+    /// last rung: a completely fresh link after same-URL retries).
+    var onFreshStream: (() async -> StreamInfo?)?
     var onProgress: (Double, Double) -> Void
     var onExit: (Double, Double) -> Void
 
@@ -55,10 +61,18 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         }
         let item = AVPlayerItem(asset: asset)
         let player = AVPlayer(playerItem: item)
+        // v1.22 buffer tuning: AVPlayer's stall-proofing default
+        // deliberately delays first frame (and every seek landing)
+        // until it holds a large buffer — on the slow CDNs these
+        // sources use, that is seconds of avoidable waiting per
+        // start/seek. The Coordinator's own stall ladder + the
+        // mid-playback self-heal are the safety net now.
+        player.automaticallyWaitsToMinimizeStalling = false
         context.coordinator.player = player
         context.coordinator.sourceURL = url
         context.coordinator.sourceHeaders = headers
         context.coordinator.startedViaProxy = startViaProxy
+        context.coordinator.freshStreamProvider = onFreshStream
         context.coordinator.observe(item: item)
 
         let interval = CMTime(seconds: 5, preferredTimescale: 1)
@@ -70,6 +84,7 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         let controller = PlayerSurfaceViewController()
         controller.player = player
         controller.coordinator = context.coordinator
+        controller.nowPlayingTitle = title
         context.coordinator.onGiveUp = { [weak controller] message in
             controller?.showError(message: message)
         }
@@ -132,6 +147,22 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         private var sawProgress = false
         var onGiveUp: ((String?) -> Void)?
         private var didMaterialize = false
+
+        // v1.22 mid-playback self-heal: a stream that dies AFTER
+        // it has played (the owner's seek-death report: drag the
+        // scrubber, the host refuses the new connections, the
+        // item fails hard) previously had NO recovery — neither
+        // surface ever retried the same URL or re-resolved a
+        // fresh link. The ladder: retry the current stream as-is
+        // (backoff 2 s, then 5 s), then one completely fresh
+        // resolve, resuming at the death position; only then the
+        // error screen. Start-phase failures keep the transport
+        // ladders below — they never reach this (hasPlayed false).
+        var freshStreamProvider: (() async -> StreamInfo?)?
+        private var hasPlayed = false
+        private var recoveryAttempts = 0
+        private var isRecovering = false
+        private var lastRecoveryPosition = -1.0
         private var ladderPending = false
         private var materializedFileURL: URL?
         private var proxyStage = 0   // 0 loader, 1 loopback server, 2 local file, 3 plain
@@ -255,6 +286,9 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         }
 
         func observe(item: AVPlayerItem) {
+            // v1.22: explicit forward buffer on EVERY item (the
+            // initial one and every ladder/recovery swap).
+            item.preferredForwardBufferDuration = 12
             statusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
                 if item.status == .failed {
                     DispatchQueue.main.async { self?.handleFailure() }
@@ -297,7 +331,7 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
                     lastTime = now
                     lastBufferedEnd = bufferedEnd
                     self.stallTicks = 0
-                    if now > 0.5 || bufferedEnd > 0 { self.sawProgress = true }
+                    if now > 0.5 || bufferedEnd > 0 { self.sawProgress = true; self.hasPlayed = true }
                     return
                 }
                 self.stallTicks += 1
@@ -349,6 +383,7 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
                 onGiveUp?(lastErrorText())
                 return
             }
+            if hasPlayed, beginRecovery() { return }
             if transportSwitched {
                 onGiveUp?(lastErrorText())
                 return
@@ -358,6 +393,79 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
                 if !didFallBackToPlain { fallBackToPlain() }
             } else {
                 retryViaProxy()
+            }
+        }
+
+        /// Starts one self-heal attempt; returns false when the
+        /// attempts are exhausted (caller gives up). While an
+        /// attempt is in flight, further failures are swallowed
+        /// (returns true) — the attempt's own outcome decides.
+        private func beginRecovery() -> Bool {
+            if isRecovering { return true }
+            recoveryAttempts += 1
+            guard recoveryAttempts <= 3 else { return false }
+            isRecovering = true
+            let deathPos = player?.currentTime().seconds ?? 0
+            if deathPos.isFinite, deathPos > 1 {
+                startPosition = deathPos
+                lastRecoveryPosition = deathPos
+            }
+            didSeek = false
+            let attempt = recoveryAttempts
+            Task { [weak self] in
+                if attempt < 3 {
+                    try? await Task.sleep(nanoseconds: attempt == 1 ? 2_000_000_000 : 5_000_000_000)
+                }
+                await MainActor.run { self?.performRecovery(attempt: attempt) }
+            }
+            return true
+        }
+
+        private func performRecovery(attempt: Int) {
+            guard let player else { isRecovering = false; return }
+            if attempt < 3 {
+                // Retry the stream the player is CURRENTLY on,
+                // rebuilt plainly from its own URL — never through
+                // the HLS rescue loader: for a direct file that
+                // loader is the wrong tool, and it was the old
+                // code's only "retry", which is why a refused
+                // seek was terminal.
+                if let currentURL = (player.currentItem?.asset as? AVURLAsset)?.url {
+                    let asset = AVURLAsset(url: currentURL, options: ["AVURLAssetHTTPHeaderFieldsKey": sourceHeaders])
+                    let item = AVPlayerItem(asset: asset)
+                    player.replaceCurrentItem(with: item)
+                    observe(item: item)
+                    seekAndPlay()
+                }
+                isRecovering = false
+                return
+            }
+            // Last rung: a completely fresh resolve of the episode.
+            guard let provider = freshStreamProvider else {
+                isRecovering = false
+                onGiveUp?(lastErrorText())
+                return
+            }
+            Task { [weak self] in
+                let fresh = await provider()
+                await MainActor.run {
+                    guard let self else { return }
+                    self.isRecovering = false
+                    guard let fresh, let freshURL = fresh.streamURL, !fresh.useCompatEngine else {
+                        self.onGiveUp?(self.lastErrorText())
+                        return
+                    }
+                    self.sourceURL = freshURL
+                    self.sourceHeaders = fresh.headers
+                    self.transportSwitched = false
+                    self.didRetryViaProxy = false
+                    self.didFallBackToPlain = false
+                    let asset = AVURLAsset(url: freshURL, options: ["AVURLAssetHTTPHeaderFieldsKey": fresh.headers])
+                    let item = AVPlayerItem(asset: asset)
+                    self.player?.replaceCurrentItem(with: item)
+                    self.observe(item: item)
+                    self.seekAndPlay()
+                }
             }
         }
 
@@ -414,7 +522,16 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
 
         func reportProgress() {
             let (c, d) = times()
-            if c > 0 { onProgress(c, d) }
+            if c > 0 {
+                if c > 0.5 { hasPlayed = true }
+                // Playback is healthy again well past the death
+                // position: the self-heal budget refills.
+                if lastRecoveryPosition >= 0, c > lastRecoveryPosition + 5 {
+                    recoveryAttempts = 0
+                    lastRecoveryPosition = -1
+                }
+                onProgress(c, d)
+            }
         }
 
         func reportExit() {
@@ -433,6 +550,8 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
 final class PlayerSurfaceViewController: UIViewController {
     var player: AVPlayer?
     weak var coordinator: VideoPlayerSurface.Coordinator?
+    /// Movie title shown in Now Playing (v1.22).
+    var nowPlayingTitle = ""
 
     private let videoView = PlayerLayerView()
     private let controlsView = UIView()
@@ -441,6 +560,10 @@ final class PlayerSurfaceViewController: UIViewController {
     private let backButton = UIButton(type: .system)
     private let forwardButton = UIButton(type: .system)
     private let rotateButton = UIButton(type: .system)
+    private let pipButton = UIButton(type: .system)
+    private var pipController: AVPictureInPictureController?
+    private var remoteTargets: [(MPRemoteCommand, Any)] = []
+    private var lastNowPlayingPush = Date.distantPast
     private let slider = UISlider()
     private let currentLabel = UILabel()
     private let durationLabel = UILabel()
@@ -495,6 +618,22 @@ final class PlayerSurfaceViewController: UIViewController {
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
         view.addGestureRecognizer(pinch)
 
+        // v1.22: background audio + Picture-in-Picture + Now
+        // Playing. The .playback audio session (with the audio
+        // background mode in the bundle) keeps the sound running
+        // when the screen locks or the app is backgrounded; PiP
+        // floats the video when the user swipes home.
+        let audioSession = AVAudioSession.sharedInstance()
+        try? audioSession.setCategory(.playback, mode: .moviePlayback)
+        try? audioSession.setActive(true)
+        if AVPictureInPictureController.isPictureInPictureSupported() {
+            let pip = AVPictureInPictureController(playerLayer: videoView.playerLayer)
+            pip?.delegate = self
+            pip?.canStartPictureInPictureAutomaticallyFromInline = true
+            pipController = pip
+        }
+        setupRemoteCommands()
+
         uiTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.refreshUI()
         }
@@ -542,6 +681,7 @@ final class PlayerSurfaceViewController: UIViewController {
         super.viewWillDisappear(animated)
         uiTimer?.invalidate()
         hideTimer?.invalidate()
+        teardownRemoteCommands()
     }
 
     // MARK: Controls
@@ -599,7 +739,17 @@ final class PlayerSurfaceViewController: UIViewController {
         rotateButton.heightAnchor.constraint(equalToConstant: 40).isActive = true
         rotateButton.addTarget(self, action: #selector(toggleRotation), for: .touchUpInside)
 
-        let bottomRow = UIStackView(arrangedSubviews: [currentLabel, slider, durationLabel, rotateButton])
+        pipButton.setImage(UIImage(systemName: "pip.enter"), for: .normal)
+        pipButton.tintColor = .white
+        pipButton.backgroundColor = UIColor.black.withAlphaComponent(0.45)
+        pipButton.layer.cornerRadius = 20
+        pipButton.translatesAutoresizingMaskIntoConstraints = false
+        pipButton.widthAnchor.constraint(equalToConstant: 40).isActive = true
+        pipButton.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        pipButton.addTarget(self, action: #selector(togglePiP), for: .touchUpInside)
+        pipButton.isHidden = !AVPictureInPictureController.isPictureInPictureSupported()
+
+        let bottomRow = UIStackView(arrangedSubviews: [currentLabel, slider, durationLabel, pipButton, rotateButton])
         bottomRow.axis = .horizontal
         bottomRow.spacing = 10
         bottomRow.alignment = .center
@@ -648,6 +798,62 @@ final class PlayerSurfaceViewController: UIViewController {
         playPauseButton.setImage(UIImage(systemName: playing ? "pause.fill" : "play.fill"), for: .normal)
         let waiting = !gaveUp && (player.timeControlStatus == .waitingToPlayAtSpecifiedRate || item.status != .readyToPlay)
         if waiting { spinner.startAnimating() } else { spinner.stopAnimating() }
+        // Now Playing (Lock Screen / Control Center / headset),
+        // pushed at ~1 Hz — the 0.25 s UI cadence would spam it.
+        if Date().timeIntervalSince(lastNowPlayingPush) > 1 {
+            lastNowPlayingPush = Date()
+            var info: [String: Any] = [
+                MPMediaItemPropertyTitle: nowPlayingTitle.isEmpty ? "JTV" : nowPlayingTitle,
+                MPNowPlayingInfoPropertyElapsedPlaybackTime: current.isFinite ? current : 0,
+                MPNowPlayingInfoPropertyPlaybackRate: playing ? 1.0 : 0.0,
+                MPNowPlayingInfoPropertyIsLiveStream: false,
+            ]
+            if duration.isFinite, duration > 0 {
+                info[MPMediaItemPropertyPlaybackDuration] = duration
+            }
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        }
+    }
+
+    // MARK: Remote commands + PiP (v1.22)
+
+    private func setupRemoteCommands() {
+        let center = MPRemoteCommandCenter.shared()
+        remoteTargets.append((center.playCommand, center.playCommand.addTarget { [weak self] _ in
+            self?.player?.play()
+            return .success
+        }))
+        remoteTargets.append((center.pauseCommand, center.pauseCommand.addTarget { [weak self] _ in
+            self?.player?.pause()
+            return .success
+        }))
+        remoteTargets.append((center.togglePlayPauseCommand, center.togglePlayPauseCommand.addTarget { [weak self] _ in
+            guard let player = self?.player else { return .commandFailed }
+            if player.timeControlStatus == .playing { player.pause() } else { player.play() }
+            return .success
+        }))
+        remoteTargets.append((center.changePlaybackPositionCommand, center.changePlaybackPositionCommand.addTarget { [weak self] event in
+            guard let positionEvent = event as? MPChangePlaybackPositionCommandEvent,
+                  let player = self?.player else { return .commandFailed }
+            player.seek(to: CMTime(seconds: positionEvent.positionTime, preferredTimescale: 600))
+            return .success
+        }))
+    }
+
+    private func teardownRemoteCommands() {
+        for (command, target) in remoteTargets { command.removeTarget(target) }
+        remoteTargets.removeAll()
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+    }
+
+    @objc private func togglePiP() {
+        guard let pip = pipController else { return }
+        if pip.isPictureInPictureActive {
+            pip.stopPictureInPicture()
+        } else {
+            pip.startPictureInPicture()
+        }
+        scheduleControlsHide()
     }
 
     private static func formatTime(_ seconds: Double) -> String {
@@ -720,6 +926,14 @@ final class PlayerLayerView: UIView {
     }
 }
 
+extension PlayerSurfaceViewController: AVPictureInPictureControllerDelegate {
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void) {
+        // The player UI never left the hierarchy — PiP floated
+        // above it — so restoring is just confirming.
+        completionHandler(true)
+    }
+}
+
 // MARK: - Player screen
 
 struct PlayerView: View {
@@ -727,6 +941,7 @@ struct PlayerView: View {
     let request: PlaybackRequest
 
     @EnvironmentObject private var history: WatchHistoryManager
+    @EnvironmentObject private var service: MovieService
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -738,6 +953,16 @@ struct PlayerView: View {
                     headers: stream.headers,
                     startPosition: request.startPosition,
                     startViaProxy: stream.requiresProxy,
+                    title: request.movie.title,
+                    onFreshStream: {
+                        // v1.22 self-heal's last rung: re-resolve
+                        // the episode from scratch (a fresh debrid
+                        // link for torrents, a fresh chain walk
+                        // for plugin sources).
+                        guard let resolution = try? await service.resolveEpisode(request),
+                              case .video(let fresh) = resolution else { return nil }
+                        return fresh
+                    },
                     onProgress: { save(position: $0, duration: $1, force: false) },
                     onExit: { save(position: $0, duration: $1, force: true) }
                 )
@@ -1050,9 +1275,16 @@ struct PlaybackResolverView: View {
                         .font(.system(size: 14, weight: .medium, design: .rounded))
                         .foregroundStyle(.white)
                         .multilineTextAlignment(.center)
-                    Button("Đóng") { dismiss() }
-                        .buttonStyle(.bordered)
+                    HStack(spacing: 12) {
+                        Button("Thử lại") {
+                            Task { await resolve() }
+                        }
+                        .buttonStyle(.borderedProminent)
                         .tint(Theme.accent)
+                        Button("Đóng") { dismiss() }
+                            .buttonStyle(.bordered)
+                            .tint(Theme.accent)
+                    }
                 }
                 .padding(24)
             }
@@ -1115,8 +1347,25 @@ struct PlaybackResolverView: View {
     }
 
     private func resolve() async {
+        phase = .resolving
         do {
-            let resolution = try await service.resolveEpisode(request)
+            // v1.22: a hard 45 s deadline on the resolver screen —
+            // the old unbounded chain could spin for minutes on a
+            // dying source (each fetch retrying behind the next).
+            // The underlying work is not cancelled (a slow source
+            // may still land in the page cache), but the user is
+            // never held hostage: timeout surfaces as a failure
+            // with a working Thử lại button.
+            let resolution = try await withThrowingTaskGroup(of: PlaybackResolution.self) { group in
+                group.addTask { try await service.resolveEpisode(request) }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: 45_000_000_000)
+                    throw MovieServiceError.timedOut
+                }
+                let first = try await group.next()!
+                group.cancelAll()
+                return first
+            }
             switch resolution {
             case .video(let stream): phase = .video(stream)
             case .manga(let stream): phase = .manga(stream)

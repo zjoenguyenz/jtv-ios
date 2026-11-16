@@ -106,6 +106,11 @@ struct MangaReaderView: View {
                                 .onAppear {
                                     currentIndex = index
                                     saveProgress()
+                                    // v1.22: warm the next pages so
+                                    // turning a page never waits on
+                                    // the CDN.
+                                    let upcoming = stream.images.dropFirst(index + 1).prefix(3)
+                                    ImageCacheManager.shared.prefetch(urlStrings: Array(upcoming), headers: stream.headers)
                                 }
                         }
                         chapterNavButtons

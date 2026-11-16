@@ -12,6 +12,7 @@ struct SettingsView: View {
     // build-time baked one).
     @AppStorage(DebridTokens.rdKey) private var rdToken = ""
     @AppStorage(DebridTokens.torboxKey) private var torboxToken = ""
+    @AppStorage(DebridTokens.premiumizeKey) private var premiumizeToken = ""
 
     private var appVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
@@ -237,11 +238,15 @@ struct SettingsView: View {
 
     private var torrentSection: some View {
         Section {
-            SecureField("Token Real-Debrid", text: $rdToken)
+            SecureField("Token TorBox", text: $torboxToken)
                 .foregroundStyle(.white)
                 .autocorrectionDisabled(true)
                 .textInputAutocapitalization(.never)
-            SecureField("Token TorBox", text: $torboxToken)
+            SecureField("API key Premiumize", text: $premiumizeToken)
+                .foregroundStyle(.white)
+                .autocorrectionDisabled(true)
+                .textInputAutocapitalization(.never)
+            SecureField("Token Real-Debrid", text: $rdToken)
                 .foregroundStyle(.white)
                 .autocorrectionDisabled(true)
                 .textInputAutocapitalization(.never)
@@ -250,9 +255,9 @@ struct SettingsView: View {
                     .foregroundStyle(Theme.accent)
             }
         } header: {
-            Text("Torrent (Real-Debrid / TorBox)")
+            Text("Torrent (TorBox / Premiumize / Real-Debrid)")
         } footer: {
-            Text("Dùng cho tab Torrent. Token chỉ lưu trên máy này; để trống nếu bản cài đặt đã nạp sẵn.")
+            Text("Dùng cho tab Torrent, thử theo thứ tự TorBox → Premiumize → Real-Debrid. Token chỉ lưu trên máy này; để trống nếu bản cài đặt đã nạp sẵn.")
         }
         .listRowBackground(Theme.glassFill)
     }

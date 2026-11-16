@@ -1,6 +1,8 @@
 import SwiftUI
 import UIKit
 import KSPlayer
+import AVFoundation
+import MediaPlayer
 
 // MARK: - FFmpeg player surface (KSPlayer)
 //
@@ -35,6 +37,7 @@ struct KSPlayerView: View {
     let request: PlaybackRequest
 
     @EnvironmentObject private var history: WatchHistoryManager
+    @EnvironmentObject private var service: MovieService
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -45,6 +48,14 @@ struct KSPlayerView: View {
                     url: url,
                     headers: stream.headers,
                     startPosition: request.startPosition,
+                    title: request.movie.title,
+                    onFreshStream: {
+                        // v1.22 self-heal's last rung (see the
+                        // AV surface): re-resolve from scratch.
+                        guard let resolution = try? await service.resolveEpisode(request),
+                              case .video(let fresh) = resolution else { return nil }
+                        return fresh
+                    },
                     onProgress: { save(position: $0, duration: $1, force: false) },
                     onExit: { save(position: $0, duration: $1, force: true) }
                 )
@@ -84,6 +95,8 @@ struct KSVideoPlayerSurface: UIViewControllerRepresentable {
     let url: URL
     let headers: [String: String]
     let startPosition: Double
+    var title: String = ""
+    var onFreshStream: (() async -> StreamInfo?)?
     var onProgress: (Double, Double) -> Void
     var onExit: (Double, Double) -> Void
 
@@ -97,6 +110,8 @@ struct KSVideoPlayerSurface: UIViewControllerRepresentable {
         controller.contentURL = url
         controller.contentHeaders = headers
         controller.startPosition = startPosition
+        controller.nowPlayingTitle = title
+        controller.freshStreamProvider = onFreshStream
         controller.onProgressTick = { [weak coordinator = context.coordinator] position, duration in
             coordinator?.onProgress(position, duration)
         }
@@ -136,6 +151,10 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
     var contentHeaders: [String: String] = [:]
     var startPosition: Double = 0
     var onProgressTick: ((Double, Double) -> Void)?
+    /// Movie title for Now Playing (v1.22).
+    var nowPlayingTitle = ""
+    /// Re-resolves the episode from scratch (v1.22 self-heal).
+    var freshStreamProvider: (() async -> StreamInfo?)?
 
     private var playerLayer: KSPlayerLayer?
     private var ready = false
@@ -148,6 +167,11 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
     private var lastPositionSec = -1.0
     private var lastAdvanceAt = Date()
     private var lastTickAt = Date.distantPast
+    // v1.22 self-heal state (mirrors the AV surface's ladder).
+    private var recoveryAttempts = 0
+    private var lastRecoveryPosition = -1.0
+    private var remoteTargets: [(MPRemoteCommand, Any)] = []
+    private var lastNowPlayingPush = Date.distantPast
 
     private let controlsView = UIView()
     private let spinner = UIActivityIndicatorView(style: .large)
@@ -212,6 +236,15 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
         view.addGestureRecognizer(pinch)
 
+        // v1.22: background audio + Now Playing, same as the AV
+        // surface. (PiP is NOT available on this surface: the ME
+        // engine renders through Metal, which the system's PiP
+        // controller cannot float.)
+        let audioSession = AVAudioSession.sharedInstance()
+        try? audioSession.setCategory(.playback, mode: .moviePlayback)
+        try? audioSession.setActive(true)
+        setupRemoteCommands()
+
         uiTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.refreshUI()
         }
@@ -242,6 +275,7 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
         super.viewWillDisappear(animated)
         uiTimer?.invalidate()
         hideTimer?.invalidate()
+        teardownRemoteCommands()
     }
 
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .allButUpsideDown }
@@ -259,6 +293,11 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
         if !contentHeaders.isEmpty {
             options.appendHeader(contentHeaders)
         }
+        // v1.22 buffer tuning (verified against the 2.3.4
+        // library source): the stock 3 s forward buffer makes
+        // the engine re-stall on every slow segment; 12 s
+        // matches the AV surface's setting.
+        options.preferredForwardBufferDuration = 12
         KSOptions.firstPlayerType = KSMEPlayer.self
         let layer = KSPlayerLayer(url: url, options: options, delegate: self)
         playerLayer = layer
@@ -271,7 +310,7 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
 
         let watchdog = DispatchWorkItem { [weak self] in
             guard let self, !self.playing else { return }
-            self.showError(message: "Chưa có hình sau 12 giây.")
+            self.handlePlaybackFailure(message: "Chưa có hình sau 12 giây.")
         }
         firstFrameWatchdog = watchdog
         DispatchQueue.main.asyncAfter(deadline: .now() + 12, execute: watchdog)
@@ -289,6 +328,7 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
         firstFrameWatchdog = nil
         freezeTimer?.invalidate()
         freezeTimer = nil
+        teardownRemoteCommands()
         playerLayer?.delegate = nil
         playerLayer?.stop()
         playerLayer = nil
@@ -317,13 +357,19 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
             }
             spinner.stopAnimating()
         case .error:
-            showError(message: "Engine phát báo lỗi.")
+            handlePlaybackFailure(message: "Engine phát báo lỗi.")
         default:
             break
         }
     }
 
     func player(layer: KSPlayerLayer, currentTime: TimeInterval, totalTime: TimeInterval) {
+        // Healthy playback well past the death position refills
+        // the self-heal budget (checked before the 5 s throttle).
+        if lastRecoveryPosition >= 0, currentTime.isFinite, currentTime > lastRecoveryPosition + 5 {
+            recoveryAttempts = 0
+            lastRecoveryPosition = -1
+        }
         let now = Date()
         guard now.timeIntervalSince(lastTickAt) >= 5 else { return }
         lastTickAt = now
@@ -333,7 +379,7 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
 
     func player(layer: KSPlayerLayer, finish error: Error?) {
         if let error {
-            showError(message: error.localizedDescription)
+            handlePlaybackFailure(message: error.localizedDescription)
         } else {
             ended = true
         }
@@ -366,8 +412,110 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
         }
         lastPositionSec = pos
         if Date().timeIntervalSince(lastAdvanceAt) > 12 {
-            showError(message: "Hình đứng quá 12 giây — đường truyền tới file có vấn đề.")
+            handlePlaybackFailure(message: "Hình đứng quá 12 giây — đường truyền tới file có vấn đề.")
         }
+    }
+
+    // MARK: - Self-heal (v1.22) + remote commands
+
+    /// The KS mirror of the AV surface's mid-playback self-heal:
+    /// this surface previously had ZERO recovery — the first
+    /// engine error or 12 s freeze went straight to the error
+    /// screen. A failure AFTER playback began now retries the
+    /// same URL twice (backoff 2 s / 5 s) by rebuilding the
+    /// layer at the death position, then tries one completely
+    /// fresh resolve, and only then shows the error. Failures
+    /// before the first frame keep the old straight-to-error
+    /// behaviour.
+    private func handlePlaybackFailure(message: String?) {
+        guard playing, !failed, recoveryAttempts < 3 else {
+            showError(message: message)
+            return
+        }
+        recoveryAttempts += 1
+        let attempt = recoveryAttempts
+        let deathPos = currentPosition
+        if deathPos > 1 {
+            startPosition = deathPos
+            lastRecoveryPosition = deathPos
+        }
+        freezeTimer?.invalidate()
+        freezeTimer = nil
+        let delay: Double = attempt == 1 ? 2 : (attempt == 2 ? 5 : 0)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, !self.failed else { return }
+            if attempt < 3 {
+                self.restartLayer()
+            } else if let provider = self.freshStreamProvider {
+                Task { [weak self] in
+                    let fresh = await provider()
+                    await MainActor.run {
+                        guard let self, !self.failed else { return }
+                        if let fresh, let freshURL = fresh.streamURL, fresh.useCompatEngine {
+                            self.contentURL = freshURL
+                            self.contentHeaders = fresh.headers
+                            self.restartLayer()
+                        } else {
+                            self.showError(message: message)
+                        }
+                    }
+                }
+            } else {
+                self.showError(message: message)
+            }
+        }
+    }
+
+    /// Tears the dead layer down and builds a fresh one; the
+    /// ready-to-play seek lands it on `startPosition`, which the
+    /// failure handler set to the death position.
+    private func restartLayer() {
+        firstFrameWatchdog?.cancel()
+        firstFrameWatchdog = nil
+        playerLayer?.delegate = nil
+        playerLayer?.stop()
+        if let playerView = playerLayer?.player.view {
+            playerView.removeFromSuperview()
+        }
+        playerLayer = nil
+        ready = false
+        playing = false
+        didSeekToStart = false
+        ended = false
+        lastPositionSec = -1
+        lastAdvanceAt = Date()
+        controlsView.isHidden = false
+        spinner.startAnimating()
+        beginPlaybackIfPossible()
+    }
+
+    private func setupRemoteCommands() {
+        let center = MPRemoteCommandCenter.shared()
+        remoteTargets.append((center.playCommand, center.playCommand.addTarget { [weak self] _ in
+            self?.playerLayer?.play()
+            return .success
+        }))
+        remoteTargets.append((center.pauseCommand, center.pauseCommand.addTarget { [weak self] _ in
+            self?.playerLayer?.pause()
+            return .success
+        }))
+        remoteTargets.append((center.togglePlayPauseCommand, center.togglePlayPauseCommand.addTarget { [weak self] _ in
+            guard let layer = self?.playerLayer else { return .commandFailed }
+            if layer.state.isPlaying { layer.pause() } else { layer.play() }
+            return .success
+        }))
+        remoteTargets.append((center.changePlaybackPositionCommand, center.changePlaybackPositionCommand.addTarget { [weak self] event in
+            guard let positionEvent = event as? MPChangePlaybackPositionCommandEvent,
+                  let layer = self?.playerLayer else { return .commandFailed }
+            layer.seek(time: positionEvent.positionTime, autoPlay: true) { _ in }
+            return .success
+        }))
+    }
+
+    private func teardownRemoteCommands() {
+        for (command, target) in remoteTargets { command.removeTarget(target) }
+        remoteTargets.removeAll()
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
     }
 
     // MARK: - Error surface (same shape as the AVPlayer surface)
@@ -474,6 +622,20 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
             spinner.startAnimating()
         } else if playing {
             spinner.stopAnimating()
+        }
+        // Now Playing, ~1 Hz like the AV surface.
+        if Date().timeIntervalSince(lastNowPlayingPush) > 1 {
+            lastNowPlayingPush = Date()
+            var info: [String: Any] = [
+                MPMediaItemPropertyTitle: nowPlayingTitle.isEmpty ? "JTV" : nowPlayingTitle,
+                MPNowPlayingInfoPropertyElapsedPlaybackTime: current.isFinite ? current : 0,
+                MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0,
+                MPNowPlayingInfoPropertyIsLiveStream: false,
+            ]
+            if duration.isFinite, duration > 0 {
+                info[MPMediaItemPropertyPlaybackDuration] = duration
+            }
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = info
         }
     }
 

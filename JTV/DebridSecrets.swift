@@ -9,4 +9,5 @@
 enum DebridSecrets {
     static let rdToken = ""
     static let torboxToken = ""
+    static let premiumizeToken = ""
 }

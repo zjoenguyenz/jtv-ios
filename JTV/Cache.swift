@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import UIKit
 import WebKit
+import CryptoKit
 
 // MARK: - Networking
 
@@ -14,6 +15,8 @@ enum Net {
         config.timeoutIntervalForRequest = 30
         config.timeoutIntervalForResource = 60
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.urlCache = URLCache(memoryCapacity: 20 * 1024 * 1024, diskCapacity: 100 * 1024 * 1024)
+        config.httpMaximumConnectionsPerHost = 12
         return URLSession(configuration: config)
     }()
 
@@ -56,15 +59,20 @@ enum Net {
         }
         // Up to 3 attempts with a short backoff: the VPN tunnel path can
         // drop or garble a first response (-1011), a retry usually lands.
+        // v1.22: a hard 4xx (except 429) is NOT retried — the old
+        // policy burned ~61 s on failures that could never succeed —
+        // and the per-attempt timeout drops to 12 s.
         var lastError: Error = URLError(.unknown)
         var triedWebView = false
         for attempt in 0..<3 {
+            var attemptStatus = 0
             do {
                 var req = makeRequest(url: url, headers: headers)
-                req.timeoutInterval = 20
+                req.timeoutInterval = 12
                 let (data, response) = try await session.data(for: req)
                 let text = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 200
+                attemptStatus = status
                 if isCloudflareChallenge(text, status: status) {
                     // Only a real browser passes this wall. Retrying
                     // URLSession just burns time (the user watched a
@@ -86,6 +94,7 @@ enum Net {
             } catch {
                 if (error as? URLError)?.code == .cancelled { throw error }
                 lastError = error
+                if (400..<500).contains(attemptStatus), attemptStatus != 429 { throw lastError }
                 if attempt < 2 {
                     try? await Task.sleep(nanoseconds: 500_000_000)
                 }
@@ -102,16 +111,18 @@ enum Net {
         }
         var lastError: Error = URLError(.unknown)
         for attempt in 0..<3 {
+            var attemptStatus = 0
             do {
                 var req = makeRequest(url: url, headers: headers)
                 req.httpMethod = "POST"
-                req.timeoutInterval = 20
+                req.timeoutInterval = 12
                 if req.value(forHTTPHeaderField: "Content-Type") == nil {
                     req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
                 }
                 req.httpBody = body.data(using: .utf8)
                 let (data, response) = try await session.data(for: req)
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 200
+                attemptStatus = status
                 if !(200...299).contains(status) {
                     throw URLError(.badServerResponse)
                 }
@@ -119,6 +130,7 @@ enum Net {
             } catch {
                 if (error as? URLError)?.code == .cancelled { throw error }
                 lastError = error
+                if (400..<500).contains(attemptStatus), attemptStatus != 429 { throw lastError }
                 if attempt < 2 {
                     try? await Task.sleep(nanoseconds: 500_000_000)
                 }
@@ -129,8 +141,20 @@ enum Net {
 
     static func fetchData(_ urlString: String, headers: [String: String] = [:]) async throws -> Data {
         guard let url = URL(string: urlString) else { throw URLError(.badURL) }
-        let (data, _) = try await session.data(for: makeRequest(url: url, headers: headers))
-        return data
+        // v1.22: same retry policy as fetchText (was: zero retries).
+        var lastError: Error = URLError(.unknown)
+        for attempt in 0..<3 {
+            do {
+                return try await session.data(for: makeRequest(url: url, headers: headers)).0
+            } catch {
+                if (error as? URLError)?.code == .cancelled { throw error }
+                lastError = error
+                if attempt < 2 {
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                }
+            }
+        }
+        throw lastError
     }
 }
 
@@ -148,32 +172,46 @@ enum Net {
 final class WebFetcher: NSObject, WKNavigationDelegate {
     static let shared = WebFetcher()
 
-    private var webView: WKWebView?
-    private var continuation: CheckedContinuation<String?, Never>?
-    private var timeoutTask: Task<Void, Never>?
-    private var busy = false
+    /// One browser lane. v1.22: TWO lanes — Cloudflare-walled
+    /// fetches (sayhentai list/detail/chapter) used to queue
+    /// behind each other through a single webview, so a chapter
+    /// open behind a list fetch could wait 10–40 s. Both lanes
+    /// share the default website data store, so one lane's
+    /// clearance serves the other (and Net.session, via the
+    /// harvested cookies).
+    private final class Lane {
+        var webView: WKWebView?
+        var continuation: CheckedContinuation<String?, Never>?
+        var timeoutTask: Task<Void, Never>?
+        var busy = false
+    }
+
+    private var lanes: [Lane] = [Lane(), Lane()]
 
     static func fetchHTML(url: URL) async -> String? {
         await shared.fetch(url: url)
     }
 
     private func fetch(url: URL) async -> String? {
-        while busy {
+        while true {
+            if let lane = lanes.first(where: { !$0.busy }) {
+                lane.busy = true
+                let html = await load(url: url, lane: lane)
+                lane.busy = false
+                return html
+            }
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
-        busy = true
-        defer { busy = false }
-        return await load(url: url)
     }
 
-    private func ensureWebView() -> WKWebView {
-        if let webView { return webView }
+    private func ensureWebView(lane: Lane) -> WKWebView {
+        if let webView = lane.webView { return webView }
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
         let wv = WKWebView(frame: CGRect(x: 0, y: 0, width: 390, height: 844), configuration: config)
         wv.customUserAgent = Net.defaultUA
         wv.navigationDelegate = self
-        webView = wv
+        lane.webView = wv
         // Attach invisibly to the key window: WebKit can throttle JS
         // timers in fully detached views, and the challenge is JS.
         if let window = UIApplication.shared.connectedScenes
@@ -186,13 +224,17 @@ final class WebFetcher: NSObject, WKNavigationDelegate {
         return wv
     }
 
-    private func load(url: URL) async -> String? {
-        let wv = ensureWebView()
+    private func lane(for webView: WKWebView) -> Lane? {
+        lanes.first(where: { $0.webView === webView })
+    }
+
+    private func load(url: URL, lane: Lane) async -> String? {
+        let wv = ensureWebView(lane: lane)
         return await withCheckedContinuation { (cont: CheckedContinuation<String?, Never>) in
-            self.continuation = cont
-            self.timeoutTask = Task { @MainActor in
+            lane.continuation = cont
+            lane.timeoutTask = Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 40_000_000_000)
-                self.finish(nil)
+                self.finish(lane: lane, nil)
             }
             var req = URLRequest(url: url)
             req.setValue(Net.defaultUA, forHTTPHeaderField: "User-Agent")
@@ -201,11 +243,11 @@ final class WebFetcher: NSObject, WKNavigationDelegate {
         }
     }
 
-    private func finish(_ html: String?) {
-        timeoutTask?.cancel()
-        timeoutTask = nil
-        continuation?.resume(returning: html)
-        continuation = nil
+    private func finish(lane: Lane, _ html: String?) {
+        lane.timeoutTask?.cancel()
+        lane.timeoutTask = nil
+        lane.continuation?.resume(returning: html)
+        lane.continuation = nil
     }
 
     private func harvestCookies(from webView: WKWebView) async {
@@ -216,29 +258,45 @@ final class WebFetcher: NSObject, WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard let lane = lane(for: webView) else { return }
         Task { @MainActor in
             // The challenge needs a beat to solve and redirect; poll
-            // the DOM until it turns into the real page.
+            // the DOM until it turns into the real page. A
+            // cf_clearance cookie means the wall is already passed
+            // even if this frame still shows the challenge shell —
+            // one short extra beat, then take the DOM as-is.
             for attempt in 0..<6 {
                 try? await Task.sleep(nanoseconds: attempt == 0 ? 800_000_000 : 1_200_000_000)
                 let raw = try? await webView.evaluateJavaScript("document.documentElement.outerHTML")
                 guard let html = raw as? String else { continue }
-                if Net.isChallengeHTML(html) { continue }
+                if Net.isChallengeHTML(html) {
+                    let cookies = await webView.configuration.websiteDataStore.httpCookieStore.allCookies()
+                    if cookies.contains(where: { $0.name == "cf_clearance" }) {
+                        try? await Task.sleep(nanoseconds: 600_000_000)
+                        let settled = try? await webView.evaluateJavaScript("document.documentElement.outerHTML")
+                        if let settledHTML = settled as? String, !Net.isChallengeHTML(settledHTML) {
+                            await self.harvestCookies(from: webView)
+                            self.finish(lane: lane, settledHTML)
+                            return
+                        }
+                    }
+                    continue
+                }
                 await self.harvestCookies(from: webView)
-                self.finish(html)
+                self.finish(lane: lane, html)
                 return
             }
             let raw = try? await webView.evaluateJavaScript("document.documentElement.outerHTML")
-            self.finish(raw as? String)
+            self.finish(lane: lane, raw as? String)
         }
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        finish(nil)
+        if let lane = lane(for: webView) { finish(lane: lane, nil) }
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        finish(nil)
+        if let lane = lane(for: webView) { finish(lane: lane, nil) }
     }
 }
 
@@ -250,10 +308,67 @@ final class ImageCacheManager {
     private let cache = NSCache<NSString, UIImage>()
     private var inFlight: [String: Task<UIImage?, Never>] = [:]
     private let lock = NSLock()
+    /// v1.22 disk tier (~300 MB, LRU by modification date): every
+    /// cold launch used to re-download every poster — the memory
+    /// cache alone could not survive a relaunch.
+    private let diskDir: URL
+    private let diskCap = 300 * 1024 * 1024
 
     private init() {
         cache.countLimit = 400
         cache.totalCostLimit = 256 * 1024 * 1024
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        diskDir = caches.appendingPathComponent("jtv-images", isDirectory: true)
+        try? FileManager.default.createDirectory(at: diskDir, withIntermediateDirectories: true)
+        let dir = diskDir, cap = diskCap
+        Task.detached { Self.pruneDisk(dir: dir, cap: cap) }
+    }
+
+    private func diskURL(for key: String) -> URL {
+        let digest = SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
+        return diskDir.appendingPathComponent(digest)
+    }
+
+    private static func pruneDisk(dir: URL, cap: Int) {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey]) else { return }
+        var total = 0
+        var sized: [(url: URL, size: Int, date: Date)] = []
+        for entry in entries {
+            let values = try? entry.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+            let size = values?.fileSize ?? 0
+            total += size
+            sized.append((entry, size, values?.contentModificationDate ?? .distantPast))
+        }
+        guard total > cap else { return }
+        for entry in sized.sorted(by: { $0.date < $1.date }) {
+            if total <= cap { break }
+            try? fm.removeItem(at: entry.url)
+            total -= entry.size
+        }
+    }
+
+    /// Real memory cost of a decoded bitmap. The old accounting
+    /// used the COMPRESSED byte count, so the 256 MB cap was
+    /// fictitious — decoded posters run 5–15× their file size.
+    private func decodedCost(_ image: UIImage) -> Int {
+        Int(image.size.width * image.size.height * image.scale * image.scale * 4)
+    }
+
+    /// Caps pathological decodes (4K backdrops) at a 2048 px long
+    /// edge; normal posters and manga pages pass through untouched.
+    private func capped(_ image: UIImage) -> UIImage {
+        let pixelW = image.size.width * image.scale
+        let pixelH = image.size.height * image.scale
+        let longest = max(pixelW, pixelH)
+        guard longest > 2048 else { return image }
+        let ratio = 2048 / longest
+        let target = CGSize(width: pixelW * ratio, height: pixelH * ratio)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        return UIGraphicsImageRenderer(size: target, format: format).image { _ in
+            image.draw(in: CGRect(origin: .zero, size: target))
+        }
     }
 
     private func key(for url: String, headers: [String: String]) -> String {
@@ -280,16 +395,35 @@ final class ImageCacheManager {
             defer {
                 self.lock.lock(); self.inFlight[k] = nil; self.lock.unlock()
             }
+            // Disk tier first: decode + promote to memory.
+            let disk = self.diskURL(for: k)
+            if let data = try? Data(contentsOf: disk), let image = UIImage(data: data) {
+                let cappedImage = self.capped(image)
+                self.cache.setObject(cappedImage, forKey: k as NSString, cost: self.decodedCost(cappedImage))
+                return cappedImage
+            }
             var req = Net.makeRequest(url: url, headers: headers)
             req.timeoutInterval = 30
             guard let (data, _) = try? await Net.session.data(for: req),
                   let image = UIImage(data: data) else { return nil }
-            self.cache.setObject(image, forKey: k as NSString, cost: data.count)
-            return image
+            try? data.write(to: disk, options: .atomic)
+            let cappedImage = self.capped(image)
+            self.cache.setObject(cappedImage, forKey: k as NSString, cost: self.decodedCost(cappedImage))
+            return cappedImage
         }
         inFlight[k] = task
         lock.unlock()
         return await task.value
+    }
+
+    /// Warms memory/disk for images about to be scrolled into
+    /// (rails after a section lands, the manga reader's next
+    /// pages). Deduped against the cache and in-flight loads.
+    func prefetch(urlStrings: [String], headers: [String: String] = [:]) {
+        for urlString in urlStrings.prefix(60) {
+            if cachedImage(for: urlString, headers: headers) != nil { continue }
+            Task { _ = await self.loadImage(urlString: urlString, headers: headers) }
+        }
     }
 
     func clear() { cache.removeAllObjects() }

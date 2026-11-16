@@ -80,7 +80,21 @@ struct MovieDetailView: View {
         isLoading = true
         loadError = nil
         do {
-            bundle = try await service.detail(pluginId: pluginId, movieId: movie.id)
+            // v1.22 progressive detail: render the meta as soon as
+            // stage 1 lands; torrenthub's stage-2 source list
+            // (measured +713 ms serial) swaps in when it arrives
+            // instead of blocking the whole page.
+            var first = try await service.detailMeta(pluginId: pluginId, movieId: movie.id)
+            bundle = first
+            isLoading = false
+            warmEmbedPrefetch(detail: first.detail)
+            if first.detail.servers.first?.episodes.first?.id.hasPrefix("jtvstreams:") == true {
+                let full = await service.detailStreams(pluginId: pluginId, movieId: movie.id, detail: first.detail)
+                if full.servers != first.detail.servers {
+                    first.detail = full
+                    bundle = first
+                }
+            }
         } catch {
             if let healed = await recoverByTitle() {
                 bundle = healed
@@ -93,6 +107,32 @@ struct MovieDetailView: View {
             didAutoResume = true
             resume(record, detail: detail)
         }
+    }
+
+    /// v1.22 dwell warm-up: for the sources whose resolve chains
+    /// end in the sniffing webview (123av, javhd, avdbapi), run
+    /// the first episode's chain NOW, while the user is reading
+    /// the page — the play tap then consumes the finished
+    /// resolution instead of starting the chain cold. One warm-up
+    /// per page, embed-shaped plugins only.
+    private static let embedChainPlugins: Set<String> = ["123av", "javhd", "avdbapi"]
+
+    private func warmEmbedPrefetch(detail: MovieDetail) {
+        guard Self.embedChainPlugins.contains(pluginId), !isManga,
+              let server = detail.servers.first, let episode = server.episodes.first else { return }
+        let request = PlaybackRequest(
+            movie: snapshotMovie,
+            pluginId: pluginId,
+            pluginName: plugins.installedPlugin(id: pluginId)?.manifest.name ?? "",
+            isManga: false,
+            serverName: server.name,
+            episode: episode,
+            allEpisodes: server.episodes,
+            startPosition: 0,
+            knownStreamURL: "",
+            fallbackHeaders: bundle?.detailStream.headers ?? [:]
+        )
+        service.prefetchEmbedResolution(request)
     }
 
     /// Favorites saved by older builds can carry an empty or

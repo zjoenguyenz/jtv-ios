@@ -22,6 +22,17 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate {
     static let scheme = "jtvhls"
 
     private let headers: [String: String]
+    /// v1.22: ONE shared session for every loader instance (was:
+    /// a new session per playback, never invalidated), and the
+    /// per-request timeout drops 30 s → 15 s so a dead segment
+    /// host surfaces inside the player's stall budget on the
+    /// first attempt instead of the third.
+    private static let sharedSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 15
+        config.timeoutIntervalForResource = 120
+        return URLSession(configuration: config)
+    }()
     private let session: URLSession
     private var tasks: [ObjectIdentifier: URLSessionDataTask] = [:]
     private var cancelled: Set<ObjectIdentifier> = []
@@ -34,10 +45,7 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate {
 
     init(headers: [String: String]) {
         self.headers = headers
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 30
-        config.timeoutIntervalForResource = 120
-        self.session = URLSession(configuration: config)
+        self.session = Self.sharedSession
         super.init()
     }
 
@@ -470,36 +478,62 @@ enum PlaylistSynthesizer {
             return http.expectedContentLength > 0 ? Int(http.expectedContentLength) : nil
         }
 
-        // Probe existence in batches of six; segments are
-        // contiguous from 0, so the first miss ends the title.
-        var sizes: [Int] = []
-        var idx = 0
-        outer: while sizes.count < 400 {
-            let batch = await withTaskGroup(of: (Int, Int?).self) { group in
-                for k in 0..<6 {
-                    let i = idx + k
-                    group.addTask { (i, await head(i)) }
-                }
-                var results: [(Int, Int?)] = []
-                for await r in group { results.append(r) }
-                return results.sorted { $0.0 < $1.0 }
-            }
-            for (_, size) in batch {
-                guard let size else { break outer }
-                sizes.append(size)
-            }
-            idx += 6
+        // Find the segment count by exponential + binary search
+        // (v1.22): segments are contiguous from 0, so existence is
+        // monotone — ~10 probes replace the old linear scan of
+        // ceil(N/6) serial HEAD batches that gated playback start.
+        func exists(_ idx: Int) async -> Bool { await head(idx) != nil }
+        guard await exists(0) else { return nil }
+        var lo = 0
+        var hi = 400
+        var probe = 1
+        while probe < hi {
+            if await exists(probe) { lo = probe; probe *= 2 } else { hi = probe; break }
         }
-        guard !sizes.isEmpty else { return nil }
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2
+            if await exists(mid) { lo = mid } else { hi = mid }
+        }
+        let n = lo + 1
 
-        // Measure durations in parallel.
-        let durations = await withTaskGroup(of: (Int, Double).self) { group in
-            for (i, size) in sizes.enumerated() {
-                group.addTask { (i, await segmentDuration(base: base, index: i, size: size, session: session) ?? 0) }
+        // Duration SAMPLING (v1.22): segments in these backups are
+        // near-uniform, so measure a spread of samples and take
+        // the median — the old code measured EVERY segment (two
+        // 48 KB range fetches each: ~29 MB and ~600 requests for
+        // a 300-segment title) before playback could start. High
+        // sample variance means the uniformity assumption failed
+        // (mixed content), so fall back to measuring all.
+        func measure(_ indices: [Int]) async -> [Double] {
+            await withTaskGroup(of: (Int, Double).self) { group in
+                for i in indices {
+                    group.addTask {
+                        guard let size = await head(i) else { return (i, 0) }
+                        return (i, await segmentDuration(base: base, index: i, size: size, session: session) ?? 0)
+                    }
+                }
+                var out = [Double](repeating: 0, count: n)
+                for await (i, d) in group { out[i] = d }
+                return out
             }
-            var ds = [Double](repeating: 0, count: sizes.count)
-            for await (i, d) in group { ds[i] = d }
-            return ds
+        }
+        let durations: [Double]
+        if n <= 12 {
+            durations = await measure(Array(0..<n))
+        } else {
+            var sampleIdx = Set([0, n - 1, n / 2])
+            for k in 1..<8 { sampleIdx.insert(n * k / 8) }
+            let sampled = await measure(sampleIdx.sorted())
+            let values = sampled.filter { $0 > 0 }.sorted()
+            if values.count >= 2 {
+                let median = values[values.count / 2]
+                if values.last! - values.first! <= 0.25 * median {
+                    durations = [Double](repeating: median, count: n)
+                } else {
+                    durations = await measure(Array(0..<n))
+                }
+            } else {
+                durations = sampled
+            }
         }
         let measured = durations.filter { $0 > 0 }
         let fallback = measured.isEmpty ? 10.0 : measured.sorted()[measured.count / 2]

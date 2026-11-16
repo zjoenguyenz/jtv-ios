@@ -374,6 +374,7 @@ struct HomeView: View {
             for await (sectionId, movies) in group {
                 if !movies.isEmpty {
                     sectionItems[sectionId] = movies
+                    ImageCacheManager.shared.prefetch(urlStrings: movies.map(\.posterUrl))
                 }
             }
         }
