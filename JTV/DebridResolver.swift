@@ -50,20 +50,23 @@ enum DebridError: LocalizedError {
 /// Turns a torrent info-hash (the torrenthub plugin's `jtvhash:`
 /// episode ids) into a direct file URL via a debrid service.
 ///
-/// Chain (v1.22.2 — the v1.21 shape, restored after a line-by-line
-/// diff against commit 55cd609): Real-Debrid primary with its own
-/// full budget (flow ported from the TV app's RdApi: addMagnet →
-/// pick file → selectFiles → poll → unrestrict), TorBox fallback
-/// with its own full budget, Premiumize last. The v1.22 windowed
-/// TorBox-first orchestration was removed: on the owner's device
-/// v1.21 played torrents with this exact chain, while v1.22
-/// starved RD behind a shared window and v1.22.1 served
-/// TorBox-first links the player could not connect to. The file
-/// pick prefers the largest VIDEO file, preferring
-/// AVPlayer-friendly containers (mp4/m4v/mov) so most titles stay
-/// on the native player; anything else is flagged
-/// `useCompatEngine` and the resolver screen routes it to the
-/// KSPlayer (FFmpeg) surface, which opens MKV/AVI natively.
+/// Priority (owner order 2026-11-16): whichever provider HAS the
+/// title wins, probed per title at tap time in the order TorBox →
+/// Real-Debrid → Premiumize — the owner's Sony/Torrentio view shows
+/// TorBox holding the most cached sources of the three. v1.22.3
+/// adds a CACHE-PROBE phase ahead of the download chain: one cheap
+/// availability call per configured provider (TorBox checkcached,
+/// RD instantAvailability, Premiumize directdl); the first provider
+/// reporting the title cached resolves it through its normal flow.
+/// When NO provider has it, the chain falls back to the proven
+/// v1.21 sequential shape (restored in v1.22.2 after a line-by-line
+/// diff against commit 55cd609): each provider's own flow with its
+/// own full budget, same priority order. The file pick prefers the
+/// largest VIDEO file, preferring AVPlayer-friendly containers
+/// (mp4/m4v/mov) so most titles stay on the native player; anything
+/// else is flagged `useCompatEngine` and the resolver screen routes
+/// it to the KSPlayer (FFmpeg) surface, which opens MKV/AVI
+/// natively.
 enum DebridResolver {
     private static let videoExts: Set<String> = ["mkv", "mp4", "avi", "m4v", "mov", "ts", "m2ts", "wmv", "flv", "webm"]
     private static let friendlyExts: Set<String> = ["mp4", "m4v", "mov"]
@@ -75,35 +78,81 @@ enum DebridResolver {
     static func resolve(hash: String) async throws -> StreamInfo {
         let clean = hash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard clean.count >= 32 else { throw DebridError.message("Mã torrent không hợp lệ.") }
-        // v1.22.2: the v1.21 chain, restored. Each provider runs
-        // with its OWN full budget inside its own flow, exactly as
-        // the build that played torrents on the owner's device.
-        // Premiumize is appended last — it can only ever serve a
-        // title the proven pair already failed on.
+        let tb = DebridTokens.torbox, rd = DebridTokens.rd, pm = DebridTokens.premiumize
+        guard !tb.isEmpty || !rd.isEmpty || !pm.isEmpty else { throw DebridError.noToken }
         var lastError: Error = DebridError.noToken
-        if !DebridTokens.rd.isEmpty {
-            do {
-                return try await resolveRD(hash: clean, token: DebridTokens.rd)
-            } catch {
-                lastError = error
-            }
+        var attempted: Set<String> = []
+
+        // Phase 1 — cache probes (v1.22.3): the first provider
+        // that already HAS the title resolves it now. A probe is
+        // one availability call; a provider whose probe misses (or
+        // whose cached flow still fails) keeps its phase-2 turn.
+        if !tb.isEmpty, await torboxIsCached(hash: clean, token: tb) {
+            attempted.insert("tb")
+            do { return try await resolveTorBox(hash: clean, token: tb) }
+            catch { lastError = error }
         }
-        if !DebridTokens.torbox.isEmpty {
-            do {
-                return try await resolveTorBox(hash: clean, token: DebridTokens.torbox)
-            } catch {
-                lastError = error
-            }
+        if !rd.isEmpty, await rdIsAvailable(hash: clean, token: rd) {
+            attempted.insert("rd")
+            do { return try await resolveRD(hash: clean, token: rd) }
+            catch { lastError = error }
         }
-        if !DebridTokens.premiumize.isEmpty {
+        if !pm.isEmpty, let hit = try? await premiumizeDirectDL(hash: clean, token: pm) {
+            return hit
+        }
+
+        // Phase 2 — nobody has it cached: the proven v1.21 chain
+        // shape (each flow with its own full budget), in the
+        // owner's priority order TorBox → Real-Debrid →
+        // Premiumize. Providers already attempted in phase 1 are
+        // not re-run: their flow is identical, only slower.
+        if !tb.isEmpty && !attempted.contains("tb") {
+            do { return try await resolveTorBox(hash: clean, token: tb) }
+            catch { lastError = error }
+        }
+        if !rd.isEmpty && !attempted.contains("rd") {
+            do { return try await resolveRD(hash: clean, token: rd) }
+            catch { lastError = error }
+        }
+        if !pm.isEmpty {
             do {
-                return try await resolvePremiumize(hash: clean, token: DebridTokens.premiumize,
+                return try await resolvePremiumize(hash: clean, token: pm,
                                                     deadline: Date().addingTimeInterval(budget))
-            } catch {
-                lastError = error
-            }
+            } catch { lastError = error }
         }
         throw lastError
+    }
+
+    // MARK: - Cache probes
+
+    /// TorBox cache check: does TorBox already hold this hash?
+    /// Response shapes vary (list or dict keyed by hash), so the
+    /// parse is defensive: any entry for our hash flagged cached.
+    private static func torboxIsCached(hash: String, token: String) async -> Bool {
+        let base = "https://api.torbox.app/v1/api"
+        guard let response = try? await torboxRequest(base, token, "GET",
+                                                       "/torrents/checkcached?hash=\(hash)&format=list", form: nil),
+              (response["success"] as? Bool) ?? true else { return false }
+        if let list = response["data"] as? [[String: Any]] {
+            return list.contains { entry in
+                ((entry["hash"] as? String)?.lowercased() == hash) && ((entry["cached"] as? Bool) ?? false)
+            }
+        }
+        if let dict = response["data"] as? [String: Any], let entry = dict[hash] as? [String: Any] {
+            return (entry["cached"] as? Bool) ?? false
+        }
+        return false
+    }
+
+    /// Real-Debrid instant availability: a non-empty variant list
+    /// for the hash means RD can serve it without downloading.
+    private static func rdIsAvailable(hash: String, token: String) async -> Bool {
+        let base = "https://api.real-debrid.com/rest/1.0"
+        guard let response = try? await rdRequest(base, token, "GET",
+                                                  "/torrents/instantAvailability/\(hash)", form: nil),
+              let entry = response[hash] as? [String: Any],
+              let variants = entry["rd"] as? [[String: Any]] else { return false }
+        return variants.contains { !($0.isEmpty) }
     }
 
     static func needsCompatEngine(filename: String) -> Bool {
@@ -194,12 +243,27 @@ enum DebridResolver {
         var downloadURL: String?
         var pickedName = ""
         while downloadURL == nil {
-            let list = try await torboxRequest(base, token, "GET", "/torrents/mylist", form: nil)
-            let torrents = (list["data"] as? [[String: Any]]) ?? []
-            if let entry = torrents.first(where: { ($0["id"] as? Int) == torrentId }) {
+            // v1.22.3 fix (doc-verified against the TorBox SDK and
+            // live-captured clients): poll THIS torrent by id with
+            // the server cache bypassed. The previous code scanned
+            // the FULL mylist, which TorBox serves from its own
+            // cache — a fresh torrent was often invisible or stale
+            // there, so the loop starved and TorBox "had no link"
+            // even when it held the file. Readiness uses all three
+            // documented fields (present / cached / finished).
+            let response = try await torboxRequest(base, token, "GET",
+                                                   "/torrents/mylist?id=\(torrentId)&bypass_cache=true", form: nil)
+            var entry: [String: Any]?
+            if let single = response["data"] as? [String: Any] {
+                entry = single
+            } else if let list = response["data"] as? [[String: Any]] {
+                entry = list.first(where: { ($0["id"] as? Int) == torrentId })
+            }
+            if let entry {
                 let finished = (entry["download_finished"] as? Bool) ?? false
                 let present = (entry["download_present"] as? Bool) ?? false
-                if finished || present {
+                let cached = (entry["cached"] as? Bool) ?? false
+                if finished || present || cached {
                     let files = (entry["files"] as? [[String: Any]]) ?? []
                     guard let pick = pickFile(files.map {
                         (id: ($0["id"] as? Int) ?? -1,

@@ -59,8 +59,8 @@ targets:
       properties:
         CFBundleDisplayName: "JTV"
         CFBundleName: "JTV"
-        CFBundleShortVersionString: "1.22.2"
-        CFBundleVersion: "28"
+        CFBundleShortVersionString: "1.22.3"
+        CFBundleVersion: "29"
         UILaunchScreen: {}
         UIBackgroundModes:
           - audio

@@ -238,11 +238,11 @@ struct SettingsView: View {
 
     private var torrentSection: some View {
         Section {
-            SecureField("Token Real-Debrid", text: $rdToken)
+            SecureField("Token TorBox", text: $torboxToken)
                 .foregroundStyle(.white)
                 .autocorrectionDisabled(true)
                 .textInputAutocapitalization(.never)
-            SecureField("Token TorBox", text: $torboxToken)
+            SecureField("Token Real-Debrid", text: $rdToken)
                 .foregroundStyle(.white)
                 .autocorrectionDisabled(true)
                 .textInputAutocapitalization(.never)
@@ -255,9 +255,9 @@ struct SettingsView: View {
                     .foregroundStyle(Theme.accent)
             }
         } header: {
-            Text("Torrent (Real-Debrid / TorBox / Premiumize)")
+            Text("Torrent (TorBox / Real-Debrid / Premiumize)")
         } footer: {
-            Text("Dùng cho tab Torrent, thử theo thứ tự Real-Debrid → TorBox → Premiumize. Token chỉ lưu trên máy này; để trống nếu bản cài đặt đã nạp sẵn.")
+            Text("Dùng cho tab Torrent: app hỏi nhà nào có sẵn phim trước, theo thứ tự TorBox → Real-Debrid → Premiumize. Token chỉ lưu trên máy này; để trống nếu bản cài đặt đã nạp sẵn.")
         }
         .listRowBackground(Theme.glassFill)
     }
