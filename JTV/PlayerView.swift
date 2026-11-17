@@ -29,6 +29,18 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
     var startViaProxy: Bool = false
     /// Movie title for the Now Playing info (v1.22).
     var title: String = ""
+    /// v1.22.4 torrent patience: direct debrid files get a
+    /// patient player (waits for buffer, deep buffer, long stall
+    /// budgets) — see the Coordinator. Page/HLS sources keep the
+    /// v1.22 eager tuning the owner approved.
+    var patientMode: Bool = false
+    /// v1.22.4 source identity + switching (owner request): the
+    /// running source's label for the control layer, the sibling
+    /// sources of the same title, and the switch callback.
+    var sourceLabel: String = ""
+    var sources: [Episode] = []
+    var currentSourceId: String = ""
+    var onSwitchSource: ((Episode) -> Void)?
     /// Re-resolves the episode from scratch (v1.22 self-heal's
     /// last rung: a completely fresh link after same-URL retries).
     var onFreshStream: (() async -> StreamInfo?)?
@@ -67,7 +79,15 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         // sources use, that is seconds of avoidable waiting per
         // start/seek. The Coordinator's own stall ladder + the
         // mid-playback self-heal are the safety net now.
-        player.automaticallyWaitsToMinimizeStalling = false
+        // v1.22.4: torrent direct files are the exception — a
+        // debrid CDN answering a far-seek range request slowly is
+        // exactly what the patient default rides out (VLC behaves
+        // the same way), while the eager setting turned slow
+        // refills into freezes and dead sources on the owner's
+        // device. Patient mode restores the waiting behaviour for
+        // torrent files only.
+        player.automaticallyWaitsToMinimizeStalling = !patientMode
+        context.coordinator.patientMode = patientMode
         context.coordinator.player = player
         context.coordinator.sourceURL = url
         context.coordinator.sourceHeaders = headers
@@ -85,6 +105,10 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         controller.player = player
         controller.coordinator = context.coordinator
         controller.nowPlayingTitle = title
+        controller.sourceLabelText = sourceLabel
+        controller.sources = sources
+        controller.currentSourceId = currentSourceId
+        controller.onSwitchSource = onSwitchSource
         context.coordinator.onGiveUp = { [weak controller] message in
             controller?.showError(message: message)
         }
@@ -120,6 +144,9 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         var player: AVPlayer?
         var observer: Any?
         var startPosition: Double = 0
+        /// v1.22.4: torrent direct files run patient (deep buffer,
+        /// doubled stall budgets). Set by the surface at creation.
+        var patientMode = false
         private var didSeek = false
         private let onProgress: (Double, Double) -> Void
         private let onExit: (Double, Double) -> Void
@@ -288,7 +315,10 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         func observe(item: AVPlayerItem) {
             // v1.22: explicit forward buffer on EVERY item (the
             // initial one and every ladder/recovery swap).
-            item.preferredForwardBufferDuration = 12
+            // v1.22.4: torrent files hold 30 s ahead — a debrid CDN
+            // refills slowly after a far seek, and a shallow buffer
+            // is what ran dry and froze the picture.
+            item.preferredForwardBufferDuration = patientMode ? 30 : 12
             statusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
                 if item.status == .failed {
                     DispatchQueue.main.async { self?.handleFailure() }
@@ -335,7 +365,12 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
                     return
                 }
                 self.stallTicks += 1
-                let budget = self.sawProgress ? 6 : 12  // 4 s ticks: 24 s / 48 s
+                // v1.22.4: torrent files get doubled budgets
+                // (96 s / 48 s) — their CDN legitimately takes
+                // that long to answer a cold far-seek range.
+                let budget = self.patientMode
+                    ? (self.sawProgress ? 12 : 24)
+                    : (self.sawProgress ? 6 : 12)  // 4 s ticks: 24 s / 48 s
                 if self.stallTicks >= budget {
                     timer?.invalidate()
                     self.handleFailure()
@@ -552,6 +587,14 @@ final class PlayerSurfaceViewController: UIViewController {
     weak var coordinator: VideoPlayerSurface.Coordinator?
     /// Movie title shown in Now Playing (v1.22).
     var nowPlayingTitle = ""
+    /// v1.22.4: which source is running (label in the control
+    /// layer), the sibling sources, and the switch callback —
+    /// the owner could not tell which of two sources was playing
+    /// and had no way to change source without leaving playback.
+    var sourceLabelText = ""
+    var sources: [Episode] = []
+    var currentSourceId = ""
+    var onSwitchSource: ((Episode) -> Void)?
 
     private let videoView = PlayerLayerView()
     private let controlsView = UIView()
@@ -561,6 +604,8 @@ final class PlayerSurfaceViewController: UIViewController {
     private let forwardButton = UIButton(type: .system)
     private let rotateButton = UIButton(type: .system)
     private let pipButton = UIButton(type: .system)
+    private let sourcesButton = UIButton(type: .system)
+    private let sourceLabel = UILabel()
     private var pipController: AVPictureInPictureController?
     private var remoteTargets: [(MPRemoteCommand, Any)] = []
     private var lastNowPlayingPush = Date.distantPast
@@ -754,7 +799,30 @@ final class PlayerSurfaceViewController: UIViewController {
         pipButton.addTarget(self, action: #selector(togglePiP), for: .touchUpInside)
         pipButton.isHidden = !AVPictureInPictureController.isPictureInPictureSupported()
 
-        let bottomRow = UIStackView(arrangedSubviews: [currentLabel, slider, durationLabel, pipButton, rotateButton])
+        // v1.22.4: source identity + switching in the control
+        // layer. The label names the running source; the button
+        // (bottom row, list icon) opens the sibling list. Only
+        // shown when the title actually has other sources.
+        sourcesButton.setImage(UIImage(systemName: "list.bullet"), for: .normal)
+        sourcesButton.tintColor = .white
+        sourcesButton.backgroundColor = UIColor.black.withAlphaComponent(0.45)
+        sourcesButton.layer.cornerRadius = 20
+        sourcesButton.translatesAutoresizingMaskIntoConstraints = false
+        sourcesButton.widthAnchor.constraint(equalToConstant: 40).isActive = true
+        sourcesButton.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        sourcesButton.addTarget(self, action: #selector(showSourceList), for: .touchUpInside)
+        sourcesButton.isHidden = sources.count <= 1
+
+        sourceLabel.text = sourceLabelText.isEmpty ? "" : "Nguồn: \(sourceLabelText)"
+        sourceLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        sourceLabel.textColor = UIColor.white.withAlphaComponent(0.85)
+        sourceLabel.numberOfLines = 1
+        sourceLabel.lineBreakMode = .byTruncatingTail
+        sourceLabel.translatesAutoresizingMaskIntoConstraints = false
+        sourceLabel.isHidden = sourceLabelText.isEmpty
+        controlsView.addSubview(sourceLabel)
+
+        let bottomRow = UIStackView(arrangedSubviews: [currentLabel, slider, durationLabel, sourcesButton, pipButton, rotateButton])
         bottomRow.axis = .horizontal
         bottomRow.spacing = 10
         bottomRow.alignment = .center
@@ -767,7 +835,33 @@ final class PlayerSurfaceViewController: UIViewController {
             bottomRow.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
             bottomRow.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
             bottomRow.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -14),
+            sourceLabel.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
+            sourceLabel.trailingAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
+            sourceLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 10),
         ])
+    }
+
+    /// v1.22.4: the sibling-source picker. The running source is
+    /// marked and disabled; tapping another hands it to the
+    /// resolver, which re-resolves and resumes at the position
+    /// the surface has been saving to history.
+    @objc private func showSourceList() {
+        let sheet = UIAlertController(title: "Chọn nguồn khác", message: "Nguồn đang phát: \(sourceLabelText)", preferredStyle: .actionSheet)
+        for episode in sources {
+            let isCurrent = episode.id == currentSourceId
+            let action = UIAlertAction(title: (isCurrent ? "✓ " : "") + episode.name, style: .default) { [weak self] _ in
+                guard !isCurrent else { return }
+                self?.onSwitchSource?(episode)
+            }
+            action.isEnabled = !isCurrent
+            sheet.addAction(action)
+        }
+        sheet.addAction(UIAlertAction(title: "Huỷ", style: .cancel))
+        if let pop = sheet.popoverPresentationController {
+            pop.sourceView = sourcesButton
+            pop.sourceRect = sourcesButton.bounds
+        }
+        present(sheet, animated: true)
     }
 
     /// Both transports failed or stalled: stop pretending and
@@ -974,6 +1068,8 @@ extension PlayerSurfaceViewController: AVPictureInPictureControllerDelegate {
 struct PlayerView: View {
     let stream: StreamInfo
     let request: PlaybackRequest
+    /// v1.22.4: source switching, owned by the resolver screen.
+    var onSwitchSource: ((Episode) -> Void)?
 
     @EnvironmentObject private var history: WatchHistoryManager
     @EnvironmentObject private var service: MovieService
@@ -989,6 +1085,11 @@ struct PlayerView: View {
                     startPosition: request.startPosition,
                     startViaProxy: stream.requiresProxy,
                     title: request.movie.title,
+                    patientMode: request.episode.id.hasPrefix("jtvhash:"),
+                    sourceLabel: request.episode.name,
+                    sources: request.allEpisodes.isEmpty ? [request.episode] : request.allEpisodes,
+                    currentSourceId: request.episode.id,
+                    onSwitchSource: onSwitchSource,
                     onFreshStream: {
                         // v1.22 self-heal's last rung: re-resolve
                         // the episode from scratch (a fresh debrid
@@ -1241,7 +1342,21 @@ struct PlaybackResolverView: View {
     let request: PlaybackRequest
 
     @EnvironmentObject private var service: MovieService
+    @EnvironmentObject private var history: WatchHistoryManager
     @Environment(\.dismiss) private var dismiss
+
+    /// v1.22.4: the request actually being played — a source
+    /// switch swaps its episode (and carries the saved position)
+    /// while the rest of the request stays identical.
+    @State private var activeRequest: PlaybackRequest
+    /// Guards against a stale resolve landing after a switch:
+    /// only the newest generation may set the phase.
+    @State private var resolveGeneration = 0
+
+    init(request: PlaybackRequest) {
+        self.request = request
+        _activeRequest = State(initialValue: request)
+    }
 
     private enum Phase {
         case resolving
@@ -1265,26 +1380,28 @@ struct PlaybackResolverView: View {
                     Text("Đang lấy link phát…")
                         .font(.system(size: 14, weight: .medium, design: .rounded))
                         .foregroundStyle(Theme.textDim)
-                    Text(request.episode.name)
+                    Text(activeRequest.episode.name)
                         .font(.system(size: 12, design: .rounded))
                         .foregroundStyle(Theme.textFaint)
+                    sourceList
                 }
+                .padding(24)
             case .video(let stream):
                 if stream.useCompatEngine {
-                    KSPlayerView(stream: stream, request: request)
+                    KSPlayerView(stream: stream, request: activeRequest, onSwitchSource: { switchSource(to: $0) })
                 } else {
-                    PlayerView(stream: stream, request: request)
+                    PlayerView(stream: stream, request: activeRequest, onSwitchSource: { switchSource(to: $0) })
                 }
             case .manga(let stream):
                 MangaReaderView(
-                    movie: request.movie,
-                    pluginId: request.pluginId,
-                    pluginName: request.pluginName,
-                    serverName: request.serverName,
-                    episodes: request.allEpisodes.isEmpty ? [request.episode] : request.allEpisodes,
-                    startEpisode: request.episode,
+                    movie: activeRequest.movie,
+                    pluginId: activeRequest.pluginId,
+                    pluginName: activeRequest.pluginName,
+                    serverName: activeRequest.serverName,
+                    episodes: activeRequest.allEpisodes.isEmpty ? [activeRequest.episode] : activeRequest.allEpisodes,
+                    startEpisode: activeRequest.episode,
                     initialStream: stream,
-                    initialIndex: Int(request.startPosition)
+                    initialIndex: Int(activeRequest.startPosition)
                 )
             case .embed(let url, let headers):
                 EmbedPlayerView(url: url, headers: headers) { captured in
@@ -1310,9 +1427,13 @@ struct PlaybackResolverView: View {
                         .font(.system(size: 14, weight: .medium, design: .rounded))
                         .foregroundStyle(.white)
                         .multilineTextAlignment(.center)
+                    Text("Nguồn vừa lỗi: \(activeRequest.episode.name)")
+                        .font(.system(size: 12, design: .rounded))
+                        .foregroundStyle(Theme.textFaint)
+                        .multilineTextAlignment(.center)
                     HStack(spacing: 12) {
                         Button("Thử lại") {
-                            Task { await resolve() }
+                            startResolve()
                         }
                         .buttonStyle(.borderedProminent)
                         .tint(Theme.accent)
@@ -1320,6 +1441,7 @@ struct PlaybackResolverView: View {
                             .buttonStyle(.bordered)
                             .tint(Theme.accent)
                     }
+                    sourceList
                 }
                 .padding(24)
             }
@@ -1355,7 +1477,7 @@ struct PlaybackResolverView: View {
             }
         }
         .task {
-            await resolve()
+            startResolve()
         }
         // Orientation restore lives HERE and only here. Nothing
         // presents over this cover anymore (no modal player, no
@@ -1381,7 +1503,73 @@ struct PlaybackResolverView: View {
         }
     }
 
-    private func resolve() async {
+    // MARK: - v1.22.4 source switching
+
+    /// All sources of the current title (the tapped server's list).
+    private var siblings: [Episode] {
+        activeRequest.allEpisodes.isEmpty ? [activeRequest.episode] : activeRequest.allEpisodes
+    }
+
+    /// The "other sources" list shown under the resolving spinner
+    /// and the failure message: when one source stalls or dies,
+    /// the owner can jump to another without leaving the player
+    /// (his request, 2026-11-17 — the Sony-style option list).
+    @ViewBuilder
+    private var sourceList: some View {
+        if siblings.count > 1 {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Nguồn khác — chạm để đổi ngay")
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .foregroundStyle(Theme.textDim)
+                ScrollView {
+                    VStack(spacing: 6) {
+                        ForEach(siblings.filter { $0.id != activeRequest.episode.id }, id: \.id) { episode in
+                            Button {
+                                switchSource(to: episode)
+                            } label: {
+                                Text(episode.name)
+                                    .font(.system(size: 13, design: .rounded))
+                                    .foregroundStyle(.white)
+                                    .lineLimit(2)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 9)
+                                    .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+                .frame(maxHeight: 200)
+            }
+            .frame(maxWidth: 420)
+            .padding(.top, 8)
+        }
+    }
+
+    /// Switches playback to another source of the same title,
+    /// carrying the newest saved position for the movie so the
+    /// new source resumes where the old one stopped.
+    private func switchSource(to episode: Episode) {
+        guard episode.id != activeRequest.episode.id else { return }
+        var next = activeRequest
+        next.episode = episode
+        if let record = history.record(for: activeRequest.pluginId, movieId: activeRequest.movie.id),
+           record.lastPosition > 5 {
+            next.startPosition = record.lastPosition
+        }
+        activeRequest = next
+        phase = .resolving
+        startResolve()
+    }
+
+    private func startResolve() {
+        resolveGeneration += 1
+        let generation = resolveGeneration
+        Task { await resolve(generation: generation) }
+    }
+
+    private func resolve(generation: Int) async {
         phase = .resolving
         do {
             // v1.22: a hard deadline on the resolver screen for
@@ -1397,11 +1585,11 @@ struct PlaybackResolverView: View {
             // minutes — capping the screen below the chain's budget
             // only produced false failures.
             let resolution: PlaybackResolution
-            if request.episode.id.hasPrefix("jtvhash:") {
-                resolution = try await service.resolveEpisode(request)
+            if activeRequest.episode.id.hasPrefix("jtvhash:") {
+                resolution = try await service.resolveEpisode(activeRequest)
             } else {
                 resolution = try await withThrowingTaskGroup(of: PlaybackResolution.self) { group in
-                    group.addTask { try await service.resolveEpisode(request) }
+                    group.addTask { try await service.resolveEpisode(activeRequest) }
                     group.addTask {
                         try await Task.sleep(nanoseconds: 45_000_000_000)
                         throw MovieServiceError.timedOut
@@ -1411,12 +1599,15 @@ struct PlaybackResolverView: View {
                     return first
                 }
             }
+            // A source switch during the wait supersedes this run.
+            guard generation == resolveGeneration else { return }
             switch resolution {
             case .video(let stream): phase = .video(stream)
             case .manga(let stream): phase = .manga(stream)
             case .embed(let url, let headers): phase = .embed(url, headers)
             }
         } catch {
+            guard generation == resolveGeneration else { return }
             phase = .failed(error.localizedDescription)
         }
     }

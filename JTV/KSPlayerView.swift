@@ -35,6 +35,8 @@ import MediaPlayer
 struct KSPlayerView: View {
     let stream: StreamInfo
     let request: PlaybackRequest
+    /// v1.22.4: source switching, owned by the resolver screen.
+    var onSwitchSource: ((Episode) -> Void)?
 
     @EnvironmentObject private var history: WatchHistoryManager
     @EnvironmentObject private var service: MovieService
@@ -49,6 +51,11 @@ struct KSPlayerView: View {
                     headers: stream.headers,
                     startPosition: request.startPosition,
                     title: request.movie.title,
+                    patientMode: request.episode.id.hasPrefix("jtvhash:"),
+                    sourceLabel: request.episode.name,
+                    sources: request.allEpisodes.isEmpty ? [request.episode] : request.allEpisodes,
+                    currentSourceId: request.episode.id,
+                    onSwitchSource: onSwitchSource,
                     onFreshStream: {
                         // v1.22 self-heal's last rung (see the
                         // AV surface): re-resolve from scratch.
@@ -96,6 +103,12 @@ struct KSVideoPlayerSurface: UIViewControllerRepresentable {
     let headers: [String: String]
     let startPosition: Double
     var title: String = ""
+    /// v1.22.4: torrent patience + source identity/switching.
+    var patientMode: Bool = false
+    var sourceLabel: String = ""
+    var sources: [Episode] = []
+    var currentSourceId: String = ""
+    var onSwitchSource: ((Episode) -> Void)?
     var onFreshStream: (() async -> StreamInfo?)?
     var onProgress: (Double, Double) -> Void
     var onExit: (Double, Double) -> Void
@@ -111,6 +124,11 @@ struct KSVideoPlayerSurface: UIViewControllerRepresentable {
         controller.contentHeaders = headers
         controller.startPosition = startPosition
         controller.nowPlayingTitle = title
+        controller.patientMode = patientMode
+        controller.sourceLabelText = sourceLabel
+        controller.sources = sources
+        controller.currentSourceId = currentSourceId
+        controller.onSwitchSource = onSwitchSource
         controller.freshStreamProvider = onFreshStream
         controller.onProgressTick = { [weak coordinator = context.coordinator] position, duration in
             coordinator?.onProgress(position, duration)
@@ -155,6 +173,13 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
     var nowPlayingTitle = ""
     /// Re-resolves the episode from scratch (v1.22 self-heal).
     var freshStreamProvider: (() async -> StreamInfo?)?
+    /// v1.22.4: torrent patience (deep buffer, long watchdogs)
+    /// + source identity/switching, mirroring the AV surface.
+    var patientMode = false
+    var sourceLabelText = ""
+    var sources: [Episode] = []
+    var currentSourceId = ""
+    var onSwitchSource: ((Episode) -> Void)?
 
     private var playerLayer: KSPlayerLayer?
     private var ready = false
@@ -179,6 +204,8 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
     private let backButton = UIButton(type: .system)
     private let forwardButton = UIButton(type: .system)
     private let rotateButton = UIButton(type: .system)
+    private let sourcesButton = UIButton(type: .system)
+    private let sourceLabel = UILabel()
     private let slider = UISlider()
     private let currentLabel = UILabel()
     private let durationLabel = UILabel()
@@ -297,7 +324,8 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
         // library source): the stock 3 s forward buffer makes
         // the engine re-stall on every slow segment; 12 s
         // matches the AV surface's setting.
-        options.preferredForwardBufferDuration = 12
+        // v1.22.4: torrent files hold 30 s (see the AV surface).
+        options.preferredForwardBufferDuration = patientMode ? 30 : 12
         KSOptions.firstPlayerType = KSMEPlayer.self
         let layer = KSPlayerLayer(url: url, options: options, delegate: self)
         playerLayer = layer
@@ -308,12 +336,16 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
         }
         layer.play()
 
+        // v1.22.4: torrent files get a 30 s first-frame budget —
+        // a debrid CDN's cold start after a far seek is slow, and
+        // the 12 s budget declared healthy files dead.
+        let firstFrameBudget: TimeInterval = patientMode ? 30 : 12
         let watchdog = DispatchWorkItem { [weak self] in
             guard let self, !self.playing else { return }
-            self.handlePlaybackFailure(message: "Chưa có hình sau 12 giây.")
+            self.handlePlaybackFailure(message: "Chưa có hình sau \(Int(firstFrameBudget)) giây.")
         }
         firstFrameWatchdog = watchdog
-        DispatchQueue.main.asyncAfter(deadline: .now() + 12, execute: watchdog)
+        DispatchQueue.main.asyncAfter(deadline: .now() + firstFrameBudget, execute: watchdog)
 
         lastAdvanceAt = Date()
         let ticker = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -411,8 +443,11 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
             return
         }
         lastPositionSec = pos
-        if Date().timeIntervalSince(lastAdvanceAt) > 12 {
-            handlePlaybackFailure(message: "Hình đứng quá 12 giây — đường truyền tới file có vấn đề.")
+        // v1.22.4: torrent files get a 30 s freeze window (their
+        // CDN refills slowly after a far seek; 12 s killed them).
+        let freezeBudget: TimeInterval = patientMode ? 30 : 12
+        if Date().timeIntervalSince(lastAdvanceAt) > freezeBudget {
+            handlePlaybackFailure(message: "Hình đứng quá \(Int(freezeBudget)) giây — đường truyền tới file có vấn đề.")
         }
     }
 
@@ -588,7 +623,28 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
         rotateButton.heightAnchor.constraint(equalToConstant: 40).isActive = true
         rotateButton.addTarget(self, action: #selector(toggleRotation), for: .touchUpInside)
 
-        let bottomRow = UIStackView(arrangedSubviews: [currentLabel, slider, durationLabel, rotateButton])
+        // v1.22.4: source identity + switching (mirrors the AV
+        // surface's control layer).
+        sourcesButton.setImage(UIImage(systemName: "list.bullet"), for: .normal)
+        sourcesButton.tintColor = .white
+        sourcesButton.backgroundColor = UIColor.black.withAlphaComponent(0.45)
+        sourcesButton.layer.cornerRadius = 20
+        sourcesButton.translatesAutoresizingMaskIntoConstraints = false
+        sourcesButton.widthAnchor.constraint(equalToConstant: 40).isActive = true
+        sourcesButton.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        sourcesButton.addTarget(self, action: #selector(showSourceList), for: .touchUpInside)
+        sourcesButton.isHidden = sources.count <= 1
+
+        sourceLabel.text = sourceLabelText.isEmpty ? "" : "Nguồn: \(sourceLabelText)"
+        sourceLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        sourceLabel.textColor = UIColor.white.withAlphaComponent(0.85)
+        sourceLabel.numberOfLines = 1
+        sourceLabel.lineBreakMode = .byTruncatingTail
+        sourceLabel.translatesAutoresizingMaskIntoConstraints = false
+        sourceLabel.isHidden = sourceLabelText.isEmpty
+        controlsView.addSubview(sourceLabel)
+
+        let bottomRow = UIStackView(arrangedSubviews: [currentLabel, slider, durationLabel, sourcesButton, rotateButton])
         bottomRow.axis = .horizontal
         bottomRow.spacing = 10
         bottomRow.alignment = .center
@@ -601,7 +657,30 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
             bottomRow.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
             bottomRow.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
             bottomRow.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -14),
+            sourceLabel.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
+            sourceLabel.trailingAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
+            sourceLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 10),
         ])
+    }
+
+    /// v1.22.4: the sibling-source picker (see the AV surface).
+    @objc private func showSourceList() {
+        let sheet = UIAlertController(title: "Chọn nguồn khác", message: "Nguồn đang phát: \(sourceLabelText)", preferredStyle: .actionSheet)
+        for episode in sources {
+            let isCurrent = episode.id == currentSourceId
+            let action = UIAlertAction(title: (isCurrent ? "✓ " : "") + episode.name, style: .default) { [weak self] _ in
+                guard !isCurrent else { return }
+                self?.onSwitchSource?(episode)
+            }
+            action.isEnabled = !isCurrent
+            sheet.addAction(action)
+        }
+        sheet.addAction(UIAlertAction(title: "Huỷ", style: .cancel))
+        if let pop = sheet.popoverPresentationController {
+            pop.sourceView = sourcesButton
+            pop.sourceRect = sourcesButton.bounds
+        }
+        present(sheet, animated: true)
     }
 
     private func refreshUI() {
