@@ -1,6 +1,6 @@
 // =============================================================================
-// Sextop1 v2.0.0 — rewritten 2026-11-14 for the site's new home
-// sextop1.house (WordPress "top1tube" theme). The old vnsextop1.com
+// Sextop1 v2.0.1 — rewritten 2026-11-14 for the site's new home
+// sextop1.cash (WordPress "top1tube" theme). The old vnsextop1.com
 // markup is gone entirely; this parser targets the new theme.
 // Playback: watch page carries a post id (.mb-screen data-id);
 // GET /wp-json/sextop1/player/?id=<postId>&server=<n> returns a
@@ -12,8 +12,8 @@ function getManifest() {
     return JSON.stringify({
         "id": "sextop1",
         "name": "Sextop1",
-        "version": "2.0.0",
-        "baseUrl": "https://sextop1.house",
+        "version": "2.0.1",
+        "baseUrl": "https://sextop1.cash",
         "iconUrl": "https://raw.githubusercontent.com/youngbi/repo/main/plugins/sextop1.webp",
         "isEnabled": true,
         "isAdult": true,
@@ -54,7 +54,7 @@ function getFilterConfig() {
 // URL GENERATION
 // =============================================================================
 
-var ST1_BASE = "https://sextop1.house";
+var ST1_BASE = "https://sextop1.cash";
 
 function getUrlList(slug, filtersJson) {
     var filters = JSON.parse(filtersJson || "{}");
