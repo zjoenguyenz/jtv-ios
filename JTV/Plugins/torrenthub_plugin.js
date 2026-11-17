@@ -141,12 +141,63 @@ function getUrlSearch(keyword, filtersJson) {
     return ADDON_BASE + "/catalog/" + ADDON_TYPE + "/search/search=" + encodeURIComponent(keyword || "") + ".json";
 }
 
+// Pure-JS base64 decode (JavaScriptCore has no atob): standard and
+// URL-safe alphabets, padding optional. Returns the decoded UTF-8
+// string or "" on any malformed input.
+function thB64Decode(str) {
+    var alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    var s = String(str || "").replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");
+    var out = "";
+    var buf = 0, bits = 0;
+    for (var i = 0; i < s.length; i++) {
+        var v = alpha.indexOf(s.charAt(i));
+        if (v < 0) return "";
+        buf = (buf << 6) | v; bits += 6;
+        if (bits >= 8) { bits -= 8; out += String.fromCharCode((buf >> bits) & 255); }
+    }
+    try { return decodeURIComponent(escape(out)); } catch (e) { return out; }
+}
+
+function thB64DecodeJson(str) {
+    try { var t = thB64Decode(str); return t ? JSON.parse(t) : null; } catch (e) { return null; }
+}
+
+/// Search query for a scene release title: drop bracket tags, date
+/// tokens and format tokens, keep the first 3 content tokens (studio
+/// + distinctive words). A full release name ANDs to zero hits on the
+/// index; the short form was verified to return the scene's variants.
+function thApibayQuery(title) {
+    var t = String(title || "").replace(/\[[^\]]*\]/g, " ");
+    var raw = t.split(/[^A-Za-z0-9]+/);
+    var stop = /^(2160p|1080p|720p|480p|360p|4k|uhd|xxx|mp4|mkv|avi|web|webrip|webdl|wrb|hdrip|bdrip|bluray|x264|x265|h264|h265|hevc|aac|mp3)$/i;
+    var keep = [];
+    for (var i = 0; i < raw.length && keep.length < 3; i++) {
+        var w = raw[i];
+        if (!w || /^\d+$/.test(w) || stop.test(w)) continue;
+        keep.push(w);
+    }
+    return keep.join(" ");
+}
+
 function getUrlDetail(slug) {
     if (!slug) return "";
     if (slug.indexOf('jtvstreams:') === 0) {
         var rest = slug.slice('jtvstreams:'.length);
         if (rest.indexOf('ad:') === 0) {
-            return ADDON_BASE + "/stream/" + ADDON_TYPE + "/" + encodeURIComponent(rest.slice(3)) + ".json";
+            var addonId = rest.slice(3);
+            // Lane B items carry ONE torrent in the addon payload, so
+            // stage 2 searches a public torrent index by the release
+            // title for real alternatives (v1.0.3). The original hash
+            // rides along as jtvfb so a no-hit search still yields the
+            // addon's own torrent as the single episode.
+            if (addonId.indexOf('jstrm:') === 0) {
+                var payload = thB64DecodeJson(addonId.slice(6));
+                if (payload && payload.h && payload.t) {
+                    var q = thApibayQuery(payload.t);
+                    if (q) return "https://apibay.org/q.php?q=" + encodeURIComponent(q) + "&jtvfb=" + payload.h;
+                }
+            }
+            return ADDON_BASE + "/stream/" + ADDON_TYPE + "/" + encodeURIComponent(addonId) + ".json";
         }
         return TORRENTIO + "/stream/movie/" + rest + ".json";
     }
@@ -352,6 +403,36 @@ function thRecommendedFromStreams(streams) {
 function parseMovieDetail(text, pageUrl) {
     var j;
     try { j = JSON.parse(text); } catch (e) { return "null"; }
+    if ((pageUrl || "").indexOf('apibay.org') >= 0 && j && j.length !== undefined) {
+        // Lane B stage 2 (v1.0.3): rows from a public torrent index
+        // search, mapped into the same stream shape Torrentio uses so
+        // the standard sort/label/⭐ logic applies unchanged.
+        var streams = [];
+        for (var ai = 0; ai < j.length; ai++) {
+            var row = j[ai];
+            if (!row || !row.info_hash || !row.name || row.name === "No results returned") continue;
+            var bytes = parseInt(row.size || 0);
+            var sizeStr = bytes >= 1073741824 ? (bytes / 1073741824).toFixed(2) + " GB"
+                        : bytes >= 1048576 ? (bytes / 1048576).toFixed(1) + " MB" : "";
+            streams.push({
+                infoHash: String(row.info_hash).toLowerCase(),
+                name: "🧲 Torrent",
+                title: row.name + "\n👤 " + (row.seeders || 0) + (sizeStr ? " 💾 " + sizeStr : "")
+            });
+        }
+        if (streams.length) {
+            var aeps = thEpisodesFromStreams(streams, false);
+            var aservers = [{ name: "Torrent", episodes: aeps }];
+            var agood = thRecommendedFromStreams(streams);
+            if (agood.length) aservers.push({ name: "⭐ Nguồn đề xuất", episodes: agood });
+            return thDetailStub(aservers);
+        }
+        var fbm = (pageUrl || "").match(/jtvfb=([0-9a-fA-F]{32,40})/);
+        if (fbm) {
+            return thDetailStub([{ name: "Torrent", episodes: [{ id: "jtvhash:" + fbm[1].toLowerCase(), name: "Nguồn gốc", slug: "s0" }] }]);
+        }
+        return "null";
+    }
     if (j && j.streams) {
         var isTio = (pageUrl || "").indexOf('torrentio') >= 0;
         var eps = thEpisodesFromStreams(j.streams, isTio);
