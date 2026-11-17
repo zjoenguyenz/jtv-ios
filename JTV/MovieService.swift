@@ -190,7 +190,30 @@ final class MovieService: ObservableObject {
               !stage2.servers.isEmpty else { return detail }
         var resolved = detail
         resolved.servers = stage2.servers
-        return resolved
+        return await mergeMediaFusion(pluginId: pluginId, movieId: movieId, detail: resolved)
+    }
+
+    /// v1.22.5: MediaFusion merge (owner request — the same
+    /// second torrent gateway the Sony app runs beside
+    /// Torrentio). When the owner has pasted his MediaFusion
+    /// manifest URL in Settings, a torrenthub detail for an
+    /// IMDb-id title gains a "MediaFusion" server: MediaFusion
+    /// answers with direct per-provider links (its responses
+    /// carry no infoHash), quality-sorted like the plugin's own
+    /// list. Strictly additive — no URL configured, a failed
+    /// fetch, or an empty answer leaves the detail exactly as
+    /// the plugin made it. The manifest URL is a bearer
+    /// credential: it lives only in UserDefaults, never logged.
+    func mergeMediaFusion(pluginId: String, movieId: String, detail: MovieDetail) async -> MovieDetail {
+        guard pluginId == "torrenthub", movieId.hasPrefix("tt"),
+              let base = MediaFusion.baseURL else { return detail }
+        let url = "\(base)/stream/movie/\(movieId).json"
+        guard let text = try? await Net.fetchText(url) else { return detail }
+        let episodes = MediaFusion.parseStreams(text: text)
+        guard !episodes.isEmpty else { return detail }
+        var merged = detail
+        merged.servers.append(EpisodeServer(name: "MediaFusion", episodes: episodes))
+        return merged
     }
 
     func detail(pluginId: String, movieId: String) async throws -> DetailBundle {
@@ -425,5 +448,103 @@ final class MovieService: ObservableObject {
         var resolved = stream
         if resolved.headers.isEmpty { resolved.headers = await defaultHeaders(for: pluginId) }
         return resolved
+    }
+}
+
+// MARK: - MediaFusion (v1.22.5)
+
+/// Parser + settings for the owner's MediaFusion gateway. The
+/// manifest URL is configured by the owner at
+/// mediafusion.elfhosted.com/configure (his providers, cached
+/// only) and pasted into Settings; it is a bearer credential —
+/// stored only in UserDefaults, never logged, never sent
+/// anywhere except the gateway itself. MediaFusion stream
+/// responses carry NO infoHash: every entry is a direct
+/// per-provider link, so episodes keep the URL as their id
+/// (the same shape as the torrenthub plugin's direct entries).
+enum MediaFusion {
+    static let urlKey = "jtv_mediafusion_url"
+
+    static var baseURL: String? {
+        let raw = UserDefaults.standard.string(forKey: urlKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !raw.isEmpty else { return nil }
+        var value = raw
+        if value.hasPrefix("stremio://") {
+            value = "https://" + String(value.dropFirst("stremio://".count))
+        }
+        if value.hasSuffix("/manifest.json") {
+            value = String(value.dropLast("/manifest.json".count))
+        }
+        if value.hasSuffix("/") { value = String(value.dropLast()) }
+        guard value.hasPrefix("http") else { return nil }
+        return value
+    }
+
+    static func parseStreams(text: String) -> [Episode] {
+        guard let data = text.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let streams = root["streams"] as? [[String: Any]] else { return [] }
+        var parsed: [(episode: Episode, rank: Int, seeds: Int, sizeMB: Double)] = []
+        for stream in streams {
+            let name = stream["name"] as? String ?? ""
+            let title = stream["title"] as? String ?? ""
+            let hints = stream["behaviorHints"] as? [String: Any]
+            let filename = (hints?["filename"] as? String)
+                ?? title.components(separatedBy: "\n").first
+                ?? ""
+            let provider: String
+            let lowered = name.lowercased()
+            if lowered.contains("premiumize") || name.contains("PM") { provider = "PM" }
+            else if lowered.contains("torbox") || name.contains("TB") { provider = "TB" }
+            else if lowered.contains("real-debrid") || lowered.contains("realdebrid") || name.contains("RD") { provider = "RD" }
+            else { provider = "MF" }
+            let haystack = (name + " " + title + " " + filename).lowercased()
+            let rank = (haystack.contains("2160") || haystack.contains("4k") || haystack.contains("uhd")) ? 4
+                : haystack.contains("1080") ? 3
+                : haystack.contains("720") ? 2
+                : haystack.contains("480") ? 1 : 0
+            let seeds = intAfter("👤", in: title)
+            let sizeMB = sizeInMB(title)
+            var label = provider
+            if !filename.isEmpty { label += " · " + filename }
+            if sizeMB > 0 { label += " · " + formatSize(sizeMB) }
+            if seeds > 0 { label += " · 👤 \(seeds)" }
+            if let url = stream["url"] as? String, !url.isEmpty {
+                parsed.append((Episode(id: url, name: label, slug: url), rank, seeds, sizeMB))
+            } else if let hash = (stream["infoHash"] as? String)?.lowercased(), !hash.isEmpty {
+                let id = "jtvhash:" + hash
+                parsed.append((Episode(id: id, name: label, slug: id), rank, seeds, sizeMB))
+            }
+        }
+        parsed.sort { a, b in
+            if a.rank != b.rank { return a.rank > b.rank }
+            if a.seeds != b.seeds { return a.seeds > b.seeds }
+            return a.sizeMB > b.sizeMB
+        }
+        return parsed.prefix(15).map { $0.episode }
+    }
+
+    private static func intAfter(_ marker: String, in text: String) -> Int {
+        guard let range = text.range(of: marker) else { return 0 }
+        let digits = text[range.upperBound...].drop { !$0.isNumber }.prefix { $0.isNumber }
+        return Int(digits) ?? 0
+    }
+
+    private static func sizeInMB(_ text: String) -> Double {
+        let pattern = #"([0-9]+(?:\.[0-9]+)?)\s*(GB|GiB|MB|MiB)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              let valueRange = Range(match.range(at: 1), in: text),
+              let unitRange = Range(match.range(at: 2), in: text),
+              let value = Double(text[valueRange]) else { return 0 }
+        let unit = text[unitRange]
+        return (unit == "GB" || unit == "GiB") ? value * 1024 : value
+    }
+
+    private static func formatSize(_ sizeMB: Double) -> String {
+        sizeMB >= 1024
+            ? String(format: "%.2f GB", sizeMB / 1024)
+            : String(format: "%.0f MB", sizeMB)
     }
 }

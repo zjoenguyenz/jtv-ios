@@ -13,6 +13,7 @@ struct SettingsView: View {
     @AppStorage(DebridTokens.rdKey) private var rdToken = ""
     @AppStorage(DebridTokens.torboxKey) private var torboxToken = ""
     @AppStorage(DebridTokens.premiumizeKey) private var premiumizeToken = ""
+    @AppStorage(MediaFusion.urlKey) private var mediaFusionURL = ""
 
     private var appVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
@@ -250,6 +251,10 @@ struct SettingsView: View {
                 .foregroundStyle(.white)
                 .autocorrectionDisabled(true)
                 .textInputAutocapitalization(.never)
+            TextField("Link MediaFusion (manifest)", text: $mediaFusionURL)
+                .foregroundStyle(.white)
+                .autocorrectionDisabled(true)
+                .textInputAutocapitalization(.never)
             if DebridTokens.isConfigured {
                 Label("Đã cấu hình ✓", systemImage: "checkmark.circle.fill")
                     .foregroundStyle(Theme.accent)
@@ -257,7 +262,7 @@ struct SettingsView: View {
         } header: {
             Text("Torrent (TorBox / Real-Debrid / Premiumize)")
         } footer: {
-            Text("Dùng cho tab Torrent: app hỏi nhà nào có sẵn phim trước, theo thứ tự TorBox → Real-Debrid → Premiumize. Token chỉ lưu trên máy này; để trống nếu bản cài đặt đã nạp sẵn.")
+            Text("Dùng cho tab Torrent: app hỏi nhà nào có sẵn phim trước, theo thứ tự TorBox → Real-Debrid → Premiumize. Token chỉ lưu trên máy này; để trống nếu bản cài đặt đã nạp sẵn. Có link MediaFusion thì dán vào: app lấy thêm nguồn từ cổng đó (Premiumize có nhiều hàng qua MediaFusion) gộp vào danh sách nguồn. Link MediaFusion như mật khẩu — chỉ lưu trên máy này, đừng chia sẻ.")
         }
         .listRowBackground(Theme.glassFill)
     }

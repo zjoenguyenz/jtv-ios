@@ -53,7 +53,9 @@ struct KSPlayerView: View {
                     title: request.movie.title,
                     patientMode: request.episode.id.hasPrefix("jtvhash:"),
                     sourceLabel: request.episode.name,
-                    sources: request.allEpisodes.isEmpty ? [request.episode] : request.allEpisodes,
+                    sources: request.switchList.isEmpty
+                        ? (request.allEpisodes.isEmpty ? [request.episode] : request.allEpisodes)
+                        : request.switchList,
                     currentSourceId: request.episode.id,
                     onSwitchSource: onSwitchSource,
                     onFreshStream: {

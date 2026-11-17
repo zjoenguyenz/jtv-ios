@@ -463,7 +463,8 @@ struct MovieDetailView: View {
             allEpisodes: episodes,
             startPosition: record.lastPosition,
             knownStreamURL: record.streamURL,
-            fallbackHeaders: bundle?.detailStream.headers ?? [:]
+            fallbackHeaders: bundle?.detailStream.headers ?? [:],
+            switchList: switchShortlist(current: episode, detail: detail)
         )
         presenter.request = request
     }
@@ -480,9 +481,35 @@ struct MovieDetailView: View {
             allEpisodes: server.episodes,
             startPosition: startPosition,
             knownStreamURL: knownStreamURL,
-            fallbackHeaders: bundle?.detailStream.headers ?? [:]
+            fallbackHeaders: bundle?.detailStream.headers ?? [:],
+            switchList: switchShortlist(current: episode, detail: detail)
         )
         Haptics.tap()
         presenter.request = request
+    }
+
+    /// v1.22.5: the top-5 source shortlist for the in-player
+    /// switcher (owner spec, 2026-11-17: ~5 top links, quality
+    /// first, so he can drop to a lighter-but-faster link
+    /// himself). Torrent titles only: merge the detail's servers
+    /// in merit order — the plugin's ⭐ recommended server, then
+    /// MediaFusion, then the rest — dedupe by episode id, the
+    /// current episode first, cap 5 rows.
+    private func switchShortlist(current: Episode, detail: MovieDetail) -> [Episode] {
+        guard pluginId == "torrenthub" else { return [] }
+        func rank(_ name: String) -> Int {
+            if name.contains("⭐") { return 0 }
+            if name == "MediaFusion" { return 1 }
+            return 2
+        }
+        let ordered = detail.servers.sorted { rank($0.name) < rank($1.name) }
+        var seen = Set<String>()
+        var others: [Episode] = []
+        for server in ordered {
+            for episode in server.episodes where episode.id != current.id {
+                if seen.insert(episode.id).inserted { others.append(episode) }
+            }
+        }
+        return [current] + Array(others.prefix(4))
     }
 }

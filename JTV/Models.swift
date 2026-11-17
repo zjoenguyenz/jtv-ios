@@ -497,6 +497,11 @@ struct PlaybackRequest: Identifiable {
     /// Last known direct stream URL from a history record (fast resume path).
     var knownStreamURL: String = ""
     var fallbackHeaders: [String: String] = [:]
+    /// v1.22.5: the curated top-5 source shortlist for the
+    /// in-player switcher (torrent titles; built by DetailView
+    /// across ALL of the detail's servers). Empty = fall back to
+    /// allEpisodes.
+    var switchList: [Episode] = []
 }
 
 /// Navigation route to a movie detail screen (carries its plugin).

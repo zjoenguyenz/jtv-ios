@@ -1087,7 +1087,9 @@ struct PlayerView: View {
                     title: request.movie.title,
                     patientMode: request.episode.id.hasPrefix("jtvhash:"),
                     sourceLabel: request.episode.name,
-                    sources: request.allEpisodes.isEmpty ? [request.episode] : request.allEpisodes,
+                    sources: request.switchList.isEmpty
+                        ? (request.allEpisodes.isEmpty ? [request.episode] : request.allEpisodes)
+                        : request.switchList,
                     currentSourceId: request.episode.id,
                     onSwitchSource: onSwitchSource,
                     onFreshStream: {
@@ -1505,9 +1507,12 @@ struct PlaybackResolverView: View {
 
     // MARK: - v1.22.4 source switching
 
-    /// All sources of the current title (the tapped server's list).
+    /// All sources offered by the in-player switcher: the
+    /// curated top-5 shortlist when the request carries one
+    /// (torrent titles), else the current server's full list.
     private var siblings: [Episode] {
-        activeRequest.allEpisodes.isEmpty ? [activeRequest.episode] : activeRequest.allEpisodes
+        if !activeRequest.switchList.isEmpty { return activeRequest.switchList }
+        return activeRequest.allEpisodes.isEmpty ? [activeRequest.episode] : activeRequest.allEpisodes
     }
 
     /// The "other sources" list shown under the resolving spinner
