@@ -37,6 +37,8 @@ struct KSPlayerView: View {
     let request: PlaybackRequest
     /// v1.22.4: source switching, owned by the resolver screen.
     var onSwitchSource: ((Episode) -> Void)?
+    /// v1.22.6: close, owned by the resolver screen.
+    var onClose: (() -> Void)?
 
     @EnvironmentObject private var history: WatchHistoryManager
     @EnvironmentObject private var service: MovieService
@@ -58,6 +60,7 @@ struct KSPlayerView: View {
                         : request.switchList,
                     currentSourceId: request.episode.id,
                     onSwitchSource: onSwitchSource,
+                    onClose: onClose,
                     onFreshStream: {
                         // v1.22 self-heal's last rung (see the
                         // AV surface): re-resolve from scratch.
@@ -111,6 +114,7 @@ struct KSVideoPlayerSurface: UIViewControllerRepresentable {
     var sources: [Episode] = []
     var currentSourceId: String = ""
     var onSwitchSource: ((Episode) -> Void)?
+    var onClose: (() -> Void)?
     var onFreshStream: (() async -> StreamInfo?)?
     var onProgress: (Double, Double) -> Void
     var onExit: (Double, Double) -> Void
@@ -131,6 +135,7 @@ struct KSVideoPlayerSurface: UIViewControllerRepresentable {
         controller.sources = sources
         controller.currentSourceId = currentSourceId
         controller.onSwitchSource = onSwitchSource
+        controller.onClose = onClose
         controller.freshStreamProvider = onFreshStream
         controller.onProgressTick = { [weak coordinator = context.coordinator] position, duration in
             coordinator?.onProgress(position, duration)
@@ -182,6 +187,7 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
     var sources: [Episode] = []
     var currentSourceId = ""
     var onSwitchSource: ((Episode) -> Void)?
+    var onClose: (() -> Void)?
 
     private var playerLayer: KSPlayerLayer?
     private var ready = false
@@ -207,6 +213,7 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
     private let forwardButton = UIButton(type: .system)
     private let rotateButton = UIButton(type: .system)
     private let sourcesButton = UIButton(type: .system)
+    private let closeButton = UIButton(type: .system)
     private let sourceLabel = UILabel()
     private let slider = UISlider()
     private let currentLabel = UILabel()
@@ -646,6 +653,22 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
         sourceLabel.isHidden = sourceLabelText.isEmpty
         controlsView.addSubview(sourceLabel)
 
+        // v1.22.6: the close button lives INSIDE the control
+        // layer so it fades with the controls while playing.
+        // (Before, the resolver's SwiftUI X floated above the
+        // playing surface permanently — the owner's one remaining
+        // complaint on v1.22.5.) The resolver keeps its own X for
+        // the resolving / embed / failed phases only.
+        closeButton.setImage(UIImage(systemName: "xmark"), for: .normal)
+        closeButton.tintColor = .white
+        closeButton.backgroundColor = UIColor.black.withAlphaComponent(0.45)
+        closeButton.layer.cornerRadius = 20
+        closeButton.translatesAutoresizingMaskIntoConstraints = false
+        closeButton.widthAnchor.constraint(equalToConstant: 40).isActive = true
+        closeButton.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        closeButton.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
+        controlsView.addSubview(closeButton)
+
         let bottomRow = UIStackView(arrangedSubviews: [currentLabel, slider, durationLabel, sourcesButton, rotateButton])
         bottomRow.axis = .horizontal
         bottomRow.spacing = 10
@@ -659,11 +682,15 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
             bottomRow.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
             bottomRow.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
             bottomRow.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -14),
-            sourceLabel.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
+            sourceLabel.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 68),
             sourceLabel.trailingAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
             sourceLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 10),
+            closeButton.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
+            closeButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 4),
         ])
     }
+
+    @objc private func closeTapped() { onClose?() }
 
     /// v1.22.4: the sibling-source picker (see the AV surface).
     @objc private func showSourceList() {

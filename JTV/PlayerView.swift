@@ -41,6 +41,8 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
     var sources: [Episode] = []
     var currentSourceId: String = ""
     var onSwitchSource: ((Episode) -> Void)?
+    /// v1.22.6: close from inside the surface's control layer.
+    var onClose: (() -> Void)?
     /// Re-resolves the episode from scratch (v1.22 self-heal's
     /// last rung: a completely fresh link after same-URL retries).
     var onFreshStream: (() async -> StreamInfo?)?
@@ -109,6 +111,7 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         controller.sources = sources
         controller.currentSourceId = currentSourceId
         controller.onSwitchSource = onSwitchSource
+        controller.onClose = onClose
         context.coordinator.onGiveUp = { [weak controller] message in
             controller?.showError(message: message)
         }
@@ -595,6 +598,7 @@ final class PlayerSurfaceViewController: UIViewController {
     var sources: [Episode] = []
     var currentSourceId = ""
     var onSwitchSource: ((Episode) -> Void)?
+    var onClose: (() -> Void)?
 
     private let videoView = PlayerLayerView()
     private let controlsView = UIView()
@@ -605,6 +609,7 @@ final class PlayerSurfaceViewController: UIViewController {
     private let rotateButton = UIButton(type: .system)
     private let pipButton = UIButton(type: .system)
     private let sourcesButton = UIButton(type: .system)
+    private let closeButton = UIButton(type: .system)
     private let sourceLabel = UILabel()
     private var pipController: AVPictureInPictureController?
     private var remoteTargets: [(MPRemoteCommand, Any)] = []
@@ -813,6 +818,22 @@ final class PlayerSurfaceViewController: UIViewController {
         sourcesButton.addTarget(self, action: #selector(showSourceList), for: .touchUpInside)
         sourcesButton.isHidden = sources.count <= 1
 
+        // v1.22.6: the close button lives INSIDE the control
+        // layer so it fades with the controls while playing.
+        // (Before, the resolver's SwiftUI X floated above the
+        // playing surface permanently — the owner's one remaining
+        // complaint on v1.22.5.) The resolver keeps its own X for
+        // the resolving / embed / failed phases only.
+        closeButton.setImage(UIImage(systemName: "xmark"), for: .normal)
+        closeButton.tintColor = .white
+        closeButton.backgroundColor = UIColor.black.withAlphaComponent(0.45)
+        closeButton.layer.cornerRadius = 20
+        closeButton.translatesAutoresizingMaskIntoConstraints = false
+        closeButton.widthAnchor.constraint(equalToConstant: 40).isActive = true
+        closeButton.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        closeButton.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
+        controlsView.addSubview(closeButton)
+
         sourceLabel.text = sourceLabelText.isEmpty ? "" : "Nguồn: \(sourceLabelText)"
         sourceLabel.font = .systemFont(ofSize: 12, weight: .medium)
         sourceLabel.textColor = UIColor.white.withAlphaComponent(0.85)
@@ -835,11 +856,15 @@ final class PlayerSurfaceViewController: UIViewController {
             bottomRow.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
             bottomRow.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
             bottomRow.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -14),
-            sourceLabel.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
+            sourceLabel.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 68),
             sourceLabel.trailingAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -16),
             sourceLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 10),
+            closeButton.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
+            closeButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 4),
         ])
     }
+
+    @objc private func closeTapped() { onClose?() }
 
     /// v1.22.4: the sibling-source picker. The running source is
     /// marked and disabled; tapping another hands it to the
@@ -1070,6 +1095,8 @@ struct PlayerView: View {
     let request: PlaybackRequest
     /// v1.22.4: source switching, owned by the resolver screen.
     var onSwitchSource: ((Episode) -> Void)?
+    /// v1.22.6: close, owned by the resolver screen.
+    var onClose: (() -> Void)?
 
     @EnvironmentObject private var history: WatchHistoryManager
     @EnvironmentObject private var service: MovieService
@@ -1092,6 +1119,7 @@ struct PlayerView: View {
                         : request.switchList,
                     currentSourceId: request.episode.id,
                     onSwitchSource: onSwitchSource,
+                    onClose: onClose,
                     onFreshStream: {
                         // v1.22 self-heal's last rung: re-resolve
                         // the episode from scratch (a fresh debrid
@@ -1390,9 +1418,9 @@ struct PlaybackResolverView: View {
                 .padding(24)
             case .video(let stream):
                 if stream.useCompatEngine {
-                    KSPlayerView(stream: stream, request: activeRequest, onSwitchSource: { switchSource(to: $0) })
+                    KSPlayerView(stream: stream, request: activeRequest, onSwitchSource: { switchSource(to: $0) }, onClose: { dismiss() })
                 } else {
-                    PlayerView(stream: stream, request: activeRequest, onSwitchSource: { switchSource(to: $0) })
+                    PlayerView(stream: stream, request: activeRequest, onSwitchSource: { switchSource(to: $0) }, onClose: { dismiss() })
                 }
             case .manga(let stream):
                 MangaReaderView(
@@ -1500,7 +1528,7 @@ struct PlaybackResolverView: View {
 
     private var showsCloseButton: Bool {
         switch phase {
-        case .manga: return false
+        case .manga, .video: return false
         default: return true
         }
     }
