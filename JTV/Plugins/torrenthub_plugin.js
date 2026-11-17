@@ -32,7 +32,7 @@ function getManifest() {
     return JSON.stringify({
         "id": "torrenthub",
         "name": "Torrent 18+",
-        "version": "1.0.1",
+        "version": "1.0.2",
         "baseUrl": "https://addon.debrid.in",
         "iconUrl": "",
         "isEnabled": true,
@@ -277,7 +277,7 @@ function thStreamLabel(release, metaLine, nameField) {
     return { label: parts.join(" · "), seeds: seeds, rank: thQualityRank(quality), sizeMB: sizeMB };
 }
 
-function thEpisodesFromStreams(streams, isTorrentio) {
+function thSortedStreams(streams) {
     var eps = [];
     for (var i = 0; i < streams.length; i++) {
         var s = streams[i];
@@ -321,11 +321,32 @@ function thEpisodesFromStreams(streams, isTorrentio) {
         return b._sizeMB - a._sizeMB;
     });
     if (eps.length > 40) eps = eps.slice(0, 40);
+    return eps;
+}
+
+function thStripMeta(eps) {
     var out = [];
     for (var j = 0; j < eps.length; j++) {
         out.push({ id: eps[j].id, name: eps[j].name, slug: eps[j].slug });
     }
     return out;
+}
+
+function thEpisodesFromStreams(streams, isTorrentio) {
+    return thStripMeta(thSortedStreams(streams));
+}
+
+/// The owner's "good sources" shortlist (2026-11-16): FHD-or-better
+/// entries only, in the standard quality order, at most 5. Empty
+/// when the title has no FHD+ source at all — nothing is labelled
+/// "recommended" that does not meet the FHD floor.
+function thRecommendedFromStreams(streams) {
+    var sorted = thSortedStreams(streams);
+    var good = [];
+    for (var i = 0; i < sorted.length && good.length < 5; i++) {
+        if (sorted[i]._rank >= 3) good.push(sorted[i]);
+    }
+    return thStripMeta(good);
 }
 
 function parseMovieDetail(text, pageUrl) {
@@ -334,7 +355,13 @@ function parseMovieDetail(text, pageUrl) {
     if (j && j.streams) {
         var isTio = (pageUrl || "").indexOf('torrentio') >= 0;
         var eps = thEpisodesFromStreams(j.streams, isTio);
-        return thDetailStub([{ name: isTio ? "Torrentio" : "Torrent", episodes: eps }]);
+        var servers = [{ name: isTio ? "Torrentio" : "Torrent", episodes: eps }];
+        // Owner request (2026-11-16): a recommended-good-sources
+        // section UNDER the full list, for manual picking when the
+        // first choice stalls. Only FHD+ entries qualify.
+        var good = thRecommendedFromStreams(j.streams);
+        if (good.length) servers.push({ name: "⭐ Nguồn đề xuất", episodes: good });
+        return thDetailStub(servers);
     }
     var m = (j && j.meta) || null;
     if (!m) return "null";
