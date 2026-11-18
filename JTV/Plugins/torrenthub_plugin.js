@@ -32,7 +32,7 @@ function getManifest() {
     return JSON.stringify({
         "id": "torrenthub",
         "name": "Torrent 18+",
-        "version": "1.0.2",
+        "version": "1.0.4",
         "baseUrl": "https://addon.debrid.in",
         "iconUrl": "",
         "isEnabled": true,
@@ -225,6 +225,10 @@ function thAddonItems(j) {
     for (var i = 0; i < metas.length; i++) {
         var m = metas[i];
         if (!m.id || !m.name) continue;
+        // 1.0.4: the addon's upstream feeds carry junk entries whose
+        // whole title is a number + a format token ("001 mp4") — they
+        // crowded the 4K rails (3-5 per page). Drop exactly those.
+        if (/^\s*\d{1,4}\s*(mp4|mkv|avi|wmv|xxx)?\s*$/i.test(m.name)) continue;
         var year = 0;
         var ym = String(m.releaseInfo || "").match(/(18|19|20)\d{2}/);
         if (ym) year = parseInt(ym[0]);

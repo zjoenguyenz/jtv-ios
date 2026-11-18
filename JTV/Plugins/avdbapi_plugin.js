@@ -6,7 +6,7 @@ function getManifest() {
     return JSON.stringify({
         "id": "avdbapi",
         "name": "AVDB JAV",
-        "version": "1.0.4",
+        "version": "1.0.5",
         "baseUrl": "https://avdbapi.com/api.php/provide/vod",
         "iconUrl": "https://avdbapi.com/favicon.ico",
         "isEnabled": true,
@@ -232,13 +232,19 @@ function parseMovieDetail(apiResponseJson) {
 
 function parseDetailResponse(embedHtml, pageUrl) {
     try {
+        // 2026-11-18: the embed host moved (upload18.org -> upload18.to);
+        // the Referer must follow the embed page's own origin or the
+        // token/stream endpoints reject the request.
+        var refOrigin = "https://upload18.org/";
+        var om = (pageUrl || "").match(/^https?:\/\/[^\/]+/i);
+        if (om) refOrigin = om[0] + "/";
         // Nếu response là m3u8 content → trả pageUrl để AVPlayer play trực tiếp
         if (embedHtml.indexOf("#EXTM3U") !== -1 || embedHtml.indexOf("#EXT-X-") !== -1) {
             return JSON.stringify({
                 url: pageUrl || "",
                 isEmbed: false,
                 headers: {
-                    "Referer": "https://upload18.org/",
+                    "Referer": refOrigin,
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
                 },
                 subtitles: []
@@ -252,7 +258,7 @@ function parseDetailResponse(embedHtml, pageUrl) {
                 url: pageUrl || "",
                 isEmbed: true,
                 headers: {
-                    "Referer": "https://upload18.org/",
+                    "Referer": refOrigin,
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
                 },
                 subtitles: []
@@ -265,7 +271,7 @@ function parseDetailResponse(embedHtml, pageUrl) {
             return JSON.stringify({
                 url: fallbackMatch[1],
                 isEmbed: false,
-                headers: { "Referer": "https://upload18.org/" },
+                headers: { "Referer": refOrigin },
                 subtitles: []
             });
         }
@@ -275,7 +281,7 @@ function parseDetailResponse(embedHtml, pageUrl) {
             url: pageUrl || "",
             isEmbed: true,
             headers: {
-                "Referer": "https://upload18.org/",
+                "Referer": refOrigin,
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
             },
             subtitles: []
@@ -290,6 +296,9 @@ function parseDetailResponse(embedHtml, pageUrl) {
 
 function parseEmbedResponse(m3u8Content, tokenUrl) {
     try {
+        var refOrigin = "https://upload18.org/";
+        var om = (tokenUrl || "").match(/^https?:\/\/[^\/]+/i);
+        if (om) refOrigin = om[0] + "/";
         // tokenUrl = "https://upload18.org/play/token_hash?hash=xxx"
         // m3u8Content = nội dung m3u8 playlist
         // ExoPlayer cần URL, không phải content → trả tokenUrl là URL playable
@@ -297,7 +306,7 @@ function parseEmbedResponse(m3u8Content, tokenUrl) {
             return JSON.stringify({
                 url: tokenUrl,
                 headers: {
-                    "Referer": "https://upload18.org/",
+                    "Referer": refOrigin,
                     "Block-Ads": "true",
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
                 },

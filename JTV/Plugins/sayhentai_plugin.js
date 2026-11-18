@@ -11,7 +11,7 @@ function getManifest() {
     return JSON.stringify({
         "id": "sayhentai",
         "name": "SayHentai",
-        "version": "2.0.1",
+        "version": "2.0.2",
         "baseUrl": "https://sayhentai.sale",
         "iconUrl": "https://sayhentai.sale/favicon.ico",
         "isEnabled": true,
@@ -28,12 +28,30 @@ function getHomeSections() {
 }
 
 function getPrimaryCategories() {
+    // 2.0.2: the full main-genre surface of the site (every slug
+    // verified present on sayhentai.sale, 2026-11-18) — before, only
+    // 6 chips were exposed and the genre list looked gutted.
     return JSON.stringify([
         { name: 'Mới Nhất', slug: '' },
         { name: 'Manhwa', slug: 'the-loai/manhwa' },
+        { name: 'Manhua', slug: 'the-loai/manhua' },
+        { name: 'Manga', slug: 'the-loai/manga' },
+        { name: 'Webtoon', slug: 'the-loai/webtoon' },
         { name: 'Drama', slug: 'the-loai/drama' },
         { name: 'Romance', slug: 'the-loai/romance' },
         { name: 'Action', slug: 'the-loai/action' },
+        { name: 'Comedy', slug: 'the-loai/comedy' },
+        { name: 'Fantasy', slug: 'the-loai/fantasy' },
+        { name: 'Supernatural', slug: 'the-loai/supernatural' },
+        { name: 'Harem', slug: 'the-loai/harem' },
+        { name: 'Ecchi', slug: 'the-loai/ecchi' },
+        { name: 'Historical', slug: 'the-loai/historical' },
+        { name: 'Horror', slug: 'the-loai/horror' },
+        { name: 'Shoujo', slug: 'the-loai/shoujo' },
+        { name: 'Sports', slug: 'the-loai/sports' },
+        { name: 'Vampire', slug: 'the-loai/vampire' },
+        { name: 'Doujinshi', slug: 'the-loai/doujinshi' },
+        { name: 'Oneshot', slug: 'the-loai/oneshot' },
         { name: 'Adult', slug: 'the-loai/adult' }
     ]);
 }
@@ -45,9 +63,25 @@ function getFilterConfig() {
         ],
         category: [
             { name: "Manhwa", value: "manhwa" },
+            { name: "Manhua", value: "manhua" },
+            { name: "Manga", value: "manga" },
+            { name: "Webtoon", value: "webtoon" },
             { name: "Drama", value: "drama" },
             { name: "Romance", value: "romance" },
-            { name: "Action", value: "action" }
+            { name: "Action", value: "action" },
+            { name: "Comedy", value: "comedy" },
+            { name: "Fantasy", value: "fantasy" },
+            { name: "Supernatural", value: "supernatural" },
+            { name: "Harem", value: "harem" },
+            { name: "Ecchi", value: "ecchi" },
+            { name: "Historical", value: "historical" },
+            { name: "Horror", value: "horror" },
+            { name: "Shoujo", value: "shoujo" },
+            { name: "Sports", value: "sports" },
+            { name: "Vampire", value: "vampire" },
+            { name: "Doujinshi", value: "doujinshi" },
+            { name: "Oneshot", value: "oneshot" },
+            { name: "Adult", value: "adult" }
         ]
     });
 }
