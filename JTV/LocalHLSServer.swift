@@ -88,6 +88,7 @@ final class LocalHLSServer: @unchecked Sendable {
                 self.startWaiters = []
                 waiters.forEach { $0(nil) }
             }
+            }
         }
     }
 
