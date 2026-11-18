@@ -78,10 +78,9 @@
       "name": "SayHentai",
       "version": "3.0.0",
       "scriptUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/plugins/mod09.js",
-      "iconUrl": "https://sayhentai.sale/favicon.ico",
+      "iconUrl": "https://sayhentai.cx/favicon.ico",
       "adult": true,
-      "baseUrl": "https://sayhentai.sale"
-    },
+      "baseUrl": "https://sayhentai.cx",
     {
       "id": "misskon",
       "name": "MissKon",
