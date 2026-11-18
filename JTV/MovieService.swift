@@ -56,17 +56,17 @@ final class MovieService: ObservableObject {
     private let pageCacheTTL: TimeInterval = 60
 
     private func fetchPage(_ url: String) async throws -> String {
-        pageCacheLock.lock()
-        let hit = pageCache[url]
-        pageCacheLock.unlock()
+        // Swift 6: scoped withLock replaces lock()/unlock()
+        // pairs in async contexts (see Cache.swift note).
+        let hit = pageCacheLock.withLock { pageCache[url] }
         if let hit, Date().timeIntervalSince(hit.at) < pageCacheTTL {
             return hit.text
         }
         let text = try await Net.fetchText(url)
-        pageCacheLock.lock()
-        pageCache[url] = CachedPage(text: text, at: Date())
-        if pageCache.count > 200 { pageCache.removeAll() }
-        pageCacheLock.unlock()
+        pageCacheLock.withLock {
+            pageCache[url] = CachedPage(text: text, at: Date())
+            if pageCache.count > 200 { pageCache.removeAll() }
+        }
         return text
     }
 
@@ -244,9 +244,7 @@ final class MovieService: ObservableObject {
         Task {
             guard let resolution = try? await self.resolveEpisode(request),
                   case .embed = resolution else { return }
-            prefetchLock.lock()
-            prefetchedEmbeds[key] = (resolution, Date())
-            prefetchLock.unlock()
+            prefetchLock.withLock { prefetchedEmbeds[key] = (resolution, Date()) }
         }
     }
 
@@ -418,9 +416,7 @@ final class MovieService: ObservableObject {
         guard stream.url.lowercased().contains(".m3u8") else { return stream }
         let host = URL(string: stream.url)?.host ?? ""
         if !host.isEmpty {
-            Self.proxyVerdictLock.lock()
-            let cached = Self.proxyVerdicts[host]
-            Self.proxyVerdictLock.unlock()
+            let cached = Self.proxyVerdictLock.withLock { Self.proxyVerdicts[host] }
             if let cached {
                 guard cached else { return stream }
                 var marked = stream
@@ -431,9 +427,7 @@ final class MovieService: ObservableObject {
         guard let text = try? await Net.fetchText(stream.url, headers: stream.headers) else { return stream }
         let verdict = text.contains("__hls_proxy/")
         if !host.isEmpty {
-            Self.proxyVerdictLock.lock()
-            Self.proxyVerdicts[host] = verdict
-            Self.proxyVerdictLock.unlock()
+            Self.proxyVerdictLock.withLock { Self.proxyVerdicts[host] = verdict }
         }
         guard verdict else { return stream }
         var marked = stream

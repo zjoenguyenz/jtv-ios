@@ -386,14 +386,16 @@ final class ImageCacheManager: @unchecked Sendable {
         if let hit = cache.object(forKey: k as NSString) { return hit }
         guard let url = URL(string: urlString) else { return nil }
 
-        lock.lock()
-        if let existing = inFlight[k] {
-            lock.unlock()
+        // Swift 6: NSLock.lock()/unlock() are unavailable in
+        // async contexts; scoped withLock is the sanctioned
+        // form (these critical sections never spanned an
+        // await, so the conversion is semantics-preserving).
+        if let existing = lock.withLock({ inFlight[k] }) {
             return await existing.value
         }
         let task = Task<UIImage?, Never> {
             defer {
-                self.lock.lock(); self.inFlight[k] = nil; self.lock.unlock()
+                self.lock.withLock { self.inFlight[k] = nil }
             }
             // Disk tier first: decode + promote to memory.
             let disk = self.diskURL(for: k)
@@ -411,8 +413,7 @@ final class ImageCacheManager: @unchecked Sendable {
             self.cache.setObject(cappedImage, forKey: k as NSString, cost: self.decodedCost(cappedImage))
             return cappedImage
         }
-        inFlight[k] = task
-        lock.unlock()
+        lock.withLock { inFlight[k] = task }
         return await task.value
     }
 

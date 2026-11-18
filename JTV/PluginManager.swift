@@ -279,12 +279,11 @@ final class PluginManager: ObservableObject {
     // MARK: - Engines
 
     func engine(for pluginId: String) async -> PluginEngine? {
-        enginesLock.lock()
-        if let cached = engines[pluginId] {
-            enginesLock.unlock()
+        // Swift 6: scoped withLock replaces lock()/unlock()
+        // pairs in async contexts (see Cache.swift note).
+        if let cached = enginesLock.withLock({ engines[pluginId] }) {
             return cached
         }
-        enginesLock.unlock()
 
         let file = scriptFileURL(for: pluginId)
         guard let script = try? String(contentsOf: file, encoding: .utf8), !script.isEmpty else {
@@ -292,9 +291,7 @@ final class PluginManager: ObservableObject {
         }
         let engine = PluginEngine(pluginId: pluginId)
         await engine.load(script: script)
-        enginesLock.lock()
-        engines[pluginId] = engine
-        enginesLock.unlock()
+        enginesLock.withLock { engines[pluginId] = engine }
         return engine
     }
 

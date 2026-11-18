@@ -175,6 +175,13 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         private var stallTimer: Timer?
         private var stallTicks = 0
         private var sawProgress = false
+        // Stall-sensor baselines (Swift 6: these used to be
+        // vars captured by reference in the timer closure,
+        // which concurrently-executing code forbids; they now
+        // live on the controller beside stallTicks/sawProgress,
+        // reset by armStallTimer before each new timer).
+        private var lastStallTime = -1.0
+        private var lastBufferedEnd = -1.0
         var onGiveUp: ((String?) -> Void)?
         private var didMaterialize = false
 
@@ -342,8 +349,8 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
             stallTimer?.invalidate()
             stallTicks = 0
             sawProgress = false
-            var lastTime = -1.0
-            var lastBufferedEnd = -1.0
+            lastStallTime = -1.0
+            lastBufferedEnd = -1.0
             var timer: Timer?
             timer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self, weak item] _ in
                 guard let self, let item, self.player?.currentItem === item else {
@@ -356,9 +363,9 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
                 }
                 let now = self.player?.currentTime().seconds ?? 0
                 let bufferedEnd = item.loadedTimeRanges.last?.timeRangeValue.end.seconds ?? -1
-                if now > lastTime + 0.25 || bufferedEnd > lastBufferedEnd + 0.25 {
-                    lastTime = now
-                    lastBufferedEnd = bufferedEnd
+                if now > self.lastStallTime + 0.25 || bufferedEnd > self.lastBufferedEnd + 0.25 {
+                    self.lastStallTime = now
+                    self.lastBufferedEnd = bufferedEnd
                     self.stallTicks = 0
                     if now > 0.5 || bufferedEnd > 0 { self.sawProgress = true; self.hasPlayed = true }
                     return
@@ -1077,7 +1084,12 @@ final class PlayerLayerView: UIView {
 }
 
 extension PlayerSurfaceViewController: AVPictureInPictureControllerDelegate {
-    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void) {
+    // nonisolated: the witness touches no isolated state (it
+    // only confirms), which is what lets it satisfy the
+    // nonisolated AVKit requirement from a main-actor type
+    // under Swift 6 (migration guide, protocol-isolation
+    // mismatch ladder).
+    nonisolated func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void) {
         // The player UI never left the hierarchy — PiP floated
         // above it — so restoring is just confirming.
         completionHandler(true)

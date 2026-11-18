@@ -1,6 +1,11 @@
 import SwiftUI
 import UIKit
-import KSPlayer
+// @preconcurrency: KSPlayer 2.3.4 is a pre-Swift-6 module
+// with no concurrency annotations (e.g. the mutable
+// KSOptions.firstPlayerType static this file sets). The
+// attribute downgrades its diagnostics to warnings —
+// tracked debt, removable when KSPlayer ships annotations.
+@preconcurrency import KSPlayer
 import AVFoundation
 import MediaPlayer
 
