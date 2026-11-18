@@ -15,7 +15,11 @@ import Network
 /// the in-app replica of the proven shape. Only playlists are
 /// served (tiny); segments are fetched by AVPlayer directly
 /// from their public origin URLs, exactly as in Safari.
-final class LocalHLSServer {
+///
+/// @unchecked Sendable: all mutable state lives on the serial
+/// `queue` — the listener, its connections and every handler run
+/// there and nowhere else.
+final class LocalHLSServer: @unchecked Sendable {
     static let shared = LocalHLSServer()
 
     private let queue = DispatchQueue(label: "jtv.localhls.server")
@@ -26,13 +30,14 @@ final class LocalHLSServer {
     private var startWaiters: [(UInt16?) -> Void] = []
 
     /// Stores a playlist body and hands back its loopback URL,
-    /// starting the listener first if needed. Completion runs on
-    /// an arbitrary queue; nil means the server is unavailable
-    /// and the caller should use another rung of its ladder.
-    func register(_ data: Data, completion: @escaping (URL?) -> Void) {
-        start { [weak self] port in
-            guard let self, let port else { completion(nil); return }
-            self.queue.async {
+    /// starting the listener first if needed. Nil means the server
+    /// is unavailable and the caller should use another rung of
+    /// its ladder. (Async since the Swift 6 migration — the old
+    /// completion form could not cross queue boundaries cleanly.)
+    func register(_ data: Data) async -> URL? {
+        guard let port = await start() else { return nil }
+        return await withCheckedContinuation { (cont: CheckedContinuation<URL?, Never>) in
+            queue.async {
                 // Content-addressed name (FNV-1a over the
                 // bytes): re-registering the same playlist is a
                 // no-op, and different playlists never collide
@@ -41,16 +46,17 @@ final class LocalHLSServer {
                 for byte in data { hash = (hash ^ UInt64(byte)) &* 1099511628211 }
                 let name = "pl-\(hash).m3u8"
                 self.bodies[name] = data
-                completion(URL(string: "http://127.0.0.1:\(port)/\(name)"))
+                cont.resume(returning: URL(string: "http://127.0.0.1:\(port)/\(name)"))
             }
         }
     }
 
-    private func start(completion: @escaping (UInt16?) -> Void) {
-        queue.async {
-            if self.port != 0 { completion(self.port); return }
-            self.startWaiters.append(completion)
-            guard self.listener == nil else { return }
+    private func start() async -> UInt16? {
+        await withCheckedContinuation { (cont: CheckedContinuation<UInt16?, Never>) in
+            queue.async {
+                if self.port != 0 { cont.resume(returning: self.port); return }
+                self.startWaiters.append { port in cont.resume(returning: port) }
+                guard self.listener == nil else { return }
             do {
                 let listener = try NWListener(using: .tcp, on: .any)
                 self.listener = listener

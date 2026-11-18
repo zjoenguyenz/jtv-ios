@@ -19,8 +19,10 @@ enum PluginEngineError: Error, LocalizedError {
 
 /// Runs one plugin script inside a JSContext. JSContext is not
 /// thread-safe, so every call is serialized on a dedicated queue and
-/// exposed to Swift as async APIs.
-final class PluginEngine {
+/// exposed to Swift as async APIs. The queue is the synchronization:
+/// all mutable state (context, lastException) is touched only on it,
+/// which is what the @unchecked Sendable conformance records.
+final class PluginEngine: @unchecked Sendable {
     let pluginIdHint: String
     private let queue: DispatchQueue
     private var context: JSContext?
@@ -66,7 +68,7 @@ final class PluginEngine {
     // MARK: - Raw call helpers
 
     /// Runs `body` on the engine queue (context may be nil if not loaded).
-    private func run<T>(_ body: @escaping (JSContext?) -> T) async -> T {
+    private func run<T: Sendable>(_ body: @escaping @Sendable (JSContext?) -> T) async -> T {
         await withCheckedContinuation { (cont: CheckedContinuation<T, Never>) in
             queue.async { cont.resume(returning: body(self.context)) }
         }

@@ -217,6 +217,9 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
             let id = PlaylistSynthesizer.streamxxID(from: sourceURL)!
             Task { [weak self] in
                 let result = await PlaylistSynthesizer.synthesize(streamID: id)
+                let serverURL: URL? = if let result {
+                    await LocalHLSServer.shared.register(result.data)
+                } else { nil }
                 await MainActor.run {
                     guard let self else { return }
                     self.synthPending = false
@@ -225,20 +228,15 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
                         return
                     }
                     self.synthFileURL = result.fileURL
-                    LocalHLSServer.shared.register(result.data) { [weak self] url in
-                        DispatchQueue.main.async {
-                            guard let self else { return }
-                            // Never swap away from content that
-                            // is already playing.
-                            if (self.player?.currentTime().seconds ?? 0) > 0.5 { return }
-                            if let url {
-                                self.synthStage = 1
-                                self.swapItem(AVPlayerItem(url: url))
-                            } else {
-                                self.synthStage = 2
-                                self.swapItem(AVPlayerItem(url: result.fileURL))
-                            }
-                        }
+                    // Never swap away from content that
+                    // is already playing.
+                    if (self.player?.currentTime().seconds ?? 0) > 0.5 { return }
+                    if let serverURL {
+                        self.synthStage = 1
+                        self.swapItem(AVPlayerItem(url: serverURL))
+                    } else {
+                        self.synthStage = 2
+                        self.swapItem(AVPlayerItem(url: result.fileURL))
                     }
                 }
             }
@@ -267,6 +265,9 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
             let headers = sourceHeaders
             Task { [weak self] in
                 let prepared = await HLSProxyLoader.materializedPlaylist(url: sourceURL, headers: headers)
+                let serverURL: URL? = if let prepared {
+                    await LocalHLSServer.shared.register(prepared.data)
+                } else { nil }
                 await MainActor.run {
                     guard let self else { return }
                     self.ladderPending = false
@@ -278,17 +279,12 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
                         return
                     }
                     self.materializedFileURL = prepared.fileURL
-                    LocalHLSServer.shared.register(prepared.data) { [weak self] url in
-                        DispatchQueue.main.async {
-                            guard let self else { return }
-                            if let url {
-                                self.proxyStage = 1
-                                self.swapItem(AVPlayerItem(url: url))
-                            } else {
-                                self.proxyStage = 2
-                                self.swapItem(AVPlayerItem(url: prepared.fileURL))
-                            }
-                        }
+                    if let serverURL {
+                        self.proxyStage = 1
+                        self.swapItem(AVPlayerItem(url: serverURL))
+                    } else {
+                        self.proxyStage = 2
+                        self.swapItem(AVPlayerItem(url: prepared.fileURL))
                     }
                 }
             }

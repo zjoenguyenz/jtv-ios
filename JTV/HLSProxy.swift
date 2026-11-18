@@ -18,7 +18,11 @@ import AVFoundation
 /// It is used as a FALLBACK only: the player first tries the plain
 /// URL, and only a failed AVPlayerItem triggers the proxied retry —
 /// sources that already play natively are never touched.
-final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate {
+///
+/// @unchecked Sendable: every piece of mutable state below is
+/// guarded by `lock`; delegate callbacks arrive on the loader's own
+/// queue and never touch state outside the lock.
+final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sendable {
     static let scheme = "jtvhls"
 
     private let headers: [String: String]

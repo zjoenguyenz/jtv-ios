@@ -302,7 +302,7 @@ final class WebFetcher: NSObject, WKNavigationDelegate {
 
 // MARK: - Image cache
 
-final class ImageCacheManager {
+final class ImageCacheManager: @unchecked Sendable {
     static let shared = ImageCacheManager()
 
     private let cache = NSCache<NSString, UIImage>()

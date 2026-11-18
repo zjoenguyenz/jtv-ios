@@ -7,6 +7,8 @@ import AVFoundation
 /// (UIKit representables) open the lock on creation and restore it
 /// when SwiftUI dismantles them — the only lifecycle signals that
 /// cannot fire spuriously when a modal player takes the screen.
+/// MainActor-isolated (Swift 6): the lock is UI state.
+@MainActor
 final class AppDelegate: NSObject, UIApplicationDelegate {
     static var orientationLock: UIInterfaceOrientationMask = .portrait
 
@@ -16,6 +18,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     }
 }
 
+@MainActor
 enum OrientationHelper {
     private static var activeScene: UIWindowScene? {
         UIApplication.shared.connectedScenes

@@ -20,6 +20,10 @@ enum MovieServiceError: Error, LocalizedError {
 
 /// Loads catalog data through the plugin contract and resolves episode
 /// play targets into native streams, manga chapters or embed pages.
+/// MainActor-isolated (Swift 6): it is a UI-facing store; its caches
+/// were already lock-guarded, and its heavy work awaits out to
+/// non-isolated helpers (Net, PluginEngine, DebridResolver).
+@MainActor
 final class MovieService: ObservableObject {
     let manager: PluginManager
 
