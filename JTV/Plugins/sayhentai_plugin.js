@@ -1,19 +1,38 @@
 // =============================================================================
-// SayHentai plugin v2.0.1 — rewritten 2026-11-13 for the site's new home.
-// The operator abandoned the old Madara site at sayhentai.cx (now stuck
-// behind a hard Cloudflare wall) and moved to sayhentai.sale, a different
-// platform (Halim-style theme): list /danh-sach, detail /truyen/<slug>.html,
-// reader /doc-truyen/<slug>/chapter-<n>.html, images on image.shtcdn.top.
-// No Cloudflare challenge on .wiki (verified from VM + on-device Safari).
+// SayHentai plugin v3.0.0 — rewritten 2026-11-18 for sayhentai.cx's new
+// platform. History: the operator's old Madara site lived at .cx, was
+// abandoned for sayhentai.sale (v2.x of this plugin), but .sale serves
+// cut-down pages (~720px slices, promo banners bookending chapters).
+// The .cx domain is back on a different platform (Laravel-style) and
+// serves the full-quality version: chapter pages are intact long
+// strips (measured 720x~10,000) with no injected promos — the owner
+// confirmed .cx is the HD copy and ordered the move back.
+// Verified 2026-11-18 from the owner's own device browser:
+//   list    /  and /genre/<slug> and /completed, cards are anchors to
+//           /truyen-<slug>.html wrapping a cover <img> at
+//           /storage/images/cover/<file> (filenames may contain spaces
+//           and Vietnamese — percent-encoded below)
+//   paging  ?page=N (homepage shows 300 pages)
+//   detail  /truyen-<slug>.html, chapters at /truyen-<slug>/chuong-<n>
+//   reader  <img> tags (no wrapper class) on cdn.pubtranxzyzz.store,
+//           signed URLs (?token=...&expires=..., ~8 h life — the app
+//           fetches the chapter page fresh at open, so tokens are new)
+//   search  /search?s=<keyword>
+//   genres  /genre index; the comic page's own genre field can be
+//           empty, so detail returns no categories (the header nav
+//           would mislabel every comic with the same genres).
+// .cx sits behind a Cloudflare check for datacenter IPs; the owner's
+// device loads it directly, and the app's WebView fallback covers a
+// challenged fetch.
 // =============================================================================
 
 function getManifest() {
     return JSON.stringify({
         "id": "sayhentai",
         "name": "SayHentai",
-        "version": "2.0.2",
-        "baseUrl": "https://sayhentai.sale",
-        "iconUrl": "https://sayhentai.sale/favicon.ico",
+        "version": "3.0.0",
+        "baseUrl": "https://sayhentai.cx",
+        "iconUrl": "https://sayhentai.cx/favicon.ico",
         "isEnabled": true,
         "isAdult": true,
         "type": "MANGA",
@@ -28,31 +47,25 @@ function getHomeSections() {
 }
 
 function getPrimaryCategories() {
-    // 2.0.2: the full main-genre surface of the site (every slug
-    // verified present on sayhentai.sale, 2026-11-18) — before, only
-    // 6 chips were exposed and the genre list looked gutted.
+    // Every slug verified live on sayhentai.cx/genre, 2026-11-18.
     return JSON.stringify([
         { name: 'Mới Nhất', slug: '' },
-        { name: 'Manhwa', slug: 'the-loai/manhwa' },
-        { name: 'Manhua', slug: 'the-loai/manhua' },
-        { name: 'Manga', slug: 'the-loai/manga' },
-        { name: 'Webtoon', slug: 'the-loai/webtoon' },
-        { name: 'Drama', slug: 'the-loai/drama' },
-        { name: 'Romance', slug: 'the-loai/romance' },
-        { name: 'Action', slug: 'the-loai/action' },
-        { name: 'Comedy', slug: 'the-loai/comedy' },
-        { name: 'Fantasy', slug: 'the-loai/fantasy' },
-        { name: 'Supernatural', slug: 'the-loai/supernatural' },
-        { name: 'Harem', slug: 'the-loai/harem' },
-        { name: 'Ecchi', slug: 'the-loai/ecchi' },
-        { name: 'Historical', slug: 'the-loai/historical' },
-        { name: 'Horror', slug: 'the-loai/horror' },
-        { name: 'Shoujo', slug: 'the-loai/shoujo' },
-        { name: 'Sports', slug: 'the-loai/sports' },
-        { name: 'Vampire', slug: 'the-loai/vampire' },
-        { name: 'Doujinshi', slug: 'the-loai/doujinshi' },
-        { name: 'Oneshot', slug: 'the-loai/oneshot' },
-        { name: 'Adult', slug: 'the-loai/adult' }
+        { name: 'Truyện Full', slug: 'completed' },
+        { name: 'Manhwa', slug: 'genre/manhwa' },
+        { name: 'Manga', slug: 'genre/manga' },
+        { name: 'Doujinshi', slug: 'genre/doujinshi' },
+        { name: 'Oneshot', slug: 'genre/oneshot' },
+        { name: 'Adult', slug: 'genre/adult' },
+        { name: 'Ecchi', slug: 'genre/ecchi' },
+        { name: 'Harem', slug: 'genre/harem' },
+        { name: 'Milf', slug: 'genre/milf' },
+        { name: 'Drama', slug: 'genre/drama' },
+        { name: 'Romance', slug: 'genre/romance' },
+        { name: 'NTR', slug: 'genre/ntr' },
+        { name: 'Không Che', slug: 'genre/khong-che' },
+        { name: 'Ngực Lớn', slug: 'genre/nguc-lon' },
+        { name: 'Nữ Sinh', slug: 'genre/nu-sinh' },
+        { name: 'Housewife', slug: 'genre/housewife' }
     ]);
 }
 
@@ -63,25 +76,25 @@ function getFilterConfig() {
         ],
         category: [
             { name: "Manhwa", value: "manhwa" },
-            { name: "Manhua", value: "manhua" },
             { name: "Manga", value: "manga" },
-            { name: "Webtoon", value: "webtoon" },
-            { name: "Drama", value: "drama" },
-            { name: "Romance", value: "romance" },
-            { name: "Action", value: "action" },
-            { name: "Comedy", value: "comedy" },
-            { name: "Fantasy", value: "fantasy" },
-            { name: "Supernatural", value: "supernatural" },
-            { name: "Harem", value: "harem" },
-            { name: "Ecchi", value: "ecchi" },
-            { name: "Historical", value: "historical" },
-            { name: "Horror", value: "horror" },
-            { name: "Shoujo", value: "shoujo" },
-            { name: "Sports", value: "sports" },
-            { name: "Vampire", value: "vampire" },
             { name: "Doujinshi", value: "doujinshi" },
             { name: "Oneshot", value: "oneshot" },
-            { name: "Adult", value: "adult" }
+            { name: "Adult", value: "adult" },
+            { name: "Ecchi", value: "ecchi" },
+            { name: "Harem", value: "harem" },
+            { name: "Milf", value: "milf" },
+            { name: "Drama", value: "drama" },
+            { name: "Romance", value: "romance" },
+            { name: "NTR", value: "ntr" },
+            { name: "Không Che", value: "khong-che" },
+            { name: "Ngực Lớn", value: "nguc-lon" },
+            { name: "Nữ Sinh", value: "nu-sinh" },
+            { name: "Housewife", value: "housewife" },
+            { name: "Group", value: "group" },
+            { name: "Series", value: "series" },
+            { name: "Smut", value: "smut" },
+            { name: "Mind Break", value: "mind-break" },
+            { name: "18+", value: "18" }
         ]
     });
 }
@@ -90,25 +103,28 @@ function getFilterConfig() {
 // URL GENERATION
 // =============================================================================
 
-var BASE = "https://sayhentai.sale";
+var BASE = "https://sayhentai.cx";
 
 function getUrlList(slug, filtersJson) {
     var filters = JSON.parse(filtersJson || "{}");
     var page = filters.page || 1;
 
     if (filters.category) {
-        return BASE + "/the-loai/" + filters.category + "?page=" + page;
+        return BASE + "/genre/" + filters.category + "?page=" + page;
     }
-    if (slug && slug.indexOf('the-loai/') === 0) {
+    if (slug && slug.indexOf('genre/') === 0) {
         return BASE + "/" + slug + "?page=" + page;
     }
-    return BASE + "/danh-sach?page=" + page;
+    if (slug === 'completed') {
+        return BASE + "/completed?page=" + page;
+    }
+    return BASE + "/?page=" + page;
 }
 
 function getUrlSearch(keyword, filtersJson) {
     var filters = JSON.parse(filtersJson || "{}");
     var page = filters.page || 1;
-    var url = BASE + "/search?q=" + encodeURIComponent(keyword);
+    var url = BASE + "/search?s=" + encodeURIComponent(keyword);
     if (page > 1) url += "&page=" + page;
     return url;
 }
@@ -116,10 +132,10 @@ function getUrlSearch(keyword, filtersJson) {
 function getUrlDetail(slug) {
     if (!slug) return "";
     if (slug.indexOf("http") === 0) return slug;
-    return BASE + "/truyen/" + slug + ".html";
+    return BASE + "/truyen-" + slug + ".html";
 }
 
-function getUrlCategories() { return BASE + "/"; }
+function getUrlCategories() { return BASE + "/genre"; }
 function getUrlCountries() { return ""; }
 function getUrlYears() { return ""; }
 
@@ -139,6 +155,12 @@ var PluginUtils = {
             .replace(/&gt;/g, ">")
             .replace(/\s+/g, " ")
             .trim();
+    },
+    // Cover filenames on .cx can contain spaces and Vietnamese
+    // characters; a raw URL(string:) would reject those, so encode.
+    encodeUrl: function (url) {
+        if (!url) return "";
+        try { return encodeURI(url.replace(/&amp;/g, "&")); } catch (e) { return url; }
     }
 };
 
@@ -150,48 +172,45 @@ function parseListResponse(html) {
     var items = [];
     var foundSlugs = {};
 
-    // Cards are <article class="thumb ..."> blocks containing a halim-thumb
-    // anchor (href + title), a lazy cover (data-src) and an episode badge.
-    var chunks = html.split(/<article[^>]*class="[^"]*thumb[^"]*"[^>]*>/i);
-    for (var i = 1; i < chunks.length; i++) {
-        var chunk = chunks[i].substring(0, 4000);
+    // Cards: an anchor to /truyen-<slug>.html whose block carries the
+    // cover <img> (src, alt = title). The homepage repeats a comic
+    // across sections, so dedupe by slug.
+    var cardRegex = /<a[^>]+href="https:\/\/sayhentai\.cx\/truyen-([a-z0-9-]+)\.html"[^>]*>([\s\S]*?)<\/a>/gi;
+    var card;
+    while ((card = cardRegex.exec(html)) !== null) {
+        var slug = card[1];
+        if (foundSlugs[slug]) continue;
+        var block = card[2];
 
-        var linkMatch = chunk.match(/<a[^>]*class="halim-thumb"[^>]*href="https:\/\/sayhentai\.sale\/truyen\/([a-z0-9-]+?)(?:\.html)?"[^>]*title="([^"]*)"/i) ||
-            chunk.match(/<a[^>]*href="https:\/\/sayhentai\.sale\/truyen\/([a-z0-9-]+?)(?:\.html)?"[^>]*>/i);
-        if (!linkMatch) continue;
+        var imgMatch = block.match(/<img[^>]+src="([^"]+)"/i) ||
+            block.match(/<img[^>]+data-src="([^"]+)"/i);
+        var thumb = imgMatch ? PluginUtils.encodeUrl(imgMatch[1]) : "";
 
-        var slug = linkMatch[1];
-        var title = linkMatch[2] ? PluginUtils.cleanText(linkMatch[2]) : "";
-        if (!title) {
-            var h2 = chunk.match(/<h2[^>]*class="[^"]*entry-title[^"]*"[^>]*>([\s\S]*?)<\/h2>/i);
-            if (h2) title = PluginUtils.cleanText(h2[1]);
-        }
+        var title = "";
+        var altMatch = block.match(/<img[^>]+alt="([^"]*)"/i);
+        if (altMatch) title = PluginUtils.cleanText(altMatch[1]);
+        if (!title) title = PluginUtils.cleanText(block);
+        if (!title) title = slug;
 
-        var thumbMatch = chunk.match(/data-src="(https:\/\/image\.shtcdn\.top\/[^"]+)"/i) ||
-            chunk.match(/<img[^>]+src="(https:\/\/image\.shtcdn\.top\/[^"]+)"/i);
-        var thumb = thumbMatch ? thumbMatch[1] : "";
+        var epMatch = block.match(/Chapter\s+([\d.]+)/i);
+        var episode = epMatch ? ("Chapter " + epMatch[1]) : "";
 
-        var epMatch = chunk.match(/<span[^>]*class="episode"[^>]*>([\s\S]*?)<\/span>/i);
-        var episode = epMatch ? PluginUtils.cleanText(epMatch[1]) : "";
-
-        if (slug && !foundSlugs[slug]) {
-            items.push({
-                id: slug,
-                title: title || slug,
-                posterUrl: thumb,
-                backdropUrl: thumb,
-                description: "",
-                episode_current: episode,
-                quality: "HD",
-                lang: "Vietsub"
-            });
-            foundSlugs[slug] = true;
-        }
+        foundSlugs[slug] = true;
+        items.push({
+            id: slug,
+            title: title,
+            posterUrl: thumb,
+            backdropUrl: thumb,
+            description: "",
+            episode_current: episode,
+            quality: "HD",
+            lang: "Vietsub"
+        });
     }
 
-    // Pagination: <li class="active"><a href="#">2</a></li>; total from page= links.
+    // Pagination: total from the ?page= links (verified shape).
     var currentPage = 1;
-    var curMatch = html.match(/<li[^>]*class="active"[^>]*>\s*<a[^>]*>(\d+)<\/a>/i);
+    var curMatch = html.match(/class="[^"]*active[^"]*"[^>]*>\s*(?:<a[^>]*>)?\s*(\d+)/i);
     if (curMatch) currentPage = parseInt(curMatch[1]);
 
     var totalPages = currentPage;
@@ -222,72 +241,47 @@ function parseMovieDetail(html) {
         // Title
         var title = "";
         var ogTitle = html.match(/<meta property="og:title" content="([^"]+)"/i);
-        if (ogTitle) title = PluginUtils.cleanText(ogTitle[1]).replace(/\s*-\s*SayHentai\s*$/i, "").replace(/^Truyện\s+/i, "");
+        if (ogTitle) title = PluginUtils.cleanText(ogTitle[1]).replace(/\s*[|-]\s*SayHentai\s*$/i, "");
         if (!title) {
             var h1 = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
             if (h1) title = PluginUtils.cleanText(h1[1]);
         }
+        if (!title) {
+            var coverAlt = html.match(/<img[^>]+src="[^"]*\/storage\/images\/cover\/[^"]*"[^>]+alt="([^"]*)"/i);
+            if (coverAlt) title = PluginUtils.cleanText(coverAlt[1]);
+        }
 
-        // Poster
+        // Poster: og:image, else the page's own cover image.
         var poster = "";
         var ogImage = html.match(/<meta property="og:image" content="([^"]+)"/i);
         if (ogImage) poster = ogImage[1];
-
-        // Status: "Trạng Thái: </span><span...>Đã hoàn thành</span>"
-        var status = "Đang tiến hành";
-        var stIdx = html.indexOf("Trạng Thái:");
-        if (stIdx >= 0) {
-            var stText = PluginUtils.cleanText(html.substring(stIdx, stIdx + 260).replace(/^Trạng Thái:\s*/i, ""));
-            if (stText) status = stText.split("Lượt Xem")[0].trim() || status;
+        if (!poster) {
+            var cover = html.match(/<img[^>]+src="(https:\/\/sayhentai\.cx\/storage\/images\/cover\/[^"]+)"/i);
+            if (cover) poster = cover[1];
         }
+        poster = PluginUtils.encodeUrl(poster);
 
-        // Description: text block after the "Nội dung" heading
+        // Description: og:description is the only verified-safe source
+        // (the detail body markup was not exposed by the survey).
         var description = "";
-        var descIdx = html.indexOf("Nội dung");
-        if (descIdx >= 0) {
-            var raw = html.substring(descIdx, descIdx + 2600);
-            var text = PluginUtils.cleanText(raw).replace(/^Nội dung( Truyện)?\s*/i, "");
-            description = text.substring(0, 700);
-        }
+        var ogDesc = html.match(/<meta property="og:description" content="([^"]*)"/i);
+        if (ogDesc) description = PluginUtils.cleanText(ogDesc[1]).substring(0, 700);
 
-        // Chapters: <li class="chapter"><a href=".../doc-truyen/<slug>/<chap>.html" title="Chapter N">
+        // Chapters: anchors to /truyen-<slug>/chuong-<n> (verified).
         var chapters = [];
         var seenChap = {};
-        var chapRegex = /<li[^>]*class="chapter"[^>]*>\s*<a[^>]+href="(https:\/\/sayhentai\.sale\/doc-truyen\/[^"]+)"[^>]*>/gi;
+        var chapRegex = /<a[^>]+href="(https:\/\/sayhentai\.cx\/truyen-[a-z0-9-]+\/chuong-([\d.]+))"[^>]*>/gi;
         var cMatch;
         while ((cMatch = chapRegex.exec(html)) !== null) {
             if (!seenChap[cMatch[1]]) {
                 seenChap[cMatch[1]] = true;
-                chapters.push({ id: cMatch[1], url: cMatch[1] });
+                chapters.push({
+                    id: cMatch[1],
+                    name: "Chapter " + cMatch[2],
+                    slug: "chuong-" + cMatch[2],
+                    num: parseFloat(cMatch[2])
+                });
             }
-        }
-        // Fallback (e.g. oneshot pages without li.chapter): any reader links.
-        if (chapters.length === 0) {
-            var anyRegex = /<a[^>]+href="(https:\/\/sayhentai\.sale\/doc-truyen\/[^"]+)"[^>]*>/gi;
-            var aMatch;
-            while ((aMatch = anyRegex.exec(html)) !== null) {
-                if (!seenChap[aMatch[1]]) {
-                    seenChap[aMatch[1]] = true;
-                    chapters.push({ id: aMatch[1], url: aMatch[1] });
-                }
-            }
-        }
-        // Name + sort ascending by chapter number parsed from the URL tail.
-        for (var k = 0; k < chapters.length; k++) {
-            var tail = chapters[k].url.substring(chapters[k].url.lastIndexOf('/') + 1).replace(/\.html$/i, "");
-            var numMatch = tail.match(/chapter-([\d.]+)/i);
-            if (numMatch) {
-                chapters[k].num = parseFloat(numMatch[1]);
-                chapters[k].name = "Chapter " + numMatch[1];
-                // Variants like chapter-8-v2-chinh-thuc are distinct releases.
-                var rest = tail.substring(tail.toLowerCase().indexOf("chapter-" + numMatch[1]) + ("chapter-" + numMatch[1]).length).replace(/^-+/, "");
-                if (rest) chapters[k].name += " (" + rest.split("-")[0] + ")";
-            } else {
-                chapters[k].num = 0;
-                chapters[k].name = (tail.toLowerCase() === "oneshot") ? "Oneshot" : tail;
-            }
-            chapters[k].slug = tail;
-            delete chapters[k].url;
         }
         chapters.sort(function (a, b) { return a.num - b.num; });
         for (var j = 0; j < chapters.length; j++) delete chapters[j].num;
@@ -297,21 +291,6 @@ function parseMovieDetail(html) {
             episodes: chapters
         }];
 
-        // Categories: the manga's own genres are rel="category tag" anchors
-        // (the plain /the-loai/ link set elsewhere is the site-wide menu).
-        var categories = [];
-        var seenCat = {};
-        var catRegex = /<a[^>]+title="([^"]+)"[^>]*rel="category tag"[^>]*href="https:\/\/sayhentai\.sale\/the-loai\/([a-z0-9-]+)"/gi;
-        var cm;
-        while ((cm = catRegex.exec(html)) !== null) {
-            if (/^\d+$/.test(cm[2])) continue;
-            var cname = PluginUtils.cleanText(cm[1]);
-            if (cname && !seenCat[cname]) {
-                seenCat[cname] = true;
-                categories.push(cname);
-            }
-        }
-
         return JSON.stringify({
             id: "",
             title: title,
@@ -319,8 +298,8 @@ function parseMovieDetail(html) {
             backdropUrl: poster,
             description: description,
             servers: servers,
-            category: categories.join(", "),
-            status: status,
+            category: "",
+            status: "Đang tiến hành",
             quality: "HD",
             lang: "Vietsub"
         });
@@ -333,13 +312,17 @@ function parseMovieDetail(html) {
 function parseDetailResponse(html) {
     try {
         var images = [];
-        // Reader pages are <img class='simg' src='https://image.shtcdn.top/manga-images/...'>
-        var tagRegex = /<img[^>]*class=['"]simg['"][^>]*>/gi;
+        // Reader images are bare <img> tags on the signed CDN host
+        // (verified shape, incl. the token query — kept verbatim,
+        // only &amp; is unescaped back to &).
+        var tagRegex = /<img[^>]*>/gi;
         var tag;
         while ((tag = tagRegex.exec(html)) !== null) {
-            var srcMatch = tag[0].match(/src=['"]([^'"]+)['"]/i);
-            if (srcMatch && images.indexOf(srcMatch[1]) === -1) {
-                images.push(srcMatch[1].replace(/&amp;/g, "&"));
+            var srcMatch = tag[0].match(/src=["'](https:\/\/cdn\.pubtranxzyzz\.store\/[^"']+)["']/i) ||
+                tag[0].match(/data-src=["'](https:\/\/cdn\.pubtranxzyzz\.store\/[^"']+)["']/i);
+            if (srcMatch) {
+                var url = srcMatch[1].replace(/&amp;/g, "&");
+                if (images.indexOf(url) === -1) images.push(url);
             }
         }
 
@@ -347,7 +330,7 @@ function parseDetailResponse(html) {
             images: images,
             headers: {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Referer": "https://sayhentai.sale/"
+                "Referer": "https://sayhentai.cx/"
             }
         });
     } catch (e) {
@@ -358,14 +341,14 @@ function parseDetailResponse(html) {
 function parseCategoriesResponse(html) {
     var categories = [];
     var seen = {};
-    var catRegex = /<a[^>]+href="https:\/\/sayhentai\.sale\/the-loai\/([a-z0-9-]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+    var catRegex = /<a[^>]+href="https:\/\/sayhentai\.cx\/genre\/([a-z0-9-]+)"[^>]*>([\s\S]*?)<\/a>/gi;
     var m;
     while ((m = catRegex.exec(html)) !== null) {
-        if (/^\d+$/.test(m[1])) continue;
-        var name = PluginUtils.cleanText(m[2]).replace(/^-\s*/, "");
+        if (/^\d+$/.test(m[1]) && m[1] !== "18") continue;
+        var name = PluginUtils.cleanText(m[2]).replace(/\(\d[\d,.]*\)\s*$/, "").trim();
         if (name && !seen[m[1]]) {
             seen[m[1]] = true;
-            categories.push({ name: name, slug: "the-loai/" + m[1] });
+            categories.push({ name: name, slug: "genre/" + m[1] });
         }
     }
     return JSON.stringify(categories);
