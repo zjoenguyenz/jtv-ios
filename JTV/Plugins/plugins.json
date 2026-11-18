@@ -49,7 +49,7 @@
     {
       "id": "javhd",
       "name": "JavHD",
-      "version": "1.0.5",
+      "version": "1.0.6",
       "scriptUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/plugins/mod06.js",
       "iconUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/icons/mod06.ico",
       "adult": true,

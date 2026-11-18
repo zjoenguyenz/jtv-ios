@@ -6,7 +6,7 @@ function getManifest() {
     return JSON.stringify({
         "id": "javhd",
         "name": "JavHD",
-        "version": "1.0.5",
+        "version": "1.0.6",
         "baseUrl": "https://javhdz.today",
         "iconUrl": "https://javhdz.today/favicon.ico",
         "isEnabled": true,
@@ -28,7 +28,7 @@ function getPrimaryCategories() {
 
 function getHomeSections() {
     return JSON.stringify([
-        { slug: 'popular/today', title: 'Xem Nhiều Hôm Nay', type: 'Horizontal', path: '' },
+        { slug: 'popular/week', title: 'Xem Nhiều Tuần Này', type: 'Horizontal', path: '' },
         { slug: 'uncensored-jav', title: 'Jav Uncensored', type: 'Horizontal', path: '' },
         { slug: 'reducing-mosaic', title: 'Reducing Mosaic', type: 'Horizontal', path: '' },
         { slug: 'jav-sub', title: 'Jav Sub', type: 'Horizontal', path: '' },
@@ -40,7 +40,6 @@ function getFilterConfig() {
     return JSON.stringify({
         sort: [
             { name: 'Mới nhất', value: 'recent' },
-            { name: 'Xem nhiều hôm nay', value: 'popular/today' },
             { name: 'Xem nhiều trong tuần', value: 'popular/week' },
             { name: 'Xem nhiều trong tháng', value: 'popular/month' },
             { name: 'Xem nhiều tất cả', value: 'popular/year' },
