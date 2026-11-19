@@ -32,7 +32,7 @@ function getManifest() {
     return JSON.stringify({
         "id": "torrenthub",
         "name": "Torrent 18+",
-        "version": "1.0.4",
+        "version": "1.0.5",
         "baseUrl": "https://addon.debrid.in",
         "iconUrl": "",
         "isEnabled": true,
@@ -169,7 +169,7 @@ function thB64DecodeJson(str) {
 function thApibayQuery(title) {
     var t = String(title || "").replace(/\[[^\]]*\]/g, " ");
     var raw = t.split(/[^A-Za-z0-9]+/);
-    var stop = /^(2160p|1080p|720p|480p|360p|4k|uhd|xxx|mp4|mkv|avi|web|webrip|webdl|wrb|hdrip|bdrip|bluray|x264|x265|h264|h265|hevc|aac|mp3)$/i;
+    var stop = /^(2160p|1440p|1080p|720p|576p|480p|360p|4k|uhd|fhd|xxx|mp4|mkv|avi|web|webrip|webdl|wrb|hdrip|bdrip|bluray|x264|x265|h264|h265|hevc|aac|mp3)$/i;
     var keep = [];
     for (var i = 0; i < raw.length && keep.length < 3; i++) {
         var w = raw[i];
@@ -228,7 +228,9 @@ function thAddonItems(j) {
         // 1.0.4: the addon's upstream feeds carry junk entries whose
         // whole title is a number + a format token ("001 mp4") — they
         // crowded the 4K rails (3-5 per page). Drop exactly those.
+        // 1.0.5: a second junk shape seen on device — "self 23962 mkv".
         if (/^\s*\d{1,4}\s*(mp4|mkv|avi|wmv|xxx)?\s*$/i.test(m.name)) continue;
+        if (/^\s*self\s+(\d{4,}|\d+\s+(mp4|mkv|avi|wmv|mov|xxx))\s*$/i.test(m.name)) continue;
         var year = 0;
         var ym = String(m.releaseInfo || "").match(/(18|19|20)\d{2}/);
         if (ym) year = parseInt(ym[0]);
@@ -298,16 +300,42 @@ function thDetailStub(servers) {
 
 function thQualityRank(q) {
     if (q === '2160p' || q === '4K' || q === 'UHD') return 4;
+    if (q === '1440p') return 3.5;
     if (q === '1080p') return 3;
     if (q === '720p') return 2;
+    if (q === '576p') return 1.5;
     if (q === '480p') return 1;
+    if (q === '360p') return 0.5;
     return 0;
+}
+
+/// 1.0.5: quality detection beyond the four classic tokens. Real
+/// payloads carry 1440p releases (measured on apibay: a 1440p copy
+/// ranked 0 and sank below 480p despite its seeds), FHD tags,
+/// "1920x1080"-style dimensions and bare resolution numbers. Only
+/// unambiguous signals are read; a name with no resolution signal
+/// at all (e.g. a bare "BDRip") stays unknown — no rank is invented.
+function thDetectQuality(text) {
+    var m = text.match(/(2160p|1440p|1080p|720p|576p|480p|360p|4K|UHD)/i);
+    if (m) {
+        var u = m[1].toUpperCase();
+        if (u === '4K') return '4K';
+        if (u === 'UHD') return 'UHD';
+        return m[1].toLowerCase();
+    }
+    if (/\bFHD\b/i.test(text)) return '1080p';
+    if (/3840\s*[x×]\s*2160/.test(text)) return '2160p';
+    if (/2560\s*[x×]\s*1440/.test(text)) return '1440p';
+    if (/1920\s*[x×]\s*1080/.test(text)) return '1080p';
+    if (/1280\s*[x×]\s*720/.test(text)) return '720p';
+    var b = text.match(/\b(2160|1440|1080|720)\b/);
+    if (b) return b[1] + 'p';
+    return '';
 }
 
 function thStreamLabel(release, metaLine, nameField) {
     var text = (release || "") + " " + (nameField || "");
-    var qm = text.match(/(2160p|1080p|720p|480p|4K|UHD)/i);
-    var quality = qm ? qm[1] : "";
+    var quality = thDetectQuality(text);
     var cm = text.match(/\.(mkv|mp4|avi|m4v|ts|wmv)\b/i);
     var container = cm ? cm[1].toUpperCase() : "";
     var seeds = 0, size = "", sizeMB = 0;

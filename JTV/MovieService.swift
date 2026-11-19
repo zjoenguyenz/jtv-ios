@@ -498,8 +498,12 @@ enum MediaFusion {
             else if lowered.contains("real-debrid") || lowered.contains("realdebrid") || name.contains("RD") { provider = "RD" }
             else { provider = "MF" }
             let haystack = (name + " " + title + " " + filename).lowercased()
+            // v1.22.8: 1440p and FHD join the 1080 tier (the plugin
+            // ranks 1440p a half-step above 1080p; here the Int
+            // scale ties them and the seed count decides, which is
+            // the owner's stated tiebreak).
             let rank = (haystack.contains("2160") || haystack.contains("4k") || haystack.contains("uhd")) ? 4
-                : haystack.contains("1080") ? 3
+                : (haystack.contains("1440") || haystack.contains("1080") || haystack.contains("fhd")) ? 3
                 : haystack.contains("720") ? 2
                 : haystack.contains("480") ? 1 : 0
             let seeds = intAfter("👤", in: title)

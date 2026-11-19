@@ -182,6 +182,20 @@ final class WebFetcher: NSObject, WKNavigationDelegate {
     private final class Lane {
         var webView: WKWebView?
         var continuation: CheckedContinuation<String?, Never>?
+        var dataContinuation: CheckedContinuation<Data?, Never>?
+        /// How many extract loops are currently polling for the
+        /// lane's in-flight bytes load. One navigation can fire
+        /// several didFinish callbacks (challenge → redirect →
+        /// real document), each spawning a loop; only the LAST
+        /// loop out may deliver a nil verdict, so a slow loop
+        /// can't kill a load another loop is about to satisfy.
+        var extractorsRunning = 0
+        /// Monotonic tag of the lane's current bytes load. Loops
+        /// and timeouts act only for the generation that spawned
+        /// them, so a loop that outlives a timed-out load cannot
+        /// deliver a verdict into the NEXT load on the same lane.
+        var dataGeneration = 0
+        var extractorsGeneration = 0
         var timeoutTask: Task<Void, Never>?
         var busy = false
     }
@@ -190,6 +204,131 @@ final class WebFetcher: NSObject, WKNavigationDelegate {
 
     static func fetchHTML(url: URL) async -> String? {
         await shared.fetch(url: url)
+    }
+
+    /// One clearance task per HOST per session: a rail of twenty
+    /// covers behind the same wall shares a single WebView round,
+    /// and concurrent callers await the same task rather than
+    /// stampeding the lanes.
+    private var clearanceTasks: [String: Task<String?, Never>] = [:]
+
+    /// Clears a host's Cloudflare wall once per session by loading
+    /// its root in a WebView lane (which also harvests the
+    /// clearance cookies into the shared jar).
+    static func ensureClearance(for url: URL) async {
+        await shared.ensureClearance(url: url)
+    }
+
+    private func ensureClearance(url: URL) async {
+        guard let host = url.host, !host.isEmpty else { return }
+        if let existing = clearanceTasks[host] {
+            _ = await existing.value
+            return
+        }
+        var components = URLComponents()
+        components.scheme = url.scheme ?? "https"
+        components.host = host
+        components.path = "/"
+        guard let root = components.url else { return }
+        let task = Task { @MainActor in await self.fetch(url: root) }
+        clearanceTasks[host] = task
+        _ = await task.value
+    }
+
+    /// Last-resort image bytes: loads the image URL in a WebView
+    /// lane (passing any challenge on the way) and reads the image
+    /// back out of the rendered document. The caller's headers
+    /// (e.g. a Referer a CDN demands) ride along on the load.
+    static func fetchImageData(url: URL, headers: [String: String] = [:]) async -> Data? {
+        await shared.fetchBytes(url: url, headers: headers)
+    }
+
+    private func fetchBytes(url: URL, headers: [String: String]) async -> Data? {
+        while true {
+            if let lane = lanes.first(where: { !$0.busy }) {
+                lane.busy = true
+                let data = await loadBytes(url: url, lane: lane, headers: headers)
+                lane.busy = false
+                return data
+            }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+    }
+
+    private func loadBytes(url: URL, lane: Lane, headers: [String: String]) async -> Data? {
+        let wv = ensureWebView(lane: lane)
+        return await withCheckedContinuation { (cont: CheckedContinuation<Data?, Never>) in
+            lane.dataGeneration += 1
+            let generation = lane.dataGeneration
+            lane.dataContinuation = cont
+            lane.timeoutTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 40_000_000_000)
+                self.finishData(lane: lane, nil, generation: generation)
+            }
+            wv.stopLoading()
+            wv.load(Net.makeRequest(url: url, headers: headers))
+        }
+    }
+
+    private func finishData(lane: Lane, _ data: Data?, generation: Int? = nil) {
+        if let generation, generation != lane.dataGeneration { return }
+        lane.timeoutTask?.cancel()
+        lane.timeoutTask = nil
+        lane.dataContinuation?.resume(returning: data)
+        lane.dataContinuation = nil
+    }
+
+    /// Entry point for a bytes load's didFinish. Several extract
+    /// loops may poll for the same load (one per didFinish the
+    /// navigation produces); bytes from ANY loop win, and a nil
+    /// verdict is delivered only by the last loop out — the load's
+    /// own timeout remains the final backstop.
+    private func extractImageBytes(lane: Lane, webView: WKWebView, generation: Int) async {
+        if lane.extractorsGeneration != generation {
+            lane.extractorsGeneration = generation
+            lane.extractorsRunning = 0
+        }
+        lane.extractorsRunning += 1
+        let data = await pollForImageBytes(lane: lane, webView: webView, generation: generation)
+        guard lane.extractorsGeneration == generation else { return }
+        lane.extractorsRunning -= 1
+        if let data {
+            await self.harvestCookies(from: webView)
+            self.finishData(lane: lane, data, generation: generation)
+        } else if lane.extractorsRunning == 0 {
+            await self.harvestCookies(from: webView)
+            self.finishData(lane: lane, nil, generation: generation)
+        }
+    }
+
+    /// Polls the lane's document until it holds a loaded image
+    /// (a challenge page has none), then draws it to a canvas and
+    /// returns the PNG bytes. Same-origin image documents are not
+    /// canvas-tainted, so the pixels are readable.
+    private func pollForImageBytes(lane: Lane, webView: WKWebView, generation: Int) async -> Data? {
+        let script = """
+        (() => {
+          const img = document.images && document.images[0];
+          if (!img || !img.complete || img.naturalWidth === 0 || img.naturalHeight === 0) return '';
+          if (img.naturalHeight > 6000) return '';
+          const c = document.createElement('canvas');
+          c.width = img.naturalWidth; c.height = img.naturalHeight;
+          c.getContext('2d').drawImage(img, 0, 0);
+          return c.toDataURL('image/png');
+        })()
+        """
+        for attempt in 0..<8 {
+            try? await Task.sleep(nanoseconds: attempt == 0 ? 900_000_000 : 1_200_000_000)
+            if lane.dataContinuation == nil || lane.dataGeneration != generation { return nil }
+            let raw = try? await webView.evaluateJavaScript(script)
+            guard let dataURL = raw as? String, dataURL.hasPrefix("data:"),
+                  let comma = dataURL.firstIndex(of: ",") else { continue }
+            let b64 = String(dataURL[dataURL.index(after: comma)...])
+            if let data = Data(base64Encoded: b64), !data.isEmpty {
+                return data
+            }
+        }
+        return nil
     }
 
     private func fetch(url: URL) async -> String? {
@@ -260,6 +399,10 @@ final class WebFetcher: NSObject, WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard let lane = lane(for: webView) else { return }
         Task { @MainActor in
+            if lane.dataContinuation != nil {
+                await self.extractImageBytes(lane: lane, webView: webView, generation: lane.dataGeneration)
+                return
+            }
             // The challenge needs a beat to solve and redirect; poll
             // the DOM until it turns into the real page. A
             // cf_clearance cookie means the wall is already passed
@@ -292,11 +435,11 @@ final class WebFetcher: NSObject, WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        if let lane = lane(for: webView) { finish(lane: lane, nil) }
+        if let lane = lane(for: webView) { finish(lane: lane, nil); finishData(lane: lane, nil) }
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        if let lane = lane(for: webView) { finish(lane: lane, nil) }
+        if let lane = lane(for: webView) { finish(lane: lane, nil); finishData(lane: lane, nil) }
     }
 }
 
@@ -307,6 +450,9 @@ final class ImageCacheManager: @unchecked Sendable {
 
     private let cache = NSCache<NSString, UIImage>()
     private var inFlight: [String: Task<UIImage?, Never>] = [:]
+    /// Cache keys whose full WebView fallback ladder already
+    /// failed this session (see fetchBytesWithFallback).
+    private var fallbackFailed: Set<String> = []
     private let lock = NSLock()
     /// v1.22 disk tier (~300 MB, LRU by modification date): every
     /// cold launch used to re-download every poster — the memory
@@ -411,9 +557,7 @@ final class ImageCacheManager: @unchecked Sendable {
                     self.cache.setObject(cappedImage, forKey: k as NSString, cost: self.decodedCost(cappedImage))
                     return cappedImage
                 }
-                var req = Net.makeRequest(url: url, headers: headers)
-                req.timeoutInterval = 30
-                guard let (data, _) = try? await Net.session.data(for: req),
+                guard let data = await self.fetchBytesWithFallback(url: url, headers: headers, cacheKey: k),
                       let image = UIImage(data: data) else { return nil }
                 try? data.write(to: disk, options: .atomic)
                 let cappedImage = self.capped(image)
@@ -424,6 +568,43 @@ final class ImageCacheManager: @unchecked Sendable {
             return created
         }
         return await task.value
+    }
+
+    /// Direct fetch first — the overwhelming majority of hosts
+    /// answer it and nothing changes for them. Hosts behind a
+    /// Cloudflare wall refuse the plain request even though the
+    /// same app's TEXT fetches get through (they have a WebView
+    /// fallback; image loads never did — SayHentai covers sat
+    /// behind the wall while its lists loaded fine). Only a
+    /// wall-shaped failure (401/403/503 or a challenge body)
+    /// escalates: clear the host's wall once via the WebView,
+    /// retry direct (clearance cookies are in the shared jar by
+    /// then, and the user agent matches the WebView's), and as a
+    /// last resort pull the bytes out of the WebView itself.
+    /// Ordinary failures (404, dead host, timeout) fail exactly
+    /// as before and never touch the WebView lanes; a URL whose
+    /// whole ladder failed is remembered for the session so
+    /// re-scrolling a dead rail doesn't re-pay it.
+    private func fetchBytesWithFallback(url: URL, headers: [String: String], cacheKey: String) async -> Data? {
+        func direct() async -> (data: Data?, wall: Bool) {
+            var req = Net.makeRequest(url: url, headers: headers)
+            req.timeoutInterval = 30
+            guard let (data, response) = try? await Net.session.data(for: req) else { return (nil, false) }
+            if UIImage(data: data) != nil { return (data, false) }
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if status == 401 || status == 403 || status == 503 { return (nil, true) }
+            let text = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+            return (nil, Net.isCloudflareChallenge(text, status: status))
+        }
+        let first = await direct()
+        if let data = first.data { return data }
+        guard first.wall else { return nil }
+        if lock.withLock({ fallbackFailed.contains(cacheKey) }) { return nil }
+        await WebFetcher.ensureClearance(for: url)
+        if let data = (await direct()).data { return data }
+        if let data = await WebFetcher.fetchImageData(url: url, headers: headers) { return data }
+        lock.withLock { _ = fallbackFailed.insert(cacheKey) }
+        return nil
     }
 
     /// Warms memory/disk for images about to be scrolled into
