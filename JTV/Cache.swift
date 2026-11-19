@@ -503,11 +503,20 @@ final class ImageCacheManager: @unchecked Sendable {
 
     /// Caps pathological decodes (4K backdrops) at a 2048 px long
     /// edge; normal posters and manga pages pass through untouched.
+    /// A reading page or strip is NEVER capped: its short edge is
+    /// the reading width (a SayHentai strip runs ~720 x 10000), and
+    /// capping the long edge crushed one to ~147 px wide — the
+    /// owner-reported "very blurry" pages of 2026-11-18, which the
+    /// plugin's HD files never caused. Only an image large in BOTH
+    /// dimensions (a backdrop, a photo) is capped. The disk tier
+    /// stores the original bytes, so this fix also heals chapters
+    /// already cached on the device.
     private func capped(_ image: UIImage) -> UIImage {
         let pixelW = image.size.width * image.scale
         let pixelH = image.size.height * image.scale
         let longest = max(pixelW, pixelH)
         guard longest > 2048 else { return image }
+        guard min(pixelW, pixelH) > 1080 else { return image }
         let ratio = 2048 / longest
         let target = CGSize(width: pixelW * ratio, height: pixelH * ratio)
         let format = UIGraphicsImageRendererFormat()
