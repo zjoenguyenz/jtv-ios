@@ -30,7 +30,7 @@ function getManifest() {
     return JSON.stringify({
         "id": "sayhentai",
         "name": "SayHentai",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "baseUrl": "https://sayhentai.cx",
         "iconUrl": "https://sayhentai.cx/favicon.ico",
         "isEnabled": true,
@@ -41,7 +41,17 @@ function getManifest() {
 }
 
 function getHomeSections() {
+    // v3.1.0: a real catalogue like the movie plugins carry — genre
+    // rails (Horizontal) over the main grid. Every path below is a
+    // list shape verified on .cx (homepage / genre / completed all
+    // serve the same card anchors parseListResponse reads), and
+    // getUrlList already routes all three forms.
     return JSON.stringify([
+        { slug: 'genre/manhwa', title: 'Manhwa', type: 'Horizontal', path: '' },
+        { slug: 'genre/khong-che', title: 'Không Che', type: 'Horizontal', path: '' },
+        { slug: 'completed', title: 'Truyện Full', type: 'Horizontal', path: '' },
+        { slug: 'genre/doujinshi', title: 'Doujinshi', type: 'Horizontal', path: '' },
+        { slug: 'genre/oneshot', title: 'Oneshot', type: 'Horizontal', path: '' },
         { slug: '', title: 'Truyện Mới Cập Nhật', type: 'Grid', path: '' }
     ]);
 }
