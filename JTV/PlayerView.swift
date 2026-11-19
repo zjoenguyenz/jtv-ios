@@ -99,7 +99,9 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
 
         let interval = CMTime(seconds: 5, preferredTimescale: 1)
         context.coordinator.observer = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak coordinator = context.coordinator] _ in
-            coordinator?.reportProgress()
+            // queue: .main — the handler provably runs on the main
+            // actor, which is the coordinator's isolation domain.
+            MainActor.assumeIsolated { coordinator?.reportProgress() }
         }
         context.coordinator.startPosition = startPosition
 
@@ -143,6 +145,12 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         // player screen closed).
     }
 
+    /// Swift 6: this coordinator only ever runs on the main actor
+    /// (SwiftUI creates and calls it there; its sibling view
+    /// controller is @MainActor through UIViewController). Stating
+    /// that isolation is what lets its Tasks inherit the actor
+    /// instead of "sending" self across isolation domains.
+    @MainActor
     final class Coordinator {
         var player: AVPlayer?
         var observer: Any?
@@ -326,9 +334,10 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
             // is what ran dry and froze the picture.
             item.preferredForwardBufferDuration = patientMode ? 30 : 12
             statusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
-                if item.status == .failed {
-                    DispatchQueue.main.async { self?.handleFailure() }
-                }
+                // KVO fires on an arbitrary queue — hop onto the
+                // coordinator's actor instead of sending self.
+                guard let self, item.status == .failed else { return }
+                Task { @MainActor in self.handleFailure() }
             }
             armStallTimer(for: item)
         }
@@ -353,33 +362,38 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
             lastBufferedEnd = -1.0
             var timer: Timer?
             timer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self, weak item] _ in
-                guard let self, let item, self.player?.currentItem === item else {
-                    timer?.invalidate()
-                    return
-                }
-                if self.player?.timeControlStatus == .paused {
-                    self.stallTicks = 0
-                    return
-                }
-                let now = self.player?.currentTime().seconds ?? 0
-                let bufferedEnd = item.loadedTimeRanges.last?.timeRangeValue.end.seconds ?? -1
-                if now > self.lastStallTime + 0.25 || bufferedEnd > self.lastBufferedEnd + 0.25 {
-                    self.lastStallTime = now
-                    self.lastBufferedEnd = bufferedEnd
-                    self.stallTicks = 0
-                    if now > 0.5 || bufferedEnd > 0 { self.sawProgress = true; self.hasPlayed = true }
-                    return
-                }
-                self.stallTicks += 1
-                // v1.22.4: torrent files get doubled budgets
-                // (96 s / 48 s) — their CDN legitimately takes
-                // that long to answer a cold far-seek range.
-                let budget = self.patientMode
-                    ? (self.sawProgress ? 12 : 24)
-                    : (self.sawProgress ? 6 : 12)  // 4 s ticks: 24 s / 48 s
-                if self.stallTicks >= budget {
-                    timer?.invalidate()
-                    self.handleFailure()
+                // armStallTimer is only called from main-actor
+                // contexts, so the timer sits on the main runloop
+                // and this block provably fires on the main actor.
+                MainActor.assumeIsolated {
+                    guard let self, let item, self.player?.currentItem === item else {
+                        timer?.invalidate()
+                        return
+                    }
+                    if self.player?.timeControlStatus == .paused {
+                        self.stallTicks = 0
+                        return
+                    }
+                    let now = self.player?.currentTime().seconds ?? 0
+                    let bufferedEnd = item.loadedTimeRanges.last?.timeRangeValue.end.seconds ?? -1
+                    if now > self.lastStallTime + 0.25 || bufferedEnd > self.lastBufferedEnd + 0.25 {
+                        self.lastStallTime = now
+                        self.lastBufferedEnd = bufferedEnd
+                        self.stallTicks = 0
+                        if now > 0.5 || bufferedEnd > 0 { self.sawProgress = true; self.hasPlayed = true }
+                        return
+                    }
+                    self.stallTicks += 1
+                    // v1.22.4: torrent files get doubled budgets
+                    // (96 s / 48 s) — their CDN legitimately takes
+                    // that long to answer a cold far-seek range.
+                    let budget = self.patientMode
+                        ? (self.sawProgress ? 12 : 24)
+                        : (self.sawProgress ? 6 : 12)  // 4 s ticks: 24 s / 48 s
+                    if self.stallTicks >= budget {
+                        timer?.invalidate()
+                        self.handleFailure()
+                    }
                 }
             }
             stallTimer = timer
