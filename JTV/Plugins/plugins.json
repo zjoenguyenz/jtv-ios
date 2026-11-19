@@ -99,6 +99,15 @@
       "iconUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/icons/mod14.png",
       "adult": true,
       "baseUrl": "https://addon.debrid.in"
+    },
+    {
+      "id": "hentaihub",
+      "name": "Hentai Hub",
+      "version": "1.0.0",
+      "scriptUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/plugins/mod15.js",
+      "iconUrl": "https://hstream.moe/images/cropped-HS-1-270x270.webp",
+      "adult": true,
+      "baseUrl": "https://hstream.moe"
     }
   ]
 }
