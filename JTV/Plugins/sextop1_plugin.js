@@ -12,7 +12,7 @@ function getManifest() {
     return JSON.stringify({
         "id": "sextop1",
         "name": "Sextop1",
-        "version": "2.0.1",
+        "version": "2.0.3",
         "baseUrl": "https://sextop1.cash",
         "iconUrl": "https://sextop1.cash/favicon.ico",
         "isEnabled": true,

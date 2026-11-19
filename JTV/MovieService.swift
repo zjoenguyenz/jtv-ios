@@ -413,6 +413,31 @@ final class MovieService: ObservableObject {
             marked.requiresProxy = true
             return marked
         }
+        // streamxx delivery probe (2026-11-18): the operator's
+        // newer uploads are a progressive MP4 served AT the
+        // /main.m3u8 address (content-type video/mp4, range
+        // requests honored), with no HLS backup in the segment
+        // store. Synthesis declines those (segment 0 is a 404)
+        // and the HLS transports then stall ~30 s on a file that
+        // was never a playlist — the dead tap the owner reported.
+        // Pick the path by measurement instead: backup present →
+        // today's synthesis path, untouched (the proxy verdict
+        // below never affected streamxx playback — synthesis
+        // outranks the proxy ladder — and its full-body fetch is
+        // pure cost here, worst on the MP4 titles where it pulls
+        // the movie down as "text"); backup missing + the origin
+        // answers as a media file → the compat engine, which
+        // sniffs the real container. Any probe doubt → the
+        // stream passes through unchanged.
+        if let url = URL(string: stream.url), let id = PlaylistSynthesizer.streamxxID(from: url) {
+            if await PlaylistSynthesizer.backupExists(streamID: id) { return stream }
+            if await Self.originServesProgressiveFile(url, headers: stream.headers) {
+                var direct = stream
+                direct.useCompatEngine = true
+                return direct
+            }
+            return stream
+        }
         guard stream.url.lowercased().contains(".m3u8") else { return stream }
         let host = URL(string: stream.url)?.host ?? ""
         if !host.isEmpty {
@@ -433,6 +458,29 @@ final class MovieService: ObservableObject {
         var marked = stream
         marked.requiresProxy = true
         return marked
+    }
+
+    /// Range-probes a URL's first bytes: true when the origin
+    /// answers with a media file (MP4 family) rather than a
+    /// playlist. Only ever called on embed.streamxx.net URLs,
+    /// whose server honors Range (measured 206). Any doubt →
+    /// false, and today's path carries on unchanged.
+    private static func originServesProgressiveFile(_ url: URL, headers: [String: String]) async -> Bool {
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 10
+        for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
+        // Set AFTER the caller's headers: a stray Range in them
+        // must not widen the probe (gate MINOR, 2026-11-18).
+        req.setValue("bytes=0-15", forHTTPHeaderField: "Range")
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return false }
+        if let mime = http.mimeType, mime.hasPrefix("video/") { return true }
+        // ftyp box at bytes 4-7 (isom / mp42 / avc1 …): a media
+        // file whatever the label says. A playlist starts '#'.
+        guard data.count >= 8 else { return false }
+        let head = [UInt8](data.prefix(16))
+        if head[0] == 0x23 { return false }
+        return head[4] == 0x66 && head[5] == 0x74 && head[6] == 0x79 && head[7] == 0x70
     }
 
     /// Resolves one manga chapter (used by the reader's prev/next).

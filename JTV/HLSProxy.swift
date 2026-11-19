@@ -468,6 +468,22 @@ enum PlaylistSynthesizer {
         String(format: "playlist%05d.ts", idx)
     }
 
+    /// Whether the segment store holds this stream's HLS backup
+    /// at all (segment 0 answers 200). The operator's newer
+    /// uploads have NO backup — measured 2026-11-18: a 2026
+    /// title's segment 0 is a 404 while a 2025 title's segments
+    /// answer 200. The resolver probes this to pick the delivery
+    /// path before the player commits to synthesis.
+    static func backupExists(streamID: String) async -> Bool {
+        guard let url = URL(string: "https://f005.backblazeb2.com/file/central-repository/hls-backups/\(streamID)/\(segmentName(0))") else { return false }
+        var req = URLRequest(url: url)
+        req.httpMethod = "HEAD"
+        req.timeoutInterval = 10
+        guard let (_, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse else { return false }
+        return http.statusCode == 200
+    }
+
     static func synthesize(streamID: String) async -> (data: Data, fileURL: URL)? {
         let base = "https://f005.backblazeb2.com/file/central-repository/hls-backups/\(streamID)"
         let session = URLSession.shared

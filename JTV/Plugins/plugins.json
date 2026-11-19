@@ -31,7 +31,7 @@
     {
       "id": "sextop1",
       "name": "Sextop1",
-      "version": "2.0.2",
+      "version": "2.0.3",
       "scriptUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/plugins/mod04.js",
       "iconUrl": "https://sextop1.cash/favicon.ico",
       "adult": true,
