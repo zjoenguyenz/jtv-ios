@@ -595,8 +595,23 @@ final class ImageCacheManager: @unchecked Sendable {
     /// whole ladder failed is remembered for the session so
     /// re-scrolling a dead rail doesn't re-pay it.
     private func fetchBytesWithFallback(url: URL, headers: [String: String], cacheKey: String) async -> Data? {
+        // Some hosts (sayhentai.cx's /storage/ covers, measured
+        // 2026-11-18) refuse image requests that arrive with no
+        // Referer at all — Cloudflare serves its hard block page
+        // even to Safari on a direct image navigation, while the
+        // same image loads fine inside the site's own pages. A
+        // browser loading an image embedded in a page sends that
+        // page as the Referer; with no caller-supplied Referer,
+        // send the image host's own root — the closest equivalent
+        // (the site's pages are the only referrers these images
+        // ever legitimately have). Callers that pass an explicit
+        // Referer (the manga reader) keep theirs.
+        var hdrs = headers
+        if !hdrs.keys.contains(where: { $0.lowercased() == "referer" }), let host = url.host, !host.isEmpty {
+            hdrs["Referer"] = "\(url.scheme ?? "https")://\(host)/"
+        }
         func direct() async -> (data: Data?, wall: Bool) {
-            var req = Net.makeRequest(url: url, headers: headers)
+            var req = Net.makeRequest(url: url, headers: hdrs)
             req.timeoutInterval = 30
             guard let (data, response) = try? await Net.session.data(for: req) else { return (nil, false) }
             if UIImage(data: data) != nil { return (data, false) }
@@ -611,7 +626,7 @@ final class ImageCacheManager: @unchecked Sendable {
         if lock.withLock({ fallbackFailed.contains(cacheKey) }) { return nil }
         await WebFetcher.ensureClearance(for: url)
         if let data = (await direct()).data { return data }
-        if let data = await WebFetcher.fetchImageData(url: url, headers: headers) { return data }
+        if let data = await WebFetcher.fetchImageData(url: url, headers: hdrs) { return data }
         lock.withLock { _ = fallbackFailed.insert(cacheKey) }
         return nil
     }
