@@ -32,7 +32,7 @@ function getManifest() {
     return JSON.stringify({
         "id": "torrenthub",
         "name": "Torrent 18+",
-        "version": "1.0.6",
+        "version": "1.0.7",
         "baseUrl": "https://addon.debrid.in",
         "iconUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/icons/mod14.png",
         "isEnabled": true,
@@ -268,7 +268,13 @@ function parseListResponse(text) {
     var j;
     try { j = JSON.parse(text); } catch (e) { return JSON.stringify({ items: [], pagination: { currentPage: 1, totalPages: 1 } }); }
     var items = thAddonItems(j);
-    var totalPages = items.length >= 20 ? LAST_PAGE + 1 : LAST_PAGE;
+    // 1.0.7: the has-next-page signal must come from the RAW page size.
+    // thAddonItems drops junk titles, so deciding on the filtered count
+    // collapsed totalPages to the current page whenever a full raw page
+    // lost even one title to the filter (xxx_top p1 keeps 17 of 20) and
+    // the app stopped loading further pages entirely.
+    var rawCount = (j && j.metas) ? j.metas.length : 0;
+    var totalPages = rawCount >= 20 ? LAST_PAGE + 1 : LAST_PAGE;
     return JSON.stringify({ items: items, pagination: { currentPage: LAST_PAGE, totalPages: totalPages } });
 }
 
