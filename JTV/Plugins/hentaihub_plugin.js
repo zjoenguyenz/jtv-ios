@@ -1,5 +1,5 @@
 // =============================================================================
-// Hentai Hub plugin v1.0.1 — ONE combined plugin, THREE source adapters.
+// Hentai Hub plugin v1.0.2 — ONE combined plugin, THREE source adapters.
 // Built 2026-11-18 from the measured source hunt (HENTAI-SOURCE-HUNT.md).
 // The owner ordered every quality hentai source that verifies folded
 // into a single plugin; catalogues stay per-source (labelled rails,
@@ -84,7 +84,7 @@ function getManifest() {
     return JSON.stringify({
         "id": "hentaihub",
         "name": "Hentai Hub",
-        "version": "1.0.1",
+        "version": "1.0.2",
         "baseUrl": "https://hstream.moe",
         "iconUrl": "https://hstream.moe/images/cropped-HS-1-270x270.webp",
         "isEnabled": true,
@@ -1151,6 +1151,18 @@ function hhResolveStep(html, url) {
             }
             var gv = null;
             try { gv = JSON.parse(html); } catch (e) { gv = null; }
+            if (!gv) {
+                // The same WebView diversion (see the player
+                // step) wraps a JSON body in a <pre> document
+                // with its text entity-escaped; unwrap + decode
+                // and retry so the serialized body parses like
+                // the raw one. No-op on raw JSON (the first
+                // parse above already succeeded).
+                var preM = html.match(/<pre[^>]*>([\s\S]*?)<\/pre>/i);
+                if (preM) {
+                    try { gv = JSON.parse(PluginUtils.decodeEntities(preM[1]).trim()); } catch (e2) { gv = null; }
+                }
+            }
             if (gv && typeof gv.url === "string" && gv.url.indexOf("http") === 0) {
                 var subs = [];
                 if (_hhPow && _hhPow.srt) subs.push({ lang: "en", url: _hhPow.srt, label: "English" });
@@ -1202,11 +1214,18 @@ function hhResolveStep(html, url) {
                 return { url: u, isEmbed: true, headers: { "Referer": HH + "/" } };
             }
             var pv = html.match(/_pV=\{vid:"([^"]+)",ct:"([^"]+)",pid:"([^"]+)",st:"([^"]+)"\}/);
-            var coreM = html.match(/(player-core-v2\.php\?t=[^"&]+&_=\d+)/);
+            // The separator may arrive entity-escaped (&amp;)
+            // when this hop was served through the app's WebView
+            // fetcher (its Cloudflare detour returns DOM-
+            // serialized HTML, where & in an attribute value is
+            // written &amp;). Accept both forms and normalize
+            // the extracted hop URL back to the raw one; on a
+            // raw page the pattern matches exactly as before.
+            var coreM = html.match(/(player-core-v2\.php\?t=[^"&]+&(?:amp;)?_=\d+)/);
             if (pv && coreM) {
                 var parts = hhExtractParts(html, pv[3].split("_")[0]);
                 if (parts) {
-                    var coreUrl = "https://nhplayer.com/" + coreM[1];
+                    var coreUrl = "https://nhplayer.com/" + coreM[1].replace("&amp;", "&");
                     var saw = false, keepSrt = "", matchedEmbedUrl = "";
                     if (_hhPow) {
                         if (_hhPow.stage === "player" || _hhPow.playerUrl === u) saw = !!_hhPow.sawWatch;
