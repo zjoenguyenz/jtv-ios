@@ -1385,6 +1385,12 @@ private struct EmbedWebView: UIViewControllerRepresentable {
         webView.customUserAgent = Net.desktopUA
         webView.backgroundColor = .black
         webView.isOpaque = false
+        // Navigation logging (v1.22.12) is installed in BOTH
+        // configurations — sniffing and non-sniffing alike —
+        // so it sits outside the sniffMedia block above: the
+        // coordinator doubles as the navigation delegate purely
+        // to leave a DiagLog trace of what the embed page did.
+        webView.navigationDelegate = context.coordinator
 
         var request = URLRequest(url: url)
         for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }
@@ -1409,7 +1415,7 @@ private struct EmbedWebView: UIViewControllerRepresentable {
         // resolver owns the restore for the whole screen.
     }
 
-    final class Coordinator: NSObject, WKScriptMessageHandler {
+    final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         private let onCapture: (String) -> Void
         /// Whether this embed installed the sniffer at all —
         /// dismantle reads it to remove only what was installed.
@@ -1427,6 +1433,40 @@ private struct EmbedWebView: UIViewControllerRepresentable {
                   !captured, MediaURL.isDirectMedia(urlString) else { return }
             captured = true
             onCapture(urlString)
+        }
+
+        // MARK: Navigation logging (v1.22.12)
+        //
+        // The embed phase used to be a black box in the
+        // diagnostic log: a page that never finished loading —
+        // or failed outright — left no trace (1.22.11 review,
+        // round-2 MINOR). These three callbacks only log; they
+        // change no loading behaviour. URLs go through
+        // DiagLog.urlForLog (scheme + host + path, query and
+        // fragment stripped), so no embed token can reach the
+        // log. The error code rides along because it is the one
+        // detail that separates a dead host (-1009/-1003) from
+        // a TLS failure (-1200) at a glance.
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            guard let url = webView.url else { return }
+            DiagLog.log("embed", "didFinish \(DiagLog.urlForLog(url.absoluteString))")
+        }
+
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            logNavigationFailure("didFailProvisional", webView: webView, error: error)
+        }
+
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            logNavigationFailure("didFail", webView: webView, error: error)
+        }
+
+        private func logNavigationFailure(_ event: String, webView: WKWebView, error: Error) {
+            let nsError = error as NSError
+            let failing = nsError.userInfo[NSURLErrorFailingURLStringErrorKey] as? String
+                ?? webView.url?.absoluteString
+                ?? ""
+            DiagLog.log("embed", "\(event) \(DiagLog.urlForLog(failing)) code=\(nsError.code)")
         }
     }
 }

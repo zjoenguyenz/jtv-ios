@@ -82,6 +82,23 @@ enum Net {
                         triedWebView = true
                         if let html = await WebFetcher.fetchHTML(url: url),
                            !html.isEmpty, !isChallengeHTML(html) {
+                            // v1.22.12: the WebView pass harvests
+                            // any clearance cookie into the shared
+                            // jar (WebFetcher.harvestCookies), so ONE
+                            // plain retry now has a real chance of
+                            // returning the RAW body — prefer it when
+                            // it does. The WebView body is a DOM
+                            // serialization (& → &amp; in attribute
+                            // values), which has broken downstream
+                            // parsers that match on raw markup
+                            // (nhplayer's core-script URL — the
+                            // hentaihub device fallback). The
+                            // WebView body remains the fallback.
+                            if let raw = await cfPlainRetry(url: url, headers: headers) {
+                                DiagLog.log("net", "cf-detour host=\(url.host ?? "?") result=raw-retry")
+                                return raw
+                            }
+                            DiagLog.log("net", "cf-detour host=\(url.host ?? "?") result=webview")
                             return html
                         }
                     }
@@ -101,6 +118,26 @@ enum Net {
             }
         }
         throw lastError
+    }
+
+    /// The ONE plain retry fetchText is allowed after a WebView
+    /// Cloudflare pass (v1.22.12): same request shape as a normal
+    /// attempt, no retries of its own, and it never throws — any
+    /// failure (transport, non-2xx, or a body that is still a
+    /// challenge) returns nil and the caller keeps the WebView
+    /// body. Cancellation is not propagated from here on purpose:
+    /// the WebView detour it follows is not cancellation-aware
+    /// either (fetchHTML completes regardless), so the detour's
+    /// semantics stay uniform.
+    private static func cfPlainRetry(url: URL, headers: [String: String]) async -> String? {
+        var req = makeRequest(url: url, headers: headers)
+        req.timeoutInterval = 12
+        guard let (data, response) = try? await session.data(for: req) else { return nil }
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 200
+        guard (200...299).contains(status) else { return nil }
+        let text = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+        guard !isCloudflareChallenge(text, status: status), !isChallengeHTML(text) else { return nil }
+        return text
     }
 
     /// POST variant for plugin hop configs that carry a postBody

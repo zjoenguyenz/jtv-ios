@@ -7,7 +7,6 @@ struct SettingsView: View {
     @State private var newSourceURL = ""
     @State private var showAdultConfirm = false
     @State private var addError: String?
-    @State private var showingLogShare = false
     @State private var logFileURL: URL?
     @State private var showLogExportError = false
 
@@ -44,11 +43,6 @@ struct SettingsView: View {
             }
             .navigationTitle("Cài đặt")
             .navigationBarTitleDisplayMode(.large)
-            .sheet(isPresented: $showingLogShare) {
-                if let logFileURL {
-                    LogShareSheet(url: logFileURL)
-                }
-            }
             .alert("Bật nội dung 18+?", isPresented: $showAdultConfirm) {
                 Button("Huỷ", role: .cancel) {}
                 Button("Bật") { plugins.adultEnabled = true }
@@ -58,6 +52,12 @@ struct SettingsView: View {
             .alert("Không ghi được file log. Thử lại sau.", isPresented: $showLogExportError) {
                 Button("Đóng", role: .cancel) {}
             }
+        }
+        .onAppear {
+            // A fresh export is written per Settings visit (see
+            // diagnosticsSection): never offer a stale log file
+            // left over from a previous visit.
+            logFileURL = nil
         }
     }
 
@@ -257,26 +257,44 @@ struct SettingsView: View {
     /// see DiagLog's redaction rule.
     private var diagnosticsSection: some View {
         Section {
-            Button {
-                // Logged BEFORE the export is generated, so the
-                // export itself records that it was requested.
-                DiagLog.log("settings", "log export requested")
-                let url = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("jtv-log.txt")
-                do {
-                    try DiagLog.exportText().write(to: url, atomically: true, encoding: .utf8)
-                    logFileURL = url
-                    showingLogShare = true
-                } catch {
-                    DiagLog.log("settings", "log export write failed: \(error.localizedDescription)")
-                    // Never fail silently: the owner asked for
-                    // the log precisely because something is
-                    // already wrong — a dead button here would
-                    // look like the app ignoring him.
-                    showLogExportError = true
+            // Two-step share (v1.22.12, L-11): the first tap
+            // writes the export file; the row then becomes a
+            // ShareLink to that file and the second tap opens
+            // the system share sheet. The previous mechanism —
+            // a UIActivityViewController wrapped in a SwiftUI
+            // .sheet via a representable — presented as a black,
+            // empty sheet on the owner's iPhone (iOS 27.2), so
+            // the log could not be sent at all. ShareLink is
+            // SwiftUI's own share presentation: no representable,
+            // no sheet wrapping. logFileURL resets whenever
+            // Settings appears (see body), so the file offered
+            // is always written in this visit, never a stale
+            // export from an earlier one.
+            if let logFileURL {
+                ShareLink(item: logFileURL) {
+                    Label("Log đã sẵn sàng — chạm để gửi", systemImage: "checkmark.circle")
                 }
-            } label: {
-                Label("Gửi log chẩn đoán", systemImage: "doc.text.magnifyingglass")
+            } else {
+                Button {
+                    // Logged BEFORE the export is generated, so the
+                    // export itself records that it was requested.
+                    DiagLog.log("settings", "log export requested")
+                    let url = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("jtv-log.txt")
+                    do {
+                        try DiagLog.exportText().write(to: url, atomically: true, encoding: .utf8)
+                        logFileURL = url
+                    } catch {
+                        DiagLog.log("settings", "log export write failed: \(error.localizedDescription)")
+                        // Never fail silently: the owner asked for
+                        // the log precisely because something is
+                        // already wrong — a dead button here would
+                        // look like the app ignoring him.
+                        showLogExportError = true
+                    }
+                } label: {
+                    Label("Gửi log chẩn đoán", systemImage: "doc.text.magnifyingglass")
+                }
             }
         } header: {
             Text("Chẩn đoán")
@@ -348,38 +366,5 @@ struct SettingsView: View {
             Text("Giới thiệu")
         }
         .listRowBackground(Theme.glassFill)
-    }
-}
-
-/// Share sheet for the exported log file — the codebase's
-/// established UIViewControllerRepresentable pattern (the same
-/// shape as the player surfaces).
-private struct LogShareSheet: UIViewControllerRepresentable {
-    let url: URL
-
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        let controller = UIActivityViewController(activityItems: [url], applicationActivities: nil)
-        anchorPopover(controller)
-        return controller
-    }
-
-    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {
-        anchorPopover(uiViewController)
-    }
-
-    /// On iPad the activity controller presents as a popover,
-    /// which crashes without an anchor — the same reason the
-    /// player's action sheets set a sourceView/sourceRect
-    /// (PlayerView's showSourceList). A SwiftUI sheet has no
-    /// UIKit button to anchor to, so the controller's own view
-    /// is the anchor; called again from update, once the view
-    /// has real bounds.
-    private func anchorPopover(_ controller: UIActivityViewController) {
-        guard let pop = controller.popoverPresentationController else { return }
-        pop.sourceView = controller.view
-        pop.sourceRect = CGRect(x: controller.view.bounds.midX,
-                                y: controller.view.bounds.midY,
-                                width: 0, height: 0)
-        pop.permittedArrowDirections = []
     }
 }
