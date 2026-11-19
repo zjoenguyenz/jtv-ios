@@ -1,5 +1,5 @@
 // =============================================================================
-// Hentai Hub plugin v1.0.0 — ONE combined plugin, THREE source adapters.
+// Hentai Hub plugin v1.0.1 — ONE combined plugin, THREE source adapters.
 // Built 2026-11-18 from the measured source hunt (HENTAI-SOURCE-HUNT.md).
 // The owner ordered every quality hentai source that verifies folded
 // into a single plugin; catalogues stay per-source (labelled rails,
@@ -45,13 +45,29 @@
 //         the keyword, so hh is honestly OMITTED from search v1.
 //         Watch /watch/<series>-episode-<n>/ -> iframe
 //         nhplayer.com/v/<id>/ -> server <li data-id="/player.php?
-//         vid=<b64>&s=<b64>&i=<b64>&type=">. v1 hands the player.php
-//         URL to the app's sniffing WebView player (isEmbed), whose
-//         real page runs its own proof-of-work and plays.
-//         *** v2 hardening task: implement the PoW in-plugin (fetch
-//         player.php + player-core-v2.php, harvest the five DOM
-//         challenge parts, SHA-256 PoW, GET /get-video-url-v2.php)
-//         to resolve the direct MP4 natively. ***
+//         vid=<b64>&s=<b64>&i=<b64>&type=">. v1.0.0 handed the
+//         player.php URL to the app's sniffing WebView player,
+//         whose real page runs its own proof-of-work — and serves
+//         a ~10 s pre-roll ad first (owner's device report,
+//         2026-11-19). v1.0.1 implements the player's proof-of-work
+//         IN-PLUGIN (measured end-to-end from the VM): the player
+//         page carries _pV{vid,ct,pid,st} plus five challenge
+//         parts hidden in a decoy-guarded DOM block (the real
+//         block is the one whose ts equals the pid prefix);
+//         player-core-v2.php carries the per-request sc/rid
+//         tokens; the PoW is SHA-256(challenge + nonceHex) with
+//         first byte 0 (expected ~256 tries, pure-JS SHA-256
+//         below); GET /get-video-url-v2.php with a clean-browser
+//         fingerprint payload returns {"url": signed MP4 on
+//         r2.1hanime.com}; the data-id s param base64-decodes to
+//         the English SRT. The resolver hop budget (initial fetch
+//         + 4 parses) only fits the full PoW chain when the
+//         resolve STARTS at the embed page, so parseHhDetail
+//         makes the opened episode's play target the embed URL
+//         (its iframe is in the detail page); sibling episodes
+//         keep watch-page targets and degrade to the v1.0.0
+//         WebView hand-off, as does ANY PoW failure — never
+//         worse than v1.0.0.
 //   hanime.tv is EXCLUDED from v1 by the hunt's verdict: playback is
 //   gated (WASM-signed handshake for <=720p, premium login for 1080p).
 //
@@ -68,7 +84,7 @@ function getManifest() {
     return JSON.stringify({
         "id": "hentaihub",
         "name": "Hentai Hub",
-        "version": "1.0.0",
+        "version": "1.0.1",
         "baseUrl": "https://hstream.moe",
         "iconUrl": "https://hstream.moe/images/cropped-HS-1-270x270.webp",
         "isEnabled": true,
@@ -80,12 +96,25 @@ function getManifest() {
 
 function getHomeSections() {
     // One labelled rail per source, plus one big-genre rail each.
+    // v1.0.1 (owner request): a few extra genre rails WITH posters
+    // for browsing, appended after the original five. Only the two
+    // poster-ful sources get genre rails — haho's list pages serve
+    // no poster data at all (see the haho poster investigation in
+    // the build report), so haho genre rails would render as empty
+    // placeholders; haho keeps its latest rail only. Each added
+    // genre was verified live through this plugin before inclusion
+    // (hs ntr/milf: 25 items, 25 posters; hh milf/vanilla: 40
+    // items, 40 posters, page 1).
     return JSON.stringify([
         { slug: 'hs:latest', title: 'HStream — Mới nhất', type: 'Horizontal', path: '' },
         { slug: 'haho:latest', title: 'HAHO — Mới cập nhật', type: 'Horizontal', path: '' },
         { slug: 'hs:tag:uncensored', title: 'HStream — Uncensored', type: 'Horizontal', path: '' },
         { slug: 'hh:g:uncensored', title: 'HentaiHaven — Uncensored', type: 'Horizontal', path: '' },
-        { slug: 'hh:latest', title: 'HentaiHaven — Mới nhất', type: 'Grid', path: '' }
+        { slug: 'hh:latest', title: 'HentaiHaven — Mới nhất', type: 'Grid', path: '' },
+        { slug: 'hs:tag:ntr', title: 'HStream — NTR', type: 'Horizontal', path: '' },
+        { slug: 'hs:tag:milf', title: 'HStream — Milf', type: 'Horizontal', path: '' },
+        { slug: 'hh:g:milf', title: 'HentaiHaven — Milf', type: 'Horizontal', path: '' },
+        { slug: 'hh:g:vanilla', title: 'HentaiHaven — Vanilla', type: 'Horizontal', path: '' }
     ]);
 }
 
@@ -797,6 +826,19 @@ function parseHhDetail(html, url) {
         episodes = [{ id: HH + "/watch/" + slug + "/", name: "Episode 1", slug: slug }];
     }
 
+    // The episode this page belongs to: its own nhplayer iframe is
+    // in this page, so its play target can start one hop later —
+    // at the embed page. The app's resolver budget (initial fetch
+    // + 4 parses) fits the full proof-of-work chain only from
+    // there; sibling episodes keep their watch-page targets and
+    // degrade to the WebView hand-off (see hhResolveStep).
+    var iframeUrl = hhIframeUrl(html);
+    if (iframeUrl) {
+        for (var ei = 0; ei < episodes.length; ei++) {
+            if (episodes[ei].slug === slug) { episodes[ei].id = iframeUrl; break; }
+        }
+    }
+
     return {
         id: "hh:" + slug,
         title: title || slug,
@@ -908,10 +950,12 @@ function hahoStreamFromEmbed(html, embedUrl) {
     return null;
 }
 
-// hh: watch page -> nhplayer embed; embed page -> player.php. v1
-// hands player.php to the app's sniffing WebView player, whose real
-// page executes the proof-of-work itself. (v2: implement the PoW
-// in-plugin and resolve the direct MP4 — see header note.)
+// hh: watch page -> nhplayer embed; embed page -> player.php.
+// This raw hop is now only the FALLBACK path: v1.0.1 resolves the
+// direct MP4 via the in-plugin proof-of-work (hhResolveStep
+// below); when any PoW step fails, or a resolve starts at a watch
+// page (hop budget), the chain degrades to this hand-off and the
+// app's sniffing WebView player runs the page's own challenge.
 function hhEmbedHop(html, url) {
     var m = html.match(/(https:\/\/nhplayer\.com\/v\/[a-z0-9]+\/?)/i);
     if (m) return { url: m[1], isEmbed: true, headers: { "Referer": HH + "/" } };
@@ -925,9 +969,307 @@ function hhEmbedHop(html, url) {
     return null;
 }
 
+// =============================================================================
+// hh proof-of-work (v1.0.1) — resolve the direct MP4 in-plugin
+// instead of handing player.php to the WebView (which serves a
+// pre-roll ad). Measured live 2026-11-19; see the header note.
+// Chain (resolve starting at the embed page):
+//   embed page  -> data-id: player.php URL + base64 SRT (stashed)
+//   player page -> _pV{vid,ct,pid,st} + five challenge parts
+//                  (pid-anchored extraction below) + core URL
+//   core script -> sc/rid tokens; PoW solved here; the
+//                  /get-video-url-v2.php URL is the next hop
+//   gv response -> {"url": signed MP4} => direct stream + SRT
+// Any failure at any step falls back to the v1.0.0 hand-off.
+// =============================================================================
+
+function hhIframeUrl(html) {
+    var m = html.match(/(https:\/\/nhplayer\.com\/v\/[a-z0-9]+\/?)/i);
+    return m ? m[1] : "";
+}
+
+// Compact pure-JS base64 (JavaScriptCore has no atob/btoa).
+var B64C = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+function b64Decode(s) {
+    if (!s) return "";
+    s = s.replace(/[^A-Za-z0-9+/=]/g, "");
+    var out = "", i = 0;
+    while (i < s.length) {
+        var e1 = B64C.indexOf(s.charAt(i++));
+        var e2 = B64C.indexOf(s.charAt(i++));
+        var e3 = B64C.indexOf(s.charAt(i++));
+        var e4 = B64C.indexOf(s.charAt(i++));
+        if (e1 < 0 || e2 < 0) break;
+        out += String.fromCharCode((e1 << 2) | (e2 >> 4));
+        if (e3 >= 0 && s.charAt(i - 2) !== "=") out += String.fromCharCode(((e2 & 15) << 4) | (e3 >> 2));
+        if (e4 >= 0 && s.charAt(i - 1) !== "=") out += String.fromCharCode(((e3 & 3) << 6) | e4);
+    }
+    return out;
+}
+function b64Encode(s) {
+    var out = "", i = 0;
+    while (i < s.length) {
+        var c1 = s.charCodeAt(i++) & 0xff;
+        var c2 = i < s.length ? s.charCodeAt(i++) & 0xff : -1;
+        var c3 = i < s.length ? s.charCodeAt(i++) & 0xff : -1;
+        out += B64C.charAt(c1 >> 2);
+        out += B64C.charAt(((c1 & 3) << 4) | (c2 < 0 ? 0 : c2 >> 4));
+        out += c2 < 0 ? "=" : B64C.charAt(((c2 & 15) << 2) | (c3 < 0 ? 0 : c3 >> 6));
+        out += c3 < 0 ? "=" : B64C.charAt(c3 & 63);
+    }
+    return out;
+}
+
+// Compact standard SHA-256 over an ASCII string -> byte array.
+// (Verified against Node's crypto on empty/short/multi-block
+// inputs during the v1.0.1 work.)
+function sha256Bytes(ascii) {
+    function rr(v, a) { return (v >>> a) | (v << (32 - a)); }
+    var K = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+    var H = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+    var bytes = [];
+    for (var i = 0; i < ascii.length; i++) bytes.push(ascii.charCodeAt(i) & 0xff);
+    var bitLen = bytes.length * 8;
+    bytes.push(0x80);
+    while (bytes.length % 64 !== 56) bytes.push(0);
+    bytes.push(0, 0, 0, 0, (bitLen >>> 24) & 0xff, (bitLen >>> 16) & 0xff, (bitLen >>> 8) & 0xff, bitLen & 0xff);
+    var w = new Array(64);
+    for (var b = 0; b < bytes.length; b += 64) {
+        for (var t = 0; t < 16; t++) w[t] = (bytes[b + t * 4] << 24) | (bytes[b + t * 4 + 1] << 16) | (bytes[b + t * 4 + 2] << 8) | bytes[b + t * 4 + 3];
+        for (var t = 16; t < 64; t++) {
+            var s0 = rr(w[t - 15], 7) ^ rr(w[t - 15], 18) ^ (w[t - 15] >>> 3);
+            var s1 = rr(w[t - 2], 17) ^ rr(w[t - 2], 19) ^ (w[t - 2] >>> 10);
+            w[t] = (w[t - 16] + s0 + w[t - 7] + s1) | 0;
+        }
+        var a = H[0], bb = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+        for (var t = 0; t < 64; t++) {
+            var S1 = rr(e, 6) ^ rr(e, 11) ^ rr(e, 25);
+            var ch = (e & f) ^ (~e & g);
+            var temp1 = (h + S1 + ch + K[t] + w[t]) | 0;
+            var S0 = rr(a, 2) ^ rr(a, 13) ^ rr(a, 22);
+            var maj = (a & bb) ^ (a & c) ^ (bb & c);
+            var temp2 = (S0 + maj) | 0;
+            h = g; g = f; f = e; e = (d + temp1) | 0; d = c; c = bb; bb = a; a = (temp1 + temp2) | 0;
+        }
+        H[0] = (H[0] + a) | 0; H[1] = (H[1] + bb) | 0; H[2] = (H[2] + c) | 0; H[3] = (H[3] + d) | 0;
+        H[4] = (H[4] + e) | 0; H[5] = (H[5] + f) | 0; H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0;
+    }
+    var out = [];
+    for (var j = 0; j < 8; j++) { out.push((H[j] >>> 24) & 0xff, (H[j] >>> 16) & 0xff, (H[j] >>> 8) & 0xff, H[j] & 0xff); }
+    return out;
+}
+
+// The player's PoW: first nonce (hex counter from 0) whose
+// SHA-256(challenge + nonce) starts with a zero byte. Expected
+// ~256 tries (measured mean 217, worst 953 over 30 random
+// challenges); the cap is a formality — P(exceeding it) ~ 0.
+function hhSolvePow(challenge) {
+    for (var n = 0; n < 300000; n++) {
+        var nonce = n.toString(16);
+        if (sha256Bytes(challenge + nonce)[0] === 0) return nonce;
+    }
+    return null;
+}
+
+// The five challenge parts sit in TWO hidden DOM blocks: a decoy
+// (semantic ids) and the real one (randomized ids). The real
+// block's ts element is the one whose data-* value equals the
+// _pV pid prefix; the parts are the closest matching values
+// before it in document order (span data-*, input value, div
+// data-*, template <p>). Verified byte-exact against the core
+// script's own selector map on two live page loads.
+function hhExtractParts(html, ts) {
+    var tsEsc = (ts || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    var am = html.match(new RegExp("data-[a-z0-9]+=\"" + tsEsc + "\"", "i"));
+    if (!am) return null;
+    var win = html.slice(Math.max(0, am.index - 1200), am.index);
+    function all(re) { var out = [], m; re.lastIndex = 0; while ((m = re.exec(win)) !== null) out.push(m[1]); return out; }
+    var datas = all(/data-[a-z0-9]+="([0-9a-f]{8})"/gi);
+    var inputs = all(/<input[^>]*?value="([0-9a-f]{8})"/gi);
+    var tpls = all(/<template[^>]*>\s*<p>([0-9a-f]{8})<\/p>/gi);
+    if (datas.length < 2 || inputs.length < 1 || tpls.length < 1) return null;
+    return { p1: datas[datas.length - 2], p2: inputs[inputs.length - 1], p3: datas[datas.length - 1], p4: tpls[tpls.length - 1], ts: ts };
+}
+
+// Clean-browser fingerprint payload for /get-video-url-v2.php —
+// the exact shape the real core script sends (empty behaviour
+// arrays; the server requires the field and validates its
+// structure — measured: omitted fp => 403 "Invalid fingerprint",
+// this payload => 200).
+var HH_FP_JSON = "{\"t\":1500,\"mm\":[],\"tm\":[],\"cl\":[],\"kp\":[],\"sc\":[],\"i\":0,\"mc\":0,\"tc\":0,\"cc\":0,\"kc\":0,\"b\":{\"sw\":1920,\"sh\":1080,\"aw\":1920,\"ah\":1040,\"cd\":24,\"pd\":24,\"tz\":300,\"hc\":8,\"dm\":8,\"pl\":\"Win32\",\"lang\":\"en-US\",\"langs\":\"en-US,en\",\"dpr\":1,\"ww\":1280,\"wh\":720,\"touch\":false,\"pdf\":true,\"fonts\":0}}";
+
+// Per-resolve PoW chain state (the app keeps one JSContext per
+// plugin; its calls are serialized, and every step below also
+// re-validates the page it is parsing, so a stale stash can only
+// ever cost the fallback, never a wrong stream).
+var _hhPow = null;
+
+function hhPlayerFallback() {
+    return { url: _hhPow.playerUrl, isEmbed: true, headers: { "Referer": HH + "/" } };
+}
+
+// Empty-body twin of the core step's failure exits: when the
+// core script fetch returns no body at all, the parse entry
+// points' !html early return would break the chain and strand
+// the resolver's last-resort WebView on the core script URL (a
+// JavaScript file). Route it through the same marked fallback
+// instead. The host/path test and the stash gates mirror the
+// core step's exact-match checks, so only a core hop of the
+// live resolve can take this detour.
+function hhCoreEmptyStep(url) {
+    var u = url || "";
+    if (u.indexOf("nhplayer.com") === -1 || u.indexOf("player-core-v2.php") === -1) return null;
+    if (!_hhPow || _hhPow.coreUrl !== u || !_hhPow.playerUrl) return null;
+    _hhPow.failedFor = _hhPow.playerUrl;
+    return hhPlayerFallback();
+}
+
+function hhGvUrl(sc, rid, nonce) {
+    var p = _hhPow.parts;
+    return "https://nhplayer.com/get-video-url-v2.php?" +
+        "vid=" + encodeURIComponent(_hhPow.vid) +
+        "&c=" + encodeURIComponent(_hhPow.ct) +
+        "&p1=" + p.p1 + "&p2=" + p.p2 + "&p3=" + p.p3 + "&p4=" + p.p4 +
+        "&t=" + p.ts +
+        "&sc=" + sc + "&rid=" + rid +
+        "&fp=" + encodeURIComponent(b64Encode(HH_FP_JSON)) +
+        "&df=" + "&pow=" + nonce +
+        "&pid=" + encodeURIComponent(_hhPow.pid) +
+        "&st=" + encodeURIComponent(_hhPow.st);
+}
+
+// One PoW-chain step, or null when this page is not a PoW hop
+// (the caller then falls through to the v1.0.0 hhEmbedHop path).
+function hhResolveStep(html, url) {
+    try {
+        var u = url || "";
+        // Authorization endpoint's answer: the direct stream.
+        if (u.indexOf("get-video-url-v2.php") !== -1) {
+            if (!_hhPow || _hhPow.gvUrl !== u) {
+                if (_hhPow && _hhPow.playerUrl) return hhPlayerFallback();
+                return null;
+            }
+            var gv = null;
+            try { gv = JSON.parse(html); } catch (e) { gv = null; }
+            if (gv && typeof gv.url === "string" && gv.url.indexOf("http") === 0) {
+                var subs = [];
+                if (_hhPow && _hhPow.srt) subs.push({ lang: "en", url: _hhPow.srt, label: "English" });
+                return { url: gv.url, isEmbed: false, headers: { "Referer": "https://nhplayer.com/", "User-Agent": DESKTOP_UA }, subtitles: subs };
+            }
+            if (_hhPow && _hhPow.playerUrl) return hhPlayerFallback();
+            return null;
+        }
+        // Core script: solve the PoW, name the authorization URL.
+        // Every failure exit below marks the resolve failed
+        // (_hhPow.failedFor = its player page) before taking the
+        // fallback: if the resolver follows the fallback and
+        // re-parses that player page, the player step self-embeds
+        // it (see there) instead of issuing a fresh core hop the
+        // parse budget cannot complete.
+        if (u.indexOf("player-core-v2.php") !== -1) {
+            if (!_hhPow || _hhPow.coreUrl !== u) {
+                if (_hhPow && _hhPow.playerUrl) { _hhPow.failedFor = _hhPow.playerUrl; return hhPlayerFallback(); }
+                return null;
+            }
+            if (_hhPow.parts && (_hhPow.stage === "core" || _hhPow.stage === "gv")) {
+                if (_hhPow.sawWatch) { _hhPow.failedFor = _hhPow.playerUrl; return hhPlayerFallback(); }
+                var scM = html.match(/[0-9a-f]{8}\.[0-9a-f]{16}/);
+                var ridM = html.match(/id:'([0-9a-f]{16})'/);
+                if (scM && ridM) {
+                    var nonce = hhSolvePow(_hhPow.parts.p1 + _hhPow.parts.p2 + _hhPow.parts.p3 + _hhPow.parts.p4 + _hhPow.parts.ts);
+                    if (nonce !== null) {
+                        var gvUrl = hhGvUrl(scM[0], ridM[1], nonce);
+                        _hhPow.gvUrl = gvUrl;
+                        _hhPow.stage = "gv";
+                        return { url: gvUrl, isEmbed: true, headers: { "Referer": _hhPow.playerUrl, "X-Requested-With": "XMLHttpRequest" } };
+                    }
+                }
+            }
+            if (_hhPow.playerUrl) { _hhPow.failedFor = _hhPow.playerUrl; return hhPlayerFallback(); }
+            return null;
+        }
+        // Player page: harvest _pV + challenge parts, name the
+        // core script as the next hop.
+        if (html.indexOf("_pV={vid:") !== -1) {
+            // This resolve's core step already failed once and
+            // the chain followed the fallback back to this page:
+            // hand the page itself to the WebView (self-embed)
+            // rather than re-driving the PoW chain past the
+            // parse budget. The marker is bound to this page's
+            // URL and is cleared when a fresh resolve passes
+            // the embed step, so it cannot poison a later one.
+            if (_hhPow && _hhPow.failedFor && _hhPow.failedFor === u) {
+                return { url: u, isEmbed: true, headers: { "Referer": HH + "/" } };
+            }
+            var pv = html.match(/_pV=\{vid:"([^"]+)",ct:"([^"]+)",pid:"([^"]+)",st:"([^"]+)"\}/);
+            var coreM = html.match(/(player-core-v2\.php\?t=[^"&]+&_=\d+)/);
+            if (pv && coreM) {
+                var parts = hhExtractParts(html, pv[3].split("_")[0]);
+                if (parts) {
+                    var coreUrl = "https://nhplayer.com/" + coreM[1];
+                    var saw = false, keepSrt = "", matchedEmbedUrl = "";
+                    if (_hhPow) {
+                        if (_hhPow.stage === "player" || _hhPow.playerUrl === u) saw = !!_hhPow.sawWatch;
+                        if (_hhPow.embedUrl && _hhPow.playerUrl === u) {
+                            keepSrt = _hhPow.srt || "";
+                            matchedEmbedUrl = _hhPow.embedUrl;
+                        }
+                    }
+                    _hhPow = { stage: "core", sawWatch: saw, embedUrl: matchedEmbedUrl, coreUrl: coreUrl, playerUrl: u, srt: keepSrt, vid: pv[1], ct: pv[2], pid: pv[3], st: pv[4], parts: parts };
+                    return { url: coreUrl, isEmbed: true, headers: { "Referer": u } };
+                }
+            }
+            return null;
+        }
+        // Embed page: stash the subtitle + chain state, then the
+        // usual player.php hop (same output as hhEmbedHop).
+        if (u.indexOf("nhplayer.com/v/") !== -1) {
+            var dm = html.match(/data-id="(\/player\.php\?[^"]+)"/);
+            if (dm) {
+                var qs = PluginUtils.decodeEntities(dm[1]);
+                var sm = qs.match(/[?&]s=([^&]+)/);
+                var srt = "";
+                if (sm) { var dec = b64Decode(sm[1]); if (dec && dec.indexOf("http") === 0) srt = dec; }
+                var pUrl = "https://nhplayer.com" + qs;
+                if (!(_hhPow && _hhPow.embedUrl === u && _hhPow.stage !== "embed")) {
+                    if (_hhPow && _hhPow.stage === "embed" && _hhPow.embedUrl === u) { _hhPow.stage = "player"; }
+                    else { _hhPow = { stage: "player", sawWatch: false }; }
+                }
+                _hhPow.embedUrl = u;
+                _hhPow.playerUrl = pUrl;
+                // A fresh chain attempt starts at this hop:
+                // any failure marker a previous resolve left on
+                // the kept stash is spent.
+                _hhPow.failedFor = "";
+                if (srt) _hhPow.srt = srt;
+                return { url: pUrl, isEmbed: true, headers: { "Referer": u } };
+            }
+            return null;
+        }
+        return null;
+    } catch (e) { return null; }
+}
+
+// hhEmbedHop plus the chain-state note for a resolve that starts
+// at a watch page (one hop longer — its PoW chain cannot fit the
+// resolver budget, so its core step will take the fallback).
+function hhHopTracked(html, url) {
+    var cfg = hhEmbedHop(html, url);
+    if (cfg && cfg.url && cfg.url.indexOf("nhplayer.com/v/") !== -1 && (url || "").indexOf("nhplayer.com") === -1) {
+        _hhPow = { stage: "embed", sawWatch: true, embedUrl: cfg.url, srt: "", playerUrl: "" };
+    }
+    return cfg;
+}
+
 function parseDetailResponse(html, url) {
     try {
-        if (!html) return JSON.stringify({ url: "", isEmbed: false, headers: {} });
+        if (!html) {
+            var hhEmptyD = hhCoreEmptyStep(url);
+            if (hhEmptyD) return JSON.stringify(hhEmptyD);
+            return JSON.stringify({ url: "", isEmbed: false, headers: {} });
+        }
+        var hhStepD = hhResolveStep(html, url);
+        if (hhStepD) return JSON.stringify(hhStepD);
         if (html.indexOf('"stream_url"') !== -1) {
             var s = hsStreamFromApi(html);
             if (s) return JSON.stringify(s);
@@ -944,7 +1286,7 @@ function parseDetailResponse(html, url) {
             if (st) return JSON.stringify(st);
         }
         if (src === "hh" || (url || "").indexOf("hentaihaven") !== -1 || (url || "").indexOf("nhplayer") !== -1) {
-            var hh = hhEmbedHop(html, url);
+            var hh = hhHopTracked(html, url);
             if (hh) return JSON.stringify(hh);
         }
         return JSON.stringify({ url: "", isEmbed: false, headers: {} });
@@ -955,7 +1297,13 @@ function parseDetailResponse(html, url) {
 
 function parseEmbedResponse(html, url) {
     try {
-        if (!html) return JSON.stringify({ url: "", isEmbed: false, headers: {} });
+        if (!html) {
+            var hhEmptyE = hhCoreEmptyStep(url);
+            if (hhEmptyE) return JSON.stringify(hhEmptyE);
+            return JSON.stringify({ url: "", isEmbed: false, headers: {} });
+        }
+        var hhStepE = hhResolveStep(html, url);
+        if (hhStepE) return JSON.stringify(hhStepE);
         if (html.indexOf('"stream_url"') !== -1) {
             var s = hsStreamFromApi(html);
             if (s) return JSON.stringify(s);
@@ -965,7 +1313,7 @@ function parseEmbedResponse(html, url) {
             if (st) return JSON.stringify(st);
         }
         if (html.indexOf("nhplayer.com") !== -1 || html.indexOf("player.php?vid=") !== -1 || (url || "").indexOf("nhplayer") !== -1) {
-            var hh = hhEmbedHop(html, url);
+            var hh = hhHopTracked(html, url);
             if (hh) return JSON.stringify(hh);
         }
         if ((url || "").indexOf("haho.moe") !== -1 || html.indexOf("haho.moe") !== -1) {
