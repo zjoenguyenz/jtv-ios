@@ -230,29 +230,33 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
             guard let sourceURL, PlaylistSynthesizer.streamxxID(from: sourceURL) != nil else { return }
             synthPending = true
             let id = PlaylistSynthesizer.streamxxID(from: sourceURL)!
-            Task { [weak self] in
+            // Swift 6: ONE @MainActor task instead of a plain
+            // task + a nested MainActor.run — nesting sent the
+            // guard-unwrapped `self` across a second `sending`
+            // boundary, which complete checking rejects (build
+            // #43). The awaits suspend off the main actor; the
+            // mutations after them run on it, as before.
+            Task { @MainActor [weak self] in
                 let result = await PlaylistSynthesizer.synthesize(streamID: id)
                 let serverURL: URL? = if let result {
                     await LocalHLSServer.shared.register(result.data)
                 } else { nil }
-                await MainActor.run {
-                    guard let self else { return }
-                    self.synthPending = false
-                    guard let result else {
-                        if self.player?.currentItem?.status == .failed { self.handleFailure() }
-                        return
-                    }
-                    self.synthFileURL = result.fileURL
-                    // Never swap away from content that
-                    // is already playing.
-                    if (self.player?.currentTime().seconds ?? 0) > 0.5 { return }
-                    if let serverURL {
-                        self.synthStage = 1
-                        self.swapItem(AVPlayerItem(url: serverURL))
-                    } else {
-                        self.synthStage = 2
-                        self.swapItem(AVPlayerItem(url: result.fileURL))
-                    }
+                guard let self else { return }
+                self.synthPending = false
+                guard let result else {
+                    if self.player?.currentItem?.status == .failed { self.handleFailure() }
+                    return
+                }
+                self.synthFileURL = result.fileURL
+                // Never swap away from content that
+                // is already playing.
+                if (self.player?.currentTime().seconds ?? 0) > 0.5 { return }
+                if let serverURL {
+                    self.synthStage = 1
+                    self.swapItem(AVPlayerItem(url: serverURL))
+                } else {
+                    self.synthStage = 2
+                    self.swapItem(AVPlayerItem(url: result.fileURL))
                 }
             }
         }
@@ -278,29 +282,30 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
             didMaterialize = true
             ladderPending = true
             let headers = sourceHeaders
-            Task { [weak self] in
+            // Swift 6: single @MainActor task (see
+            // beginSynthesis for why the nested MainActor.run
+            // shape is rejected by complete checking).
+            Task { @MainActor [weak self] in
                 let prepared = await HLSProxyLoader.materializedPlaylist(url: sourceURL, headers: headers)
                 let serverURL: URL? = if let prepared {
                     await LocalHLSServer.shared.register(prepared.data)
                 } else { nil }
-                await MainActor.run {
-                    guard let self else { return }
-                    self.ladderPending = false
-                    guard let prepared else {
-                        // Declined: if the placeholder item
-                        // already died while waiting, advance the
-                        // normal fallback now.
-                        if self.player?.currentItem?.status == .failed { self.handleFailure() }
-                        return
-                    }
-                    self.materializedFileURL = prepared.fileURL
-                    if let serverURL {
-                        self.proxyStage = 1
-                        self.swapItem(AVPlayerItem(url: serverURL))
-                    } else {
-                        self.proxyStage = 2
-                        self.swapItem(AVPlayerItem(url: prepared.fileURL))
-                    }
+                guard let self else { return }
+                self.ladderPending = false
+                guard let prepared else {
+                    // Declined: if the placeholder item
+                    // already died while waiting, advance the
+                    // normal fallback now.
+                    if self.player?.currentItem?.status == .failed { self.handleFailure() }
+                    return
+                }
+                self.materializedFileURL = prepared.fileURL
+                if let serverURL {
+                    self.proxyStage = 1
+                    self.swapItem(AVPlayerItem(url: serverURL))
+                } else {
+                    self.proxyStage = 2
+                    self.swapItem(AVPlayerItem(url: prepared.fileURL))
                 }
             }
         }
@@ -334,10 +339,14 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
             // is what ran dry and froze the picture.
             item.preferredForwardBufferDuration = patientMode ? 30 : 12
             statusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
-                // KVO fires on an arbitrary queue — hop onto the
-                // coordinator's actor instead of sending self.
-                guard let self, item.status == .failed else { return }
-                Task { @MainActor in self.handleFailure() }
+                // KVO fires on an arbitrary queue: read the
+                // status VALUE here, then hop with only a weak
+                // recapture — sending the guard-unwrapped strong
+                // `self` into the task was build #43's line-330
+                // error.
+                let failed = item.status == .failed
+                guard failed else { return }
+                Task { @MainActor [weak self] in self?.handleFailure() }
             }
             armStallTimer(for: item)
         }
@@ -360,14 +369,20 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
             sawProgress = false
             lastStallTime = -1.0
             lastBufferedEnd = -1.0
-            var timer: Timer?
-            timer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self, weak item] _ in
+            // Swift 6 gate fix: no local `var timer` capture —
+            // the timer assigns straight to self.stallTimer and
+            // the closure invalidates through it. Equivalent to
+            // the old shape: a stale timer reaching the guard
+            // was already invalidated by the re-arm that replaced
+            // it, and in the budget branch handleFailure()
+            // invalidates stallTimer as its first statement.
+            stallTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self, weak item] _ in
                 // armStallTimer is only called from main-actor
                 // contexts, so the timer sits on the main runloop
                 // and this block provably fires on the main actor.
                 MainActor.assumeIsolated {
                     guard let self, let item, self.player?.currentItem === item else {
-                        timer?.invalidate()
+                        self?.stallTimer?.invalidate()
                         return
                     }
                     if self.player?.timeControlStatus == .paused {
@@ -391,12 +406,12 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
                         ? (self.sawProgress ? 12 : 24)
                         : (self.sawProgress ? 6 : 12)  // 4 s ticks: 24 s / 48 s
                     if self.stallTicks >= budget {
-                        timer?.invalidate()
+                        // handleFailure() invalidates stallTimer
+                        // as its first statement.
                         self.handleFailure()
                     }
                 }
             }
-            stallTimer = timer
         }
 
         private func handleFailure() {
@@ -467,11 +482,14 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
             }
             didSeek = false
             let attempt = recoveryAttempts
-            Task { [weak self] in
+            // Swift 6: single @MainActor task (the nested
+            // MainActor.run shape sent `self` across a second
+            // `sending` boundary — build #43).
+            Task { @MainActor [weak self] in
                 if attempt < 3 {
                     try? await Task.sleep(nanoseconds: attempt == 1 ? 2_000_000_000 : 5_000_000_000)
                 }
-                await MainActor.run { self?.performRecovery(attempt: attempt) }
+                self?.performRecovery(attempt: attempt)
             }
             return true
         }
@@ -501,26 +519,26 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
                 onGiveUp?(lastErrorText())
                 return
             }
-            Task { [weak self] in
+            // Swift 6: single @MainActor task (see the recovery
+            // task above for why the nested shape is rejected).
+            Task { @MainActor [weak self] in
                 let fresh = await provider()
-                await MainActor.run {
-                    guard let self else { return }
-                    self.isRecovering = false
-                    guard let fresh, let freshURL = fresh.streamURL, !fresh.useCompatEngine else {
-                        self.onGiveUp?(self.lastErrorText())
-                        return
-                    }
-                    self.sourceURL = freshURL
-                    self.sourceHeaders = fresh.headers
-                    self.transportSwitched = false
-                    self.didRetryViaProxy = false
-                    self.didFallBackToPlain = false
-                    let asset = AVURLAsset(url: freshURL, options: ["AVURLAssetHTTPHeaderFieldsKey": fresh.headers])
-                    let item = AVPlayerItem(asset: asset)
-                    self.player?.replaceCurrentItem(with: item)
-                    self.observe(item: item)
-                    self.seekAndPlay()
+                guard let self else { return }
+                self.isRecovering = false
+                guard let fresh, let freshURL = fresh.streamURL, !fresh.useCompatEngine else {
+                    self.onGiveUp?(self.lastErrorText())
+                    return
                 }
+                self.sourceURL = freshURL
+                self.sourceHeaders = fresh.headers
+                self.transportSwitched = false
+                self.didRetryViaProxy = false
+                self.didFallBackToPlain = false
+                let asset = AVURLAsset(url: freshURL, options: ["AVURLAssetHTTPHeaderFieldsKey": fresh.headers])
+                let item = AVPlayerItem(asset: asset)
+                self.player?.replaceCurrentItem(with: item)
+                self.observe(item: item)
+                self.seekAndPlay()
             }
         }
 
@@ -590,6 +608,11 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         }
 
         func reportExit() {
+            // Gate re-review MINOR: kill the stall timer with
+            // its owner — otherwise a released coordinator
+            // leaves a repeating timer firing no-ops for the
+            // rest of the session.
+            stallTimer?.invalidate()
             let (c, d) = times()
             if c > 0 { onExit(c, d) }
         }

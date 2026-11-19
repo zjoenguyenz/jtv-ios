@@ -496,17 +496,19 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
             if attempt < 3 {
                 self.restartLayer()
             } else if let provider = self.freshStreamProvider {
-                Task { [weak self] in
+                // Swift 6: single @MainActor task (the nested
+                // MainActor.run shape sent `self` across a
+                // second `sending` boundary — the family that
+                // bounced the AV surface in build #43).
+                Task { @MainActor [weak self] in
                     let fresh = await provider()
-                    await MainActor.run {
-                        guard let self, !self.failed else { return }
-                        if let fresh, let freshURL = fresh.streamURL, fresh.useCompatEngine {
-                            self.contentURL = freshURL
-                            self.contentHeaders = fresh.headers
-                            self.restartLayer()
-                        } else {
-                            self.showError(message: message)
-                        }
+                    guard let self, !self.failed else { return }
+                    if let fresh, let freshURL = fresh.streamURL, fresh.useCompatEngine {
+                        self.contentURL = freshURL
+                        self.contentHeaders = fresh.headers
+                        self.restartLayer()
+                    } else {
+                        self.showError(message: message)
                     }
                 }
             } else {

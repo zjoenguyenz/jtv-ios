@@ -388,32 +388,41 @@ final class ImageCacheManager: @unchecked Sendable {
 
         // Swift 6: NSLock.lock()/unlock() are unavailable in
         // async contexts; scoped withLock is the sanctioned
-        // form (these critical sections never spanned an
-        // await, so the conversion is semantics-preserving).
-        if let existing = lock.withLock({ inFlight[k] }) {
-            return await existing.value
-        }
-        let task = Task<UIImage?, Never> {
-            defer {
-                self.lock.withLock { self.inFlight[k] = nil }
-            }
-            // Disk tier first: decode + promote to memory.
-            let disk = self.diskURL(for: k)
-            if let data = try? Data(contentsOf: disk), let image = UIImage(data: data) {
+        // form. The check-and-set MUST stay inside ONE critical
+        // section — the pre-migration code held the lock across
+        // the check, the Task creation and the registration,
+        // and splitting that into two sections (an earlier
+        // conversion did) loses the dedupe guarantee: two
+        // concurrent calls could both miss the check and both
+        // fetch, and a finishing task's cleanup could clear a
+        // successor's registration. So the task is created AND
+        // registered inside a single withLock section that
+        // returns it; the section itself never awaits.
+        let task: Task<UIImage?, Never> = lock.withLock {
+            if let existing = inFlight[k] { return existing }
+            let created = Task<UIImage?, Never> {
+                defer {
+                    self.lock.withLock { self.inFlight[k] = nil }
+                }
+                // Disk tier first: decode + promote to memory.
+                let disk = self.diskURL(for: k)
+                if let data = try? Data(contentsOf: disk), let image = UIImage(data: data) {
+                    let cappedImage = self.capped(image)
+                    self.cache.setObject(cappedImage, forKey: k as NSString, cost: self.decodedCost(cappedImage))
+                    return cappedImage
+                }
+                var req = Net.makeRequest(url: url, headers: headers)
+                req.timeoutInterval = 30
+                guard let (data, _) = try? await Net.session.data(for: req),
+                      let image = UIImage(data: data) else { return nil }
+                try? data.write(to: disk, options: .atomic)
                 let cappedImage = self.capped(image)
                 self.cache.setObject(cappedImage, forKey: k as NSString, cost: self.decodedCost(cappedImage))
                 return cappedImage
             }
-            var req = Net.makeRequest(url: url, headers: headers)
-            req.timeoutInterval = 30
-            guard let (data, _) = try? await Net.session.data(for: req),
-                  let image = UIImage(data: data) else { return nil }
-            try? data.write(to: disk, options: .atomic)
-            let cappedImage = self.capped(image)
-            self.cache.setObject(cappedImage, forKey: k as NSString, cost: self.decodedCost(cappedImage))
-            return cappedImage
+            inFlight[k] = created
+            return created
         }
-        lock.withLock { inFlight[k] = task }
         return await task.value
     }
 
