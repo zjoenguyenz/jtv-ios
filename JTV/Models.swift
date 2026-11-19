@@ -447,9 +447,7 @@ struct StreamInfo: Codable {
     /// Play this stream on the KSPlayer (FFmpeg) surface instead of
     /// AVPlayer — set by the app only: by DebridResolver when the
     /// resolved file's container is one AVFoundation cannot open
-    /// (MKV/AVI/…), and by MovieService's streamxx probe when the
-    /// origin serves a progressive file at a playlist address.
-    /// Plugin payloads decode it as false.
+    /// (MKV/AVI/…). Plugin payloads decode it as false.
     var useCompatEngine: Bool = false
 
     enum CodingKeys: String, CodingKey { case url, headers, subtitles, images, isEmbed, postBody, requiresProxy, useCompatEngine }
@@ -482,7 +480,13 @@ struct StreamInfo: Codable {
 enum PlaybackResolution {
     case video(StreamInfo)
     case manga(StreamInfo)
-    case embed(url: URL, headers: [String: String])
+    /// `sniffMedia` false means the page IS the player (the
+    /// operator's own player page): the webview must be left
+    /// alone to play in-page, with no media sniffing — sniffing
+    /// would capture the page's internal stream URL and promote
+    /// it to a native surface, defeating the hand-off. Only the
+    /// streamxx fallback passes false; every other embed sniffs.
+    case embed(url: URL, headers: [String: String], sniffMedia: Bool)
 }
 
 /// Everything needed to start (or resume) playback of one episode/chapter.

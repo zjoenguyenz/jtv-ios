@@ -219,6 +219,12 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
     private let rotateButton = UIButton(type: .system)
     private let sourcesButton = UIButton(type: .system)
     private let closeButton = UIButton(type: .system)
+    /// v1.22.11: the error slate's own close button, owned by
+    /// the ROOT view — showError hides controlsView (and with
+    /// it the in-controls close button), which on v1.22.10 left
+    /// the error screen with NO reachable exit. This one is
+    /// hidden during playback and shown only by showError.
+    private let errorCloseButton = UIButton(type: .system)
     private let sourceLabel = UILabel()
     private let slider = UISlider()
     private let currentLabel = UILabel()
@@ -356,6 +362,7 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
         let firstFrameBudget: TimeInterval = patientMode ? 30 : 12
         let watchdog = DispatchWorkItem { [weak self] in
             guard let self, !self.playing else { return }
+            DiagLog.log("player-ks", "first-frame watchdog fired (budget \(Int(firstFrameBudget))s)")
             self.handlePlaybackFailure(message: "Chưa có hình sau \(Int(firstFrameBudget)) giây.")
         }
         firstFrameWatchdog = watchdog
@@ -461,6 +468,7 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
         // CDN refills slowly after a far seek; 12 s killed them).
         let freezeBudget: TimeInterval = patientMode ? 30 : 12
         if Date().timeIntervalSince(lastAdvanceAt) > freezeBudget {
+            DiagLog.log("player-ks", "freeze watchdog fired (budget \(Int(freezeBudget))s)")
             handlePlaybackFailure(message: "Hình đứng quá \(Int(freezeBudget)) giây — đường truyền tới file có vấn đề.")
         }
     }
@@ -536,6 +544,7 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
         lastPositionSec = -1
         lastAdvanceAt = Date()
         controlsView.isHidden = false
+        errorCloseButton.isHidden = true
         spinner.startAnimating()
         beginPlaybackIfPossible()
     }
@@ -581,6 +590,11 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
             errorLabel.text = "Không phát được nguồn này.\n\(message)"
         }
         errorLabel.isHidden = false
+        // v1.22.11: the error slate always keeps a reachable
+        // close — controlsView (and its close button) is hidden
+        // above, so the root-view error button takes over.
+        errorCloseButton.isHidden = false
+        DiagLog.log("player-ks", "error shown: \(message ?? "unknown")")
     }
 
     // MARK: - Controls (mirrors PlayerSurfaceViewController)
@@ -676,6 +690,21 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
         closeButton.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
         controlsView.addSubview(closeButton)
 
+        // v1.22.11: error-slated close (see the declaration) —
+        // same look and action as the in-controls button, but
+        // parented to the root view so showError can never hide
+        // it along with the control layer.
+        errorCloseButton.setImage(UIImage(systemName: "xmark"), for: .normal)
+        errorCloseButton.tintColor = .white
+        errorCloseButton.backgroundColor = UIColor.black.withAlphaComponent(0.45)
+        errorCloseButton.layer.cornerRadius = 20
+        errorCloseButton.translatesAutoresizingMaskIntoConstraints = false
+        errorCloseButton.widthAnchor.constraint(equalToConstant: 40).isActive = true
+        errorCloseButton.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        errorCloseButton.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
+        errorCloseButton.isHidden = true
+        view.addSubview(errorCloseButton)
+
         let bottomRow = UIStackView(arrangedSubviews: [currentLabel, slider, durationLabel, sourcesButton, rotateButton])
         bottomRow.axis = .horizontal
         bottomRow.spacing = 10
@@ -694,6 +723,8 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
             sourceLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 10),
             closeButton.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
             closeButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 4),
+            errorCloseButton.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
+            errorCloseButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 4),
         ])
     }
 

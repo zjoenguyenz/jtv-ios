@@ -406,6 +406,7 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
                         ? (self.sawProgress ? 12 : 24)
                         : (self.sawProgress ? 6 : 12)  // 4 s ticks: 24 s / 48 s
                     if self.stallTicks >= budget {
+                        DiagLog.log("player-av", "stall watchdog fired (ticks=\(self.stallTicks) sawProgress=\(self.sawProgress) patient=\(self.patientMode))")
                         // handleFailure() invalidates stallTimer
                         // as its first statement.
                         self.handleFailure()
@@ -650,6 +651,14 @@ final class PlayerSurfaceViewController: UIViewController {
     private let pipButton = UIButton(type: .system)
     private let sourcesButton = UIButton(type: .system)
     private let closeButton = UIButton(type: .system)
+    /// v1.22.11: the error slate's own close button, owned by
+    /// the ROOT view — showError hides controlsView (and with
+    /// it the in-controls close button), which left the error
+    /// screen with no reachable exit. Hidden during playback,
+    /// shown only by showError. (This surface's controller is
+    /// created fresh for every stream, so — exactly like
+    /// errorLabel — it needs no in-place reset.)
+    private let errorCloseButton = UIButton(type: .system)
     private let sourceLabel = UILabel()
     private var pipController: AVPictureInPictureController?
     private var remoteTargets: [(MPRemoteCommand, Any)] = []
@@ -874,6 +883,21 @@ final class PlayerSurfaceViewController: UIViewController {
         closeButton.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
         controlsView.addSubview(closeButton)
 
+        // v1.22.11: error-slated close (see the declaration) —
+        // same look and action as the in-controls button, but
+        // parented to the root view so showError can never hide
+        // it along with the control layer.
+        errorCloseButton.setImage(UIImage(systemName: "xmark"), for: .normal)
+        errorCloseButton.tintColor = .white
+        errorCloseButton.backgroundColor = UIColor.black.withAlphaComponent(0.45)
+        errorCloseButton.layer.cornerRadius = 20
+        errorCloseButton.translatesAutoresizingMaskIntoConstraints = false
+        errorCloseButton.widthAnchor.constraint(equalToConstant: 40).isActive = true
+        errorCloseButton.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        errorCloseButton.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
+        errorCloseButton.isHidden = true
+        view.addSubview(errorCloseButton)
+
         sourceLabel.text = sourceLabelText.isEmpty ? "" : "Nguồn: \(sourceLabelText)"
         sourceLabel.font = .systemFont(ofSize: 12, weight: .medium)
         sourceLabel.textColor = UIColor.white.withAlphaComponent(0.85)
@@ -901,6 +925,8 @@ final class PlayerSurfaceViewController: UIViewController {
             sourceLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 10),
             closeButton.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
             closeButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 4),
+            errorCloseButton.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 16),
+            errorCloseButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 4),
         ])
     }
 
@@ -930,7 +956,9 @@ final class PlayerSurfaceViewController: UIViewController {
     }
 
     /// Both transports failed or stalled: stop pretending and
-    /// say so — the resolver's close button is right there.
+    /// say so — and keep a close button on screen while saying
+    /// it (v1.22.11: the in-controls button hides together with
+    /// controlsView, so the root-view error button takes over).
     func showError(message: String? = nil) {
         gaveUp = true
         spinner.stopAnimating()
@@ -944,6 +972,8 @@ final class PlayerSurfaceViewController: UIViewController {
             errorLabel.text = "Không phát được nguồn này.\n\(message)"
         }
         errorLabel.isHidden = false
+        errorCloseButton.isHidden = false
+        DiagLog.log("player-av", "error shown: \(message ?? "unknown")")
     }
 
     private func refreshUI() {
@@ -1215,12 +1245,18 @@ struct PlayerView: View {
 struct EmbedPlayerView: View {
     let url: URL
     let headers: [String: String]
+    /// True (the default, every source except the streamxx
+    /// fallback): the webview sniffs the page for a media URL
+    /// and promotes it to a native surface. False: the page IS
+    /// the player — it is left completely alone to play
+    /// in-page, fully interactive.
+    var sniffMedia: Bool = true
     var onCapture: (String) -> Void
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            EmbedWebView(url: url, headers: headers, onCapture: onCapture)
+            EmbedWebView(url: url, headers: headers, sniffMedia: sniffMedia, onCapture: onCapture)
                 .ignoresSafeArea()
             // No close chrome of its own: the resolver screen draws
             // one persistent close button above every phase (this
@@ -1233,6 +1269,7 @@ struct EmbedPlayerView: View {
 private struct EmbedWebView: UIViewControllerRepresentable {
     let url: URL
     let headers: [String: String]
+    var sniffMedia: Bool = true
     var onCapture: (String) -> Void
 
     static let snifferJS = """
@@ -1319,17 +1356,25 @@ private struct EmbedWebView: UIViewControllerRepresentable {
     """
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onCapture: onCapture)
+        Coordinator(onCapture: onCapture, sniffing: sniffMedia)
     }
 
     func makeUIViewController(context: Context) -> EmbedHostViewController {
         // The embed surface owns the orientation lock, exactly
         // like the native one: opened here, restored in dismantle.
         OrientationHelper.setLock(.allButUpsideDown)
-        let userScript = WKUserScript(source: Self.snifferJS, injectionTime: .atDocumentStart, forMainFrameOnly: false)
         let controller = WKUserContentController()
-        controller.addUserScript(userScript)
-        controller.add(context.coordinator, name: "m3u8Interceptor")
+        // Sniffing installs the interceptor script + message
+        // handler that watch the page for a media URL. A
+        // non-sniffing embed (the operator's own player page)
+        // gets NEITHER: any URL the page loads internally —
+        // including the stream URL it plays — stays its own,
+        // and nothing can promote it to a native surface.
+        if sniffMedia {
+            let userScript = WKUserScript(source: Self.snifferJS, injectionTime: .atDocumentStart, forMainFrameOnly: false)
+            controller.addUserScript(userScript)
+            controller.add(context.coordinator, name: "m3u8Interceptor")
+        }
 
         let config = WKWebViewConfiguration()
         config.userContentController = controller
@@ -1353,7 +1398,11 @@ private struct EmbedWebView: UIViewControllerRepresentable {
     func updateUIViewController(_ controller: EmbedHostViewController, context: Context) {}
 
     static func dismantleUIViewController(_ controller: EmbedHostViewController, coordinator: Coordinator) {
-        controller.webView?.configuration.userContentController.removeScriptMessageHandler(forName: "m3u8Interceptor")
+        // Only a sniffing embed ever installed the handler;
+        // removing it is the whole teardown difference.
+        if coordinator.sniffing {
+            controller.webView?.configuration.userContentController.removeScriptMessageHandler(forName: "m3u8Interceptor")
+        }
         controller.webView?.stopLoading()
         // No orientation restore here either: promotion to the
         // native player dismantles this surface too, and the
@@ -1362,10 +1411,14 @@ private struct EmbedWebView: UIViewControllerRepresentable {
 
     final class Coordinator: NSObject, WKScriptMessageHandler {
         private let onCapture: (String) -> Void
+        /// Whether this embed installed the sniffer at all —
+        /// dismantle reads it to remove only what was installed.
+        let sniffing: Bool
         private var captured = false
 
-        init(onCapture: @escaping (String) -> Void) {
+        init(onCapture: @escaping (String) -> Void, sniffing: Bool) {
             self.onCapture = onCapture
+            self.sniffing = sniffing
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -1437,7 +1490,7 @@ struct PlaybackResolverView: View {
         case resolving
         case video(StreamInfo)
         case manga(StreamInfo)
-        case embed(URL, [String: String])
+        case embed(URL, [String: String], Bool)
         case failed(String)
     }
 
@@ -1478,8 +1531,8 @@ struct PlaybackResolverView: View {
                     initialStream: stream,
                     initialIndex: Int(activeRequest.startPosition)
                 )
-            case .embed(let url, let headers):
-                EmbedPlayerView(url: url, headers: headers) { captured in
+            case .embed(let url, let headers, let sniffMedia):
+                EmbedPlayerView(url: url, headers: headers, sniffMedia: sniffMedia) { captured in
                     // Media CDNs behind embed players (123av's family,
                     // verified by direct fetch) accept media requests
                     // only with a Referer from the embed host itself —
@@ -1682,7 +1735,7 @@ struct PlaybackResolverView: View {
             switch resolution {
             case .video(let stream): phase = .video(stream)
             case .manga(let stream): phase = .manga(stream)
-            case .embed(let url, let headers): phase = .embed(url, headers)
+            case .embed(let url, let headers, let sniffMedia): phase = .embed(url, headers, sniffMedia)
             }
         } catch {
             guard generation == resolveGeneration else { return }

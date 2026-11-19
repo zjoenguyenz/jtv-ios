@@ -11,8 +11,8 @@ settings:
     # the target override would have silently reverted the
     # app to Swift 5 mode (review-gate hygiene fix).
     SWIFT_VERSION: "6.0"
-    MARKETING_VERSION: "1.22.10"
-    CURRENT_PROJECT_VERSION: "36"
+    MARKETING_VERSION: "1.22.11"
+    CURRENT_PROJECT_VERSION: "37"
     DEVELOPMENT_TEAM: ""
 packages:
   # v1.21: KSPlayer (FFmpeg engine) for the Torrent tab's debrid
@@ -33,6 +33,7 @@ targets:
       - JTV/PluginEngine.swift
       - JTV/PluginManager.swift
       - JTV/MovieService.swift
+      - JTV/DiagLog.swift
       - JTV/Library.swift
       - JTV/Cache.swift
       - JTV/Theme.swift
@@ -66,8 +67,8 @@ targets:
       properties:
         CFBundleDisplayName: "JTV"
         CFBundleName: "JTV"
-        CFBundleShortVersionString: "1.22.10"
-        CFBundleVersion: "36"
+        CFBundleShortVersionString: "1.22.11"
+        CFBundleVersion: "37"
         UILaunchScreen: {}
         UIBackgroundModes:
           - audio

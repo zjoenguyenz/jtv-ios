@@ -209,12 +209,16 @@ final class MovieService: ObservableObject {
     /// the plugin made it. The manifest URL is a bearer
     /// credential: it lives only in UserDefaults, never logged.
     func mergeMediaFusion(pluginId: String, movieId: String, detail: MovieDetail) async -> MovieDetail {
-        guard pluginId == "torrenthub", movieId.hasPrefix("tt"),
-              let base = MediaFusion.baseURL else { return detail }
+        guard pluginId == "torrenthub", movieId.hasPrefix("tt") else { return detail }
+        // The manifest URL is a bearer credential: the log only
+        // ever learns whether one is configured (DiagLog law).
+        DiagLog.log("mediafusion", "configured=\(MediaFusion.baseURL != nil ? "yes" : "no")")
+        guard let base = MediaFusion.baseURL else { return detail }
         let url = "\(base)/stream/movie/\(movieId).json"
         guard let text = try? await Net.fetchText(url) else { return detail }
         let episodes = MediaFusion.parseStreams(text: text)
         guard !episodes.isEmpty else { return detail }
+        DiagLog.log("mediafusion", "merged streams=\(episodes.count)")
         var merged = detail
         merged.servers.append(EpisodeServer(name: "MediaFusion", episodes: episodes))
         return merged
@@ -265,9 +269,19 @@ final class MovieService: ObservableObject {
     func resolveEpisode(_ request: PlaybackRequest) async throws -> PlaybackResolution {
         let pluginId = request.pluginId
         let target = request.episode.id
-        guard !target.isEmpty else { throw MovieServiceError.unresolvedEpisode }
+        guard !target.isEmpty else {
+            DiagLog.log("resolve", "error plugin=\(pluginId) empty target")
+            throw MovieServiceError.unresolvedEpisode
+        }
+        // Log the target KIND and its redacted shape only — a
+        // signed stream URL never enters the log (DiagLog law).
+        let targetKind = target.hasPrefix("jtvhash:") ? "hash"
+            : request.isManga ? "manga"
+            : MediaURL.isDirectMedia(target) ? "direct" : "embed"
+        DiagLog.log("resolve", "start plugin=\(pluginId) kind=\(targetKind) target=\(DiagLog.urlForLog(target))")
 
         if let prefetched = consumePrefetchedEmbed(pluginId: pluginId, target: target) {
+            DiagLog.log("resolve", "route=embed via=prefetched")
             return prefetched
         }
 
@@ -277,7 +291,10 @@ final class MovieService: ObservableObject {
         if pluginId != "torrenthub", !request.knownStreamURL.isEmpty && MediaURL.isDirectMedia(request.knownStreamURL) {
             var headers = request.fallbackHeaders
             if headers.isEmpty { headers = await defaultHeaders(for: pluginId) }
-            return .video(await markProxyIfNeeded(StreamInfo(url: request.knownStreamURL, headers: headers), pluginId: pluginId))
+            let stream = await markProxyIfNeeded(StreamInfo(url: request.knownStreamURL, headers: headers), pluginId: pluginId)
+            if let fallback = await streamxxPlayerFallback(url: stream.url, headers: stream.headers) { return fallback }
+            DiagLog.log("resolve", "route=video engine=\(stream.useCompatEngine ? "ksplayer" : "avplayer") via=fast-resume url=\(DiagLog.urlForLog(stream.url))")
+            return .video(stream)
         }
 
         // Debrid torrent target (torrenthub): the episode id is an
@@ -287,6 +304,7 @@ final class MovieService: ObservableObject {
         // for the KSPlayer surface.
         if target.hasPrefix("jtvhash:") {
             let hash = String(target.dropFirst("jtvhash:".count))
+            DiagLog.log("resolve", "route=debrid")
             return .video(try await DebridResolver.resolve(hash: hash))
         }
 
@@ -294,10 +312,14 @@ final class MovieService: ObservableObject {
         if MediaURL.isDirectMedia(target) {
             var headers = request.fallbackHeaders
             if headers.isEmpty { headers = await defaultHeaders(for: pluginId) }
-            return .video(await markProxyIfNeeded(StreamInfo(url: target, headers: headers), pluginId: pluginId))
+            let stream = await markProxyIfNeeded(StreamInfo(url: target, headers: headers), pluginId: pluginId)
+            if let fallback = await streamxxPlayerFallback(url: stream.url, headers: stream.headers) { return fallback }
+            DiagLog.log("resolve", "route=video engine=\(stream.useCompatEngine ? "ksplayer" : "avplayer") via=direct url=\(DiagLog.urlForLog(stream.url))")
+            return .video(stream)
         }
 
         guard let engine = try? await engine(for: pluginId) else {
+            DiagLog.log("resolve", "error plugin=\(pluginId) plugin unavailable")
             throw MovieServiceError.pluginUnavailable
         }
 
@@ -308,8 +330,10 @@ final class MovieService: ObservableObject {
             if !stream.images.isEmpty {
                 var resolved = stream
                 if resolved.headers.isEmpty { resolved.headers = await defaultHeaders(for: pluginId) }
+                DiagLog.log("resolve", "route=manga images=\(resolved.images.count)")
                 return .manga(resolved)
             }
+            DiagLog.log("resolve", "error plugin=\(pluginId) manga chapter had no images")
             throw MovieServiceError.unresolvedEpisode
         }
 
@@ -336,6 +360,7 @@ final class MovieService: ObservableObject {
             if !step.images.isEmpty {
                 var resolved = step
                 if resolved.headers.isEmpty { resolved.headers = currentHeaders }
+                DiagLog.log("resolve", "route=manga via=embed-chain images=\(resolved.images.count)")
                 return .manga(resolved)
             }
             if !step.isEmbed || MediaURL.isDirectMedia(step.url) {
@@ -347,11 +372,15 @@ final class MovieService: ObservableObject {
                    let pageURL = URL(string: step.url) {
                     var pageHeaders = step.headers
                     if pageHeaders.isEmpty { pageHeaders = currentHeaders }
-                    return .embed(url: pageURL, headers: pageHeaders)
+                    DiagLog.log("resolve", "route=embed via=webpage url=\(DiagLog.urlForLog(step.url))")
+                    return .embed(url: pageURL, headers: pageHeaders, sniffMedia: true)
                 }
                 var resolved = step
                 if resolved.headers.isEmpty { resolved.headers = currentHeaders }
-                return .video(await markProxyIfNeeded(resolved, pluginId: pluginId))
+                let stream = await markProxyIfNeeded(resolved, pluginId: pluginId)
+                if let fallback = await streamxxPlayerFallback(url: stream.url, headers: stream.headers) { return fallback }
+                DiagLog.log("resolve", "route=video engine=\(stream.useCompatEngine ? "ksplayer" : "avplayer") via=embed-chain url=\(DiagLog.urlForLog(stream.url))")
+                return .video(stream)
             }
             // Self-embed (123av's shape): the parser points back at
             // the very page we already fetched. Refetching it changes
@@ -360,7 +389,8 @@ final class MovieService: ObservableObject {
             if step.url == currentURL, let pageURL = URL(string: step.url) {
                 var pageHeaders = step.headers
                 if pageHeaders.isEmpty { pageHeaders = currentHeaders }
-                return .embed(url: pageURL, headers: pageHeaders)
+                DiagLog.log("resolve", "route=embed via=self-embed url=\(DiagLog.urlForLog(step.url))")
+                return .embed(url: pageURL, headers: pageHeaders, sniffMedia: true)
             }
             // Follow the hop.
             lastEmbedURL = step.url
@@ -376,8 +406,46 @@ final class MovieService: ObservableObject {
         }
 
         // Last resort: open the embed in the sniffing webview.
-        guard let url = URL(string: lastEmbedURL) else { throw MovieServiceError.unresolvedEpisode }
-        return .embed(url: url, headers: await defaultHeaders(for: pluginId))
+        guard let url = URL(string: lastEmbedURL) else {
+            DiagLog.log("resolve", "error plugin=\(pluginId) unresolved episode")
+            throw MovieServiceError.unresolvedEpisode
+        }
+        DiagLog.log("resolve", "route=embed via=last-resort url=\(DiagLog.urlForLog(lastEmbedURL))")
+        return .embed(url: url, headers: await defaultHeaders(for: pluginId), sniffMedia: true)
+    }
+
+    /// streamxx route decision (v1.22.11): the operator's newer
+    /// uploads have NO HLS backup in the segment store, and the
+    /// progressive MP4 served at their /main.m3u8 address has
+    /// corrupt sample tables — measured with FFmpeg 8.1, which
+    /// cannot decode a single frame ("missing mandatory atoms,
+    /// broken header", "contradictionary STSC and STCO"), so no
+    /// native or compat engine on the phone can play them either
+    /// (the v1.22.10 KSPlayer flagging failed on the owner's
+    /// device for exactly this reason). The operator's own web
+    /// player at embed.streamxx.net/player/<id> DOES play the
+    /// same titles (browser-verified), so a backup-less streamxx
+    /// stream is handed to the webview on that player page
+    /// instead of to a video surface. The hand-off is
+    /// NON-SNIFFING (sniffMedia: false, round-2 review M-1):
+    /// the player page loads the same broken /main.m3u8
+    /// internally, and the webview's media sniffer would
+    /// capture that URL and promote it to a native surface —
+    /// which cannot play it — defeating the route. Left alone,
+    /// the page's own player plays it in-page exactly as it
+    /// does in a browser. A stream WITH a backup keeps the
+    /// synthesis path: this helper returns nil and the caller
+    /// proceeds to .video untouched. Never throws; any
+    /// doubt → nil.
+    private func streamxxPlayerFallback(url: String, headers: [String: String]) async -> PlaybackResolution? {
+        guard let u = URL(string: url), let streamID = PlaylistSynthesizer.streamxxID(from: u) else { return nil }
+        if await PlaylistSynthesizer.backupExists(streamID: streamID) {
+            DiagLog.log("resolve", "streamxx id=\(streamID) backup=yes -> synthesis path")
+            return nil
+        }
+        guard let playerURL = URL(string: "https://embed.streamxx.net/player/\(streamID)") else { return nil }
+        DiagLog.log("resolve", "streamxx id=\(streamID) backup=no route=embed-player sniff=off url=\(DiagLog.urlForLog(playerURL.absoluteString))")
+        return .embed(url: playerURL, headers: headers, sniffMedia: false)
     }
 
     /// Some playlists route their segments through a throwaway
@@ -413,29 +481,18 @@ final class MovieService: ObservableObject {
             marked.requiresProxy = true
             return marked
         }
-        // streamxx delivery probe (2026-11-18): the operator's
-        // newer uploads are a progressive MP4 served AT the
-        // /main.m3u8 address (content-type video/mp4, range
-        // requests honored), with no HLS backup in the segment
-        // store. Synthesis declines those (segment 0 is a 404)
-        // and the HLS transports then stall ~30 s on a file that
-        // was never a playlist — the dead tap the owner reported.
-        // Pick the path by measurement instead: backup present →
-        // today's synthesis path, untouched (the proxy verdict
-        // below never affected streamxx playback — synthesis
-        // outranks the proxy ladder — and its full-body fetch is
-        // pure cost here, worst on the MP4 titles where it pulls
-        // the movie down as "text"); backup missing + the origin
-        // answers as a media file → the compat engine, which
-        // sniffs the real container. Any probe doubt → the
-        // stream passes through unchanged.
-        if let url = URL(string: stream.url), let id = PlaylistSynthesizer.streamxxID(from: url) {
-            if await PlaylistSynthesizer.backupExists(streamID: id) { return stream }
-            if await Self.originServesProgressiveFile(url, headers: stream.headers) {
-                var direct = stream
-                direct.useCompatEngine = true
-                return direct
-            }
+        // streamxx URLs return untouched (v1.22.11): their route
+        // decision — synthesis when a backup exists, the
+        // operator's web player when none does — is made by
+        // streamxxPlayerFallback in resolveEpisode, BEFORE the
+        // stream reaches a video surface. What must never happen
+        // here is the generic __hls_proxy probe below: it
+        // downloads the whole body as text to grep for the
+        // wrapper, which on streamxx's newer uploads means
+        // pulling a ~100 MB progressive MP4 down as "text" on
+        // every tap — and the verdict never affected streamxx
+        // playback anyway (synthesis outranks the proxy ladder).
+        if let url = URL(string: stream.url), PlaylistSynthesizer.streamxxID(from: url) != nil {
             return stream
         }
         guard stream.url.lowercased().contains(".m3u8") else { return stream }
@@ -458,29 +515,6 @@ final class MovieService: ObservableObject {
         var marked = stream
         marked.requiresProxy = true
         return marked
-    }
-
-    /// Range-probes a URL's first bytes: true when the origin
-    /// answers with a media file (MP4 family) rather than a
-    /// playlist. Only ever called on embed.streamxx.net URLs,
-    /// whose server honors Range (measured 206). Any doubt →
-    /// false, and today's path carries on unchanged.
-    private static func originServesProgressiveFile(_ url: URL, headers: [String: String]) async -> Bool {
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 10
-        for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
-        // Set AFTER the caller's headers: a stray Range in them
-        // must not widen the probe (gate MINOR, 2026-11-18).
-        req.setValue("bytes=0-15", forHTTPHeaderField: "Range")
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
-              let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return false }
-        if let mime = http.mimeType, mime.hasPrefix("video/") { return true }
-        // ftyp box at bytes 4-7 (isom / mp42 / avc1 …): a media
-        // file whatever the label says. A playlist starts '#'.
-        guard data.count >= 8 else { return false }
-        let head = [UInt8](data.prefix(16))
-        if head[0] == 0x23 { return false }
-        return head[4] == 0x66 && head[5] == 0x74 && head[6] == 0x79 && head[7] == 0x70
     }
 
     /// Resolves one manga chapter (used by the reader's prev/next).

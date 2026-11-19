@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct SettingsView: View {
     @EnvironmentObject private var plugins: PluginManager
@@ -6,6 +7,9 @@ struct SettingsView: View {
     @State private var newSourceURL = ""
     @State private var showAdultConfirm = false
     @State private var addError: String?
+    @State private var showingLogShare = false
+    @State private var logFileURL: URL?
+    @State private var showLogExportError = false
 
     // Debrid tokens for the Torrent tab — the same UserDefaults
     // keys DebridTokens reads (a Settings value wins over the
@@ -31,6 +35,7 @@ struct SettingsView: View {
                     activePluginSection
                     pluginTogglesSection
                     contentSection
+                    diagnosticsSection
                     torrentSection
                     aboutSection
                 }
@@ -39,11 +44,19 @@ struct SettingsView: View {
             }
             .navigationTitle("Cài đặt")
             .navigationBarTitleDisplayMode(.large)
+            .sheet(isPresented: $showingLogShare) {
+                if let logFileURL {
+                    LogShareSheet(url: logFileURL)
+                }
+            }
             .alert("Bật nội dung 18+?", isPresented: $showAdultConfirm) {
                 Button("Huỷ", role: .cancel) {}
                 Button("Bật") { plugins.adultEnabled = true }
             } message: {
                 Text("Các nguồn plugin 18+ sẽ hiện trong app. Bạn có thể tắt lại bất cứ lúc nào.")
+            }
+            .alert("Không ghi được file log. Thử lại sau.", isPresented: $showLogExportError) {
+                Button("Đóng", role: .cancel) {}
             }
         }
     }
@@ -235,6 +248,44 @@ struct SettingsView: View {
         .listRowBackground(Theme.glassFill)
     }
 
+    // MARK: - Diagnostics (LOG RETRIEVAL LAW)
+
+    /// Exports the in-app diagnostic log (DiagLog) as a text
+    /// file through the share sheet, so a fault can be reported
+    /// with its evidence attached instead of described from
+    /// memory. The log never contains tokens or signed links —
+    /// see DiagLog's redaction rule.
+    private var diagnosticsSection: some View {
+        Section {
+            Button {
+                // Logged BEFORE the export is generated, so the
+                // export itself records that it was requested.
+                DiagLog.log("settings", "log export requested")
+                let url = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("jtv-log.txt")
+                do {
+                    try DiagLog.exportText().write(to: url, atomically: true, encoding: .utf8)
+                    logFileURL = url
+                    showingLogShare = true
+                } catch {
+                    DiagLog.log("settings", "log export write failed: \(error.localizedDescription)")
+                    // Never fail silently: the owner asked for
+                    // the log precisely because something is
+                    // already wrong — a dead button here would
+                    // look like the app ignoring him.
+                    showLogExportError = true
+                }
+            } label: {
+                Label("Gửi log chẩn đoán", systemImage: "doc.text.magnifyingglass")
+            }
+        } header: {
+            Text("Chẩn đoán")
+        } footer: {
+            Text("Khi app gặp lỗi, gửi file log này về để sửa đúng chỗ. Log chỉ ghi các bước xử lý và lỗi — không chứa token hay link đã ký.")
+        }
+        .listRowBackground(Theme.glassFill)
+    }
+
     // MARK: - Torrent (debrid tokens)
 
     private var torrentSection: some View {
@@ -297,5 +348,38 @@ struct SettingsView: View {
             Text("Giới thiệu")
         }
         .listRowBackground(Theme.glassFill)
+    }
+}
+
+/// Share sheet for the exported log file — the codebase's
+/// established UIViewControllerRepresentable pattern (the same
+/// shape as the player surfaces).
+private struct LogShareSheet: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        let controller = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        anchorPopover(controller)
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {
+        anchorPopover(uiViewController)
+    }
+
+    /// On iPad the activity controller presents as a popover,
+    /// which crashes without an anchor — the same reason the
+    /// player's action sheets set a sourceView/sourceRect
+    /// (PlayerView's showSourceList). A SwiftUI sheet has no
+    /// UIKit button to anchor to, so the controller's own view
+    /// is the anchor; called again from update, once the view
+    /// has real bounds.
+    private func anchorPopover(_ controller: UIActivityViewController) {
+        guard let pop = controller.popoverPresentationController else { return }
+        pop.sourceView = controller.view
+        pop.sourceRect = CGRect(x: controller.view.bounds.midX,
+                                y: controller.view.bounds.midY,
+                                width: 0, height: 0)
+        pop.permittedArrowDirections = []
     }
 }

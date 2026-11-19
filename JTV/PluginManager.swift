@@ -313,6 +313,7 @@ final class PluginManager: ObservableObject {
         isSyncing = true
         if !silent { lastSyncError = nil }
         defer { isSyncing = false }
+        DiagLog.log("sync", "start sources=\(sources.count) silent=\(silent)")
 
         var errors: [String] = []
         var newInstalled: [InstalledPlugin] = []
@@ -330,6 +331,7 @@ final class PluginManager: ObservableObject {
                 anyChanged = anyChanged || synced.changed
                 authoritative[source.url] = synced.remoteIds
             } catch {
+                DiagLog.log("sync", "source failed host=\(URL(string: source.url)?.host ?? "?") error=\(error.localizedDescription)")
                 if (error as? URLError)?.code == .badServerResponse {
                     // 404/403 from the raw host — for the owner's own
                     // repo this almost always means it is still private.
@@ -382,6 +384,7 @@ final class PluginManager: ObservableObject {
         }
         persist()
         if anyChanged { syncGeneration += 1 }
+        DiagLog.log("sync", "done installed=\(installed.count) sources ok=\(authoritative.count)/\(newSources.count) errors=\(errors.count) purged=\(purgedIds.count) changed=\(anyChanged)")
         if !silent && !errors.isEmpty {
             lastSyncError = errors.joined(separator: "\n")
         }
@@ -428,6 +431,8 @@ final class PluginManager: ObservableObject {
 
         var result: [InstalledPlugin] = []
         var changed = false
+        var updatedCount = 0
+        var failedCount = 0
         for entry in file.plugins where !entry.id.isEmpty && !entry.scriptUrl.isEmpty {
             let existing = installed.first { $0.id == entry.id }
             let fileURL = scriptFileURL(for: entry.id)
@@ -464,6 +469,8 @@ final class PluginManager: ObservableObject {
                 await engine.load(script: script)
                 guard var manifest = await engine.manifest(),
                       manifest.id == entry.id else {
+                    failedCount += 1
+                    DiagLog.log("sync", "plugin update failed id=\(entry.id) reason=manifest mismatch")
                     if let existing { result.append(existing) }
                     continue
                 }
@@ -493,14 +500,19 @@ final class PluginManager: ObservableObject {
                 manifest.scriptUrl = entry.scriptUrl
                 // A plugin that arrived via sync keeps the bundled
                 // floor: mark it with the source that delivered it.
+                updatedCount += 1
+                DiagLog.log("sync", "plugin updated id=\(entry.id) v\(manifest.version)")
                 result.append(InstalledPlugin(manifest: manifest, sourceURL: urlString))
                 changed = true
             } catch {
                 // Keep the working copy; one bad entry must not fail
                 // the whole source's other updates.
+                failedCount += 1
+                DiagLog.log("sync", "plugin update failed id=\(entry.id) error=\(error.localizedDescription)")
                 if let existing { result.append(existing) }
             }
         }
+        DiagLog.log("sync", "source done host=\(URL(string: urlString)?.host ?? "?") plugins=\(result.count) updated=\(updatedCount) failed=\(failedCount)")
         return (result, changed, remoteIds)
     }
 

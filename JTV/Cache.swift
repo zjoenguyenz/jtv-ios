@@ -627,6 +627,10 @@ final class ImageCacheManager: @unchecked Sendable {
         await WebFetcher.ensureClearance(for: url)
         if let data = (await direct()).data { return data }
         if let data = await WebFetcher.fetchImageData(url: url, headers: hdrs) { return data }
+        // The whole ladder failed: log the HOST only (DiagLog
+        // law — never the signed/full URL) so a dead image host
+        // is diagnosable from the exported log.
+        DiagLog.log("image", "fallback ladder failed host=\(url.host ?? "?")")
         lock.withLock { _ = fallbackFailed.insert(cacheKey) }
         return nil
     }
