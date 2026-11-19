@@ -32,9 +32,9 @@ function getManifest() {
     return JSON.stringify({
         "id": "torrenthub",
         "name": "Torrent 18+",
-        "version": "1.0.5",
+        "version": "1.0.6",
         "baseUrl": "https://addon.debrid.in",
-        "iconUrl": "",
+        "iconUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/icons/mod14.png",
         "isEnabled": true,
         "isAdult": true,
         "type": "VIDEO",

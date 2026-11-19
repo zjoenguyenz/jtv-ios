@@ -1,5 +1,5 @@
 // =============================================================================
-// Sextop1 v2.0.1 — rewritten 2026-11-14 for the site's new home
+// Sextop1 v2.0.2 — rewritten 2026-11-14 for the site's new home
 // sextop1.cash (WordPress "top1tube" theme). The old vnsextop1.com
 // markup is gone entirely; this parser targets the new theme.
 // Playback: watch page carries a post id (.mb-screen data-id);
@@ -14,7 +14,7 @@ function getManifest() {
         "name": "Sextop1",
         "version": "2.0.1",
         "baseUrl": "https://sextop1.cash",
-        "iconUrl": "https://raw.githubusercontent.com/youngbi/repo/main/plugins/sextop1.webp",
+        "iconUrl": "https://sextop1.cash/favicon.ico",
         "isEnabled": true,
         "isAdult": true,
         "type": "VIDEO",

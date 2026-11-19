@@ -6,9 +6,9 @@ function getManifest() {
     return JSON.stringify({
         "id": "topxx",
         "name": "TopXX",
-        "version": "1.0.1",
+        "version": "1.0.2",
         "baseUrl": "https://topxx.vip",
-        "iconUrl": "https://topxx.vip/favicon.ico",
+        "iconUrl": "https://topxx.vip/assets/images/header/logo.png",
         "isEnabled": true,
         "isAdult": true,
         "layoutType": "HORIZONTAL",
