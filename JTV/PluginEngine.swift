@@ -35,16 +35,28 @@ final class PluginEngine: @unchecked Sendable {
 
     // MARK: - Lifecycle
 
-    func load(script: String) async {
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+    /// v1.22.15: returns true iff evaluating the script raised no
+    /// exception. The captured exception is routed to DiagLog
+    /// before returning — load failures used to be invisible
+    /// (the exception sat in `lastException` and the engine was
+    /// cached anyway), so a broken plugin looked exactly like an
+    /// empty one in the log.
+    @discardableResult
+    func load(script: String) async -> Bool {
+        await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
             queue.async {
                 let ctx = JSContext()
                 ctx?.exceptionHandler = { [weak self] _, exc in
                     self?.lastException = exc?.toString() ?? "unknown"
                 }
+                self.lastException = nil
                 ctx?.evaluateScript(script)
+                let exc = self.lastException
                 self.context = ctx
-                cont.resume()
+                if let exc {
+                    DiagLog.log("plugin", "id=\(self.pluginIdHint) fn=load js-exception: \(exc)")
+                }
+                cont.resume(returning: exc == nil)
             }
         }
     }
@@ -75,7 +87,15 @@ final class PluginEngine: @unchecked Sendable {
     }
 
     /// Calls a JS function with string arguments; returns its string result.
+    /// v1.22.15: this is the choke point every contract call flows
+    /// through, so it emits ONE DiagLog line per call carrying the
+    /// elapsed time and the outcome — ok, exception (with the
+    /// captured exception string, which the `try?` layer above
+    /// would otherwise flatten into an empty default), or
+    /// unavailable (context or function missing). The throws are
+    /// exactly as before; only the logging is new.
     private func callString(_ function: String, args: [String]) async throws -> String {
+        let started = Date()
         let result: String? = await run { ctx in
             guard let ctx else { return nil }
             self.lastException = nil
@@ -85,21 +105,35 @@ final class PluginEngine: @unchecked Sendable {
             if let exc = self.lastException { return "\u{1}EXC:\(exc)" }
             return value?.toString() ?? ""
         }
-        guard let result else { throw PluginEngineError.notLoaded }
-        if result.hasPrefix("\u{1}EXC:") {
-            throw PluginEngineError.jsException(String(result.dropFirst(5)))
+        let ms = Int(Date().timeIntervalSince(started) * 1000)
+        guard let result else {
+            DiagLog.log("plugin", "id=\(pluginIdHint) fn=\(function) ms=\(ms) outcome=unavailable")
+            throw PluginEngineError.notLoaded
         }
+        if result.hasPrefix("\u{1}EXC:") {
+            let exc = String(result.dropFirst(5))
+            DiagLog.log("plugin", "id=\(pluginIdHint) fn=\(function) ms=\(ms) outcome=exception js-exception: \(exc)")
+            throw PluginEngineError.jsException(exc)
+        }
+        DiagLog.log("plugin", "id=\(pluginIdHint) fn=\(function) ms=\(ms) outcome=ok")
         return result
     }
 
     private func decode<T: Decodable>(_ type: T.Type, from json: String, function: String) throws -> T {
         let trimmed = json.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let data = trimmed.data(using: .utf8), !trimmed.isEmpty else {
+            // v1.22.15: the failure kind reaches DiagLog before the
+            // `try?` layer flattens it; the thrown error is unchanged.
+            DiagLog.log("plugin", "id=\(pluginIdHint) fn=\(function) decode-failed")
             throw PluginEngineError.badResult(function)
         }
         do {
             return try JSONDecoder().decode(T.self, from: data)
         } catch {
+            // v1.22.15: kind only in the log — the DecodingError's
+            // description stays in the thrown error for callers,
+            // exactly as before, but is not written to the log.
+            DiagLog.log("plugin", "id=\(pluginIdHint) fn=\(function) decode-failed")
             throw PluginEngineError.badResult("\(function): \(error.localizedDescription)")
         }
     }

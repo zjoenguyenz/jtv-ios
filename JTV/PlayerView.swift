@@ -114,8 +114,8 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         controller.currentSourceId = currentSourceId
         controller.onSwitchSource = onSwitchSource
         controller.onClose = onClose
-        context.coordinator.onGiveUp = { [weak controller] message in
-            controller?.showError(message: message)
+        context.coordinator.onGiveUp = { [weak controller] message, logKind in
+            controller?.showError(message: message, logKind: logKind)
         }
         if PlaylistSynthesizer.streamxxID(from: url) != nil {
             // streamxx streams never need their origin host:
@@ -139,6 +139,11 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         coordinator.reportExit()
         coordinator.observer.map { coordinator.player?.removeTimeObserver($0) }
         coordinator.observer = nil
+        // v1.22.15 (C-2): the status KVO and the NotificationCenter
+        // observers are torn down with the periodic observer —
+        // statusObservation is private to the Coordinator, so the
+        // removal lives on it (teardownObservers()).
+        coordinator.teardownObservers()
         coordinator.player?.pause()
         // No orientation restore here: the resolver screen owns it
         // (its onDisappear is the one signal that always means the
@@ -159,6 +164,28 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         /// doubled stall budgets). Set by the surface at creation.
         var patientMode = false
         private var didSeek = false
+        /// v1.22.15 (C-1): the automatic start is gated on the
+        /// current item's .readyToPlay — seekAndPlay() only
+        /// records the intent here; the start itself is performed
+        /// by handleReadyToPlay(_:) once the item reports ready.
+        /// Reset per item in observe(item:).
+        private var startRequested = false
+        /// v1.22.15 (D-1): the owner's subtitle default is applied
+        /// exactly once per item (in the same ready handling as
+        /// C-1's gated start), so a later manual track change in
+        /// the player UI is never overridden. Reset per item in
+        /// observe(item:).
+        private var didApplySubtitleDefault = false
+        /// v1.22.15 (C-2): token-based NotificationCenter
+        /// observers, registered once in init and removed in
+        /// teardownObservers() — registrations and removals match
+        /// exactly, and item swaps never re-register them.
+        private var interruptionObserver: NSObjectProtocol?
+        private var itemEndObserver: NSObjectProtocol?
+        /// v1.22.15 (C-2): whether playback was running when an
+        /// audio-session interruption began — the ended handler
+        /// resumes only if this is set (and the system asks).
+        private var wasPlayingBeforeInterruption = false
         private let onProgress: (Double, Double) -> Void
         private let onExit: (Double, Double) -> Void
 
@@ -190,7 +217,12 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         // reset by armStallTimer before each new timer).
         private var lastStallTime = -1.0
         private var lastBufferedEnd = -1.0
-        var onGiveUp: ((String?) -> Void)?
+        /// v1.22.15 (B-4 part ii): the give-up hand-off carries the
+        /// screen message AND a separate log kind — the message
+        /// may be raw NSError text (lastErrorText()) and is for
+        /// the error label only; the kind (the error's
+        /// domain#code) is the only part that may reach DiagLog.
+        var onGiveUp: ((String?, String?) -> Void)?
         private var didMaterialize = false
 
         // v1.22 mid-playback self-heal: a stream that dies AFTER
@@ -326,12 +358,115 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
             player?.currentItem?.error?.localizedDescription
         }
 
+        /// v1.22.15 (B-4 part ii): the current item error's
+        /// domain#code — the log-safe companion to
+        /// lastErrorText() above, whose raw text is shown on the
+        /// error label but must never reach a DiagLog line.
+        private func lastErrorKind() -> String? {
+            guard let itemError = player?.currentItem?.error else { return nil }
+            let error = itemError as NSError
+            return "\(error.domain)#\(error.code)"
+        }
+
         init(onProgress: @escaping (Double, Double) -> Void, onExit: @escaping (Double, Double) -> Void) {
             self.onProgress = onProgress
             self.onExit = onExit
+            // v1.22.15 (C-2): the interruption and end-of-item
+            // observers are registered ONCE, here — never per
+            // item — and removed in teardownObservers(). Both
+            // use queue: .main, so their blocks provably run on
+            // the main actor (the same sanctioned shape as the
+            // periodic time observer in makeUIViewController).
+            interruptionObserver = NotificationCenter.default.addObserver(
+                forName: AVAudioSession.interruptionNotification, object: nil, queue: .main
+            ) { [weak self] notification in
+                MainActor.assumeIsolated { self?.handleInterruption(notification) }
+            }
+            itemEndObserver = NotificationCenter.default.addObserver(
+                forName: .AVPlayerItemDidPlayToEndTime, object: nil, queue: .main
+            ) { [weak self] notification in
+                MainActor.assumeIsolated { self?.handleItemEnded(notification) }
+            }
+        }
+
+        /// v1.22.15 (C-2): removes every observer this coordinator
+        /// added — the status KVO is invalidated and the two
+        /// NotificationCenter tokens from init are removed.
+        /// Called from dismantleUIViewController alongside the
+        /// periodic time observer's removal. Invalidation and
+        /// token removal are idempotent, so a second call (or a
+        /// call after observe(item:) already invalidated the
+        /// KVO) is a no-op.
+        func teardownObservers() {
+            statusObservation?.invalidate()
+            statusObservation = nil
+            if let interruptionObserver {
+                NotificationCenter.default.removeObserver(interruptionObserver)
+                self.interruptionObserver = nil
+            }
+            if let itemEndObserver {
+                NotificationCenter.default.removeObserver(itemEndObserver)
+                self.itemEndObserver = nil
+            }
+        }
+
+        /// v1.22.15 (C-2): an audio-session interruption (a call,
+        /// Siri) pauses playback it interrupted; when it ends,
+        /// playback resumes only if the system says it should
+        /// (.shouldResume), it had been playing, and the current
+        /// item is ready — the same readiness the gated start
+        /// waits for. The remembered flag is consumed either way.
+        private func handleInterruption(_ notification: Notification) {
+            guard let typeValue = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  let type = AVAudioSession.InterruptionType(rawValue: typeValue) else { return }
+            switch type {
+            case .began:
+                let wasPlaying = player?.timeControlStatus == .playing
+                wasPlayingBeforeInterruption = wasPlaying
+                if wasPlaying { player?.pause() }
+                DiagLog.log("player-av", "interruption kind=interruption-began")
+            case .ended:
+                DiagLog.log("player-av", "interruption kind=interruption-ended")
+                let optionsValue = notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+                let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
+                let wasPlaying = wasPlayingBeforeInterruption
+                wasPlayingBeforeInterruption = false
+                if options.contains(.shouldResume), wasPlaying,
+                   player?.currentItem?.status == .readyToPlay {
+                    player?.play()
+                }
+            default:
+                break
+            }
+        }
+
+        /// v1.22.15 (C-2): the current item played to its end —
+        /// log it and make one final progress report (the
+        /// periodic observer's next tick may never come), so the
+        /// saved position lands at the item's end. The identity
+        /// check keeps a stale item's end (an in-flight swap)
+        /// from reporting against the new item.
+        private func handleItemEnded(_ notification: Notification) {
+            guard let item = notification.object as? AVPlayerItem,
+                  player?.currentItem === item else { return }
+            DiagLog.log("player-av", "item ended")
+            let (c, d) = times()
+            onProgress(c, d)
         }
 
         func observe(item: AVPlayerItem) {
+            // v1.22.15 (C-2): the previous item's status KVO is
+            // invalidated BEFORE the new one is assigned — a swap
+            // must never leave two live observations behind.
+            statusObservation?.invalidate()
+            // v1.22.15 (C-1/D-1): per-item state resets on EVERY
+            // item this funnel sees (the initial item and every
+            // ladder/recovery swap alike): the new item has not
+            // been seeked, no start is pending for it yet, and
+            // its subtitle default has not been applied.
+            startRequested = false
+            didSeek = false
+            didApplySubtitleDefault = false
             // v1.22: explicit forward buffer on EVERY item (the
             // initial one and every ladder/recovery swap).
             // v1.22.4: torrent files hold 30 s ahead — a debrid CDN
@@ -343,10 +478,21 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
                 // status VALUE here, then hop with only a weak
                 // recapture — sending the guard-unwrapped strong
                 // `self` into the task was build #43's line-330
-                // error.
-                let failed = item.status == .failed
-                guard failed else { return }
-                Task { @MainActor [weak self] in self?.handleFailure() }
+                // error. The same reduction covers the new
+                // .readyToPlay branch (v1.22.15, C-1): only the
+                // status value crosses; the item itself is
+                // re-read as the player's current item on the
+                // main actor.
+                let status = item.status
+                guard status == .failed || status == .readyToPlay else { return }
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    if status == .failed {
+                        self.handleFailure()
+                    } else if let current = self.player?.currentItem, current.status == .readyToPlay {
+                        self.handleReadyToPlay(current)
+                    }
+                }
             }
             armStallTimer(for: item)
         }
@@ -451,12 +597,12 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
                     fallBackToPlain()
                     return
                 }
-                onGiveUp?(lastErrorText())
+                onGiveUp?(lastErrorText(), lastErrorKind())
                 return
             }
             if hasPlayed, beginRecovery() { return }
             if transportSwitched {
-                onGiveUp?(lastErrorText())
+                onGiveUp?(lastErrorText(), lastErrorKind())
                 return
             }
             transportSwitched = true
@@ -517,7 +663,7 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
             // Last rung: a completely fresh resolve of the episode.
             guard let provider = freshStreamProvider else {
                 isRecovering = false
-                onGiveUp?(lastErrorText())
+                onGiveUp?(lastErrorText(), lastErrorKind())
                 return
             }
             // Swift 6: single @MainActor task (see the recovery
@@ -527,7 +673,7 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
                 guard let self else { return }
                 self.isRecovering = false
                 guard let fresh, let freshURL = fresh.streamURL, !fresh.useCompatEngine else {
-                    self.onGiveUp?(self.lastErrorText())
+                    self.onGiveUp?(self.lastErrorText(), self.lastErrorKind())
                     return
                 }
                 self.sourceURL = freshURL
@@ -574,16 +720,93 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
             seekAndPlay()
         }
 
+        /// v1.22.15 (C-1): the automatic start is GATED on the
+        /// current item's .readyToPlay. This records the start
+        /// intent only; the start itself is performed by
+        /// handleReadyToPlay(_:) — immediately, if the current
+        /// item is already ready, otherwise from the status
+        /// observation's .readyToPlay branch when it reports
+        /// ready. All existing callers keep calling this
+        /// unchanged; user-initiated play/pause (the control
+        /// layer's toggle, the remote commands) never comes
+        /// through here and is NOT gated.
         func seekAndPlay() {
-            guard let player else { return }
-            if startPosition > 10, !didSeek {
+            startRequested = true
+            if let item = player?.currentItem, item.status == .readyToPlay {
+                handleReadyToPlay(item)
+            }
+        }
+
+        /// The ready handling C-1 and D-1 share: the item has
+        /// reported .readyToPlay, so apply the subtitle default
+        /// (once per item, D-1) and then perform any pending
+        /// gated start (C-1). A readiness report for an item
+        /// that is no longer current performs nothing.
+        private func handleReadyToPlay(_ item: AVPlayerItem) {
+            guard player?.currentItem === item else { return }
+            applySubtitleDefaultIfNeeded(for: item)
+            guard startRequested, let player else { return }
+            startRequested = false
+            // Resume rule (shared with KSPlayerView): seek once
+            // when the surface first reports ready, only if
+            // startPosition > 5; exact (zero-tolerance) seek;
+            // play only from a finished seek completion.
+            // (v1.22.15, C-3: the threshold was > 10 and the
+            // after-tolerance 5 s, and the completion played
+            // unconditionally — an interrupted seek could play
+            // from wherever it landed.)
+            if startPosition > 5, !didSeek {
                 didSeek = true
                 let target = CMTime(seconds: startPosition, preferredTimescale: 600)
-                player.seek(to: target, toleranceBefore: .zero, toleranceAfter: CMTime(seconds: 5, preferredTimescale: 600)) { _ in
+                player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { finished in
+                    guard finished else { return }
                     player.play()
                 }
             } else {
                 player.play()
+            }
+        }
+
+        /// v1.22.15 (D-1): the owner's subtitle default, applied
+        /// once per item from the ready handling: Vietnamese if
+        /// the item's legible group offers it, otherwise
+        /// English, otherwise NO selection change. Matching
+        /// accepts language codes (vi/vie/vnm, en/eng), BCP 47
+        /// tags with the vi/en prefix, and display names
+        /// ("vietnam"/"việt", "english") — sources name their
+        /// tracks all three ways, and the rule falls through to
+        /// none rather than guessing. The log carries the kind
+        /// only, never a track name. Audio selection is not
+        /// touched.
+        private func applySubtitleDefaultIfNeeded(for item: AVPlayerItem) {
+            guard !didApplySubtitleDefault else { return }
+            didApplySubtitleDefault = true
+            guard let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .legible) else {
+                DiagLog.log("player-av", "subtitle selected=none-available")
+                return
+            }
+            func isVietnamese(_ option: AVMediaSelectionOption) -> Bool {
+                let code = option.locale?.language.languageCode?.identifier.lowercased() ?? ""
+                let tag = option.extendedLanguageTag?.lowercased() ?? ""
+                let name = option.displayName.lowercased()
+                return ["vi", "vie", "vnm"].contains(code) || tag.hasPrefix("vi")
+                    || name.contains("vietnam") || name.contains("việt")
+            }
+            func isEnglish(_ option: AVMediaSelectionOption) -> Bool {
+                let code = option.locale?.language.languageCode?.identifier.lowercased() ?? ""
+                let tag = option.extendedLanguageTag?.lowercased() ?? ""
+                let name = option.displayName.lowercased()
+                return ["en", "eng"].contains(code) || tag.hasPrefix("en")
+                    || name.contains("english")
+            }
+            if let vietnamese = group.options.first(where: isVietnamese) {
+                item.select(vietnamese, in: group)
+                DiagLog.log("player-av", "subtitle selected=vi")
+            } else if let english = group.options.first(where: isEnglish) {
+                item.select(english, in: group)
+                DiagLog.log("player-av", "subtitle selected=en")
+            } else {
+                DiagLog.log("player-av", "subtitle selected=none-available")
             }
         }
 
@@ -727,9 +950,15 @@ final class PlayerSurfaceViewController: UIViewController {
         // background mode in the bundle) keeps the sound running
         // when the screen locks or the app is backgrounded; PiP
         // floats the video when the user swipes home.
-        let audioSession = AVAudioSession.sharedInstance()
-        try? audioSession.setCategory(.playback, mode: .moviePlayback)
-        try? audioSession.setActive(true)
+        AudioSession.configureForPlayback()
+        // v1.22.15 (C-5) contract: PiP exists only on this
+        // surface and is lost on a source or surface switch by
+        // construction — the controller is built here, per
+        // surface instance, from this surface's own player
+        // layer, and a switch builds a new surface (with a new
+        // controller) rather than carrying PiP across. No
+        // routing changes that; a failed PiP START, however,
+        // now reaches DiagLog via the delegate below.
         if AVPictureInPictureController.isPictureInPictureSupported() {
             let pip = AVPictureInPictureController(playerLayer: videoView.playerLayer)
             pip?.delegate = self
@@ -959,7 +1188,15 @@ final class PlayerSurfaceViewController: UIViewController {
     /// say so — and keep a close button on screen while saying
     /// it (v1.22.11: the in-controls button hides together with
     /// controlsView, so the root-view error button takes over).
-    func showError(message: String? = nil) {
+    /// v1.22.15 (B-4 part ii): `logKind` is the log-safe
+    /// companion to `message` — where the message originates
+    /// from an NSError, the caller passes that error's
+    /// domain#code as the kind; where it is an app-generated
+    /// literal, an app-defined kind. The label below keeps the
+    /// plain-language message exactly as before; the log line
+    /// carries the kind ONLY, so no raw error text can reach
+    /// DiagLog through this path.
+    func showError(message: String? = nil, logKind: String? = nil) {
         gaveUp = true
         spinner.stopAnimating()
         controlsView.isHidden = true
@@ -973,7 +1210,7 @@ final class PlayerSurfaceViewController: UIViewController {
         }
         errorLabel.isHidden = false
         errorCloseButton.isHidden = false
-        DiagLog.log("player-av", "error shown: \(message ?? "unknown")")
+        DiagLog.log("player-av", "error shown kind=\(logKind ?? "unknown")")
     }
 
     private func refreshUI() {
@@ -1110,8 +1347,14 @@ final class PlayerSurfaceViewController: UIViewController {
     private func skip(by delta: Double) {
         guard let player else { return }
         let target = max(0, player.currentTime().seconds + delta)
-        player.seek(to: CMTime(seconds: target, preferredTimescale: 600)) { [weak self] _ in
-            guard let self, !self.userPaused else { return }
+        // v1.22.15 (C-3, second cited site): this is the ±10 s
+        // SKIP seek — not a resume seek — so its tolerances stay
+        // exactly as they were (skip behaviour unchanged); only
+        // the completion now honours its `finished` flag before
+        // playing, so a skip superseded by another seek does not
+        // play from the wrong place.
+        player.seek(to: CMTime(seconds: target, preferredTimescale: 600)) { [weak self] finished in
+            guard let self, finished, !self.userPaused else { return }
             self.player?.play()
         }
         scheduleControlsHide()
@@ -1160,6 +1403,15 @@ extension PlayerSurfaceViewController: AVPictureInPictureControllerDelegate {
         // The player UI never left the hierarchy — PiP floated
         // above it — so restoring is just confirming.
         completionHandler(true)
+    }
+
+    // v1.22.15 (C-5): a failed PiP start used to be invisible —
+    // the one delegate method above was the only one this
+    // surface implemented. Same nonisolated witness shape; the
+    // body only logs, and (per B-4) it logs the error's
+    // domain#code kind, never its raw text.
+    nonisolated func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, failedToStartPictureInPictureWithError error: Error) {
+        DiagLog.log("player-av", "pip failed kind=\((error as NSError).domain)#\((error as NSError).code)")
     }
 }
 

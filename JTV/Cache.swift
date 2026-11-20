@@ -353,13 +353,22 @@ final class WebFetcher: NSObject, WKNavigationDelegate {
     }
 
     private func fetchBytes(url: URL, headers: [String: String]) async -> Data? {
+        // v1.22.15 (B-5): lane-wait duration — logged only when
+        // the grant needed at least one 200 ms poll wait; a
+        // first-try grant logs nothing. No lane behaviour change.
+        let enteredAt = Date()
+        var waited = false
         while true {
             if let lane = lanes.first(where: { !$0.busy }) {
                 lane.busy = true
+                if waited {
+                    DiagLog.log("lane", "kind=bytes waited_ms=\(Int(Date().timeIntervalSince(enteredAt) * 1000))")
+                }
                 let data = await loadBytes(url: url, lane: lane, headers: headers)
                 lane.busy = false
                 return data
             }
+            waited = true
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
     }
@@ -441,13 +450,22 @@ final class WebFetcher: NSObject, WKNavigationDelegate {
     }
 
     private func fetch(url: URL) async -> String? {
+        // v1.22.15 (B-5): lane-wait duration — logged only when
+        // the grant needed at least one 200 ms poll wait; a
+        // first-try grant logs nothing. No lane behaviour change.
+        let enteredAt = Date()
+        var waited = false
         while true {
             if let lane = lanes.first(where: { !$0.busy }) {
                 lane.busy = true
+                if waited {
+                    DiagLog.log("lane", "kind=html waited_ms=\(Int(Date().timeIntervalSince(enteredAt) * 1000))")
+                }
                 let html = await load(url: url, lane: lane)
                 lane.busy = false
                 return html
             }
+            waited = true
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
     }
@@ -754,7 +772,21 @@ final class ImageCacheManager: @unchecked Sendable {
         }
     }
 
-    func clear() { cache.removeAllObjects() }
+    func clear() {
+        cache.removeAllObjects()
+        // v1.22.15 (F-2): the Settings action ("Xoá bộ nhớ đệm
+        // ảnh") now tells the truth — it also empties the disk
+        // tier and resets the session failure memo, not just
+        // the memory tier. Synchronous on purpose: clear() is
+        // an explicit user action and the disk directory is
+        // empty when it returns.
+        if let entries = try? FileManager.default.contentsOfDirectory(at: diskDir, includingPropertiesForKeys: nil) {
+            for entry in entries {
+                try? FileManager.default.removeItem(at: entry)
+            }
+        }
+        lock.withLock { fallbackFailed.removeAll() }
+    }
 }
 
 /// Async image view backed by ImageCacheManager (supports custom headers,
@@ -766,6 +798,19 @@ struct CachedAsyncImage: View {
 
     @State private var image: UIImage?
     @State private var failed = false
+
+    /// v1.22.15 (F-1): the task identity MUST match
+    /// ImageCacheManager.key(for:headers:) — the URL alone
+    /// when headers is empty, else the URL + "|" + the
+    /// headers sorted by key as "k=v" joined by "&" — so the
+    /// view reloads exactly when the manager's cache entry
+    /// would differ (a same-URL/different-headers request is
+    /// a different image to the manager, and now to the view).
+    private var identity: String {
+        if headers.isEmpty { return urlString }
+        let suffix = headers.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: "&")
+        return urlString + "|" + suffix
+    }
 
     var body: some View {
         ZStack {
@@ -786,7 +831,8 @@ struct CachedAsyncImage: View {
                     .overlay { ProgressView().tint(.white.opacity(0.5)) }
             }
         }
-        .task(id: urlString) {
+        .task(id: identity) {
+            image = nil
             failed = false
             if let cached = ImageCacheManager.shared.cachedImage(for: urlString, headers: headers) {
                 image = cached

@@ -63,8 +63,7 @@ struct JTVApp: App {
         _presenter = StateObject(wrappedValue: PlaybackPresenter())
 
         // Allow background / PiP audio playback for the video player.
-        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
-        try? AVAudioSession.sharedInstance().setActive(true)
+        AudioSession.configureForPlayback()
     }
 
     var body: some Scene {

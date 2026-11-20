@@ -215,9 +215,21 @@ final class MovieService: ObservableObject {
         DiagLog.log("mediafusion", "configured=\(MediaFusion.baseURL != nil ? "yes" : "no")")
         guard let base = MediaFusion.baseURL else { return detail }
         let url = "\(base)/stream/movie/\(movieId).json"
-        guard let text = try? await Net.fetchText(url) else { return detail }
+        // v1.22.15 (B-2, H-9): was `try?` — a failed fetch was
+        // silent. Identical return on failure; the catch logs
+        // the error kind only (domain#code, DiagLog law).
+        let text: String
+        do {
+            text = try await Net.fetchText(url)
+        } catch {
+            DiagLog.log("mediafusion", "fetch failed kind=\((error as NSError).domain)#\((error as NSError).code)")
+            return detail
+        }
         let episodes = MediaFusion.parseStreams(text: text)
-        guard !episodes.isEmpty else { return detail }
+        guard !episodes.isEmpty else {
+            DiagLog.log("mediafusion", "streams=0 parse-empty")
+            return detail
+        }
         DiagLog.log("mediafusion", "merged streams=\(episodes.count)")
         var merged = detail
         merged.servers.append(EpisodeServer(name: "MediaFusion", episodes: episodes))
@@ -267,7 +279,20 @@ final class MovieService: ObservableObject {
     /// direct media -> native player; manga chapter API -> images;
     /// embed page -> plugin embed/detail parser, else webview sniffer.
     func resolveEpisode(_ request: PlaybackRequest) async throws -> PlaybackResolution {
+        // v1.22.15 (B-4): register the MediaFusion credential host
+        // with the logger BEFORE any line below can carry an MF
+        // stream URL through urlForLog. A persisted MF episode can
+        // be resumed on a cold launch without mergeMediaFusion ever
+        // running in this session (DetailView stage-2 early return),
+        // so the getter's registration side effect cannot be relied
+        // on having happened. Reading baseURL performs it.
+        _ = MediaFusion.baseURL
+        // v1.22.15 (B-5, N-12): exactly one chain-duration line
+        // per resolve, emitted by the defer on every exit —
+        // success and throw alike. No other change here.
+        let chainStart = Date()
         let pluginId = request.pluginId
+        defer { DiagLog.log("resolve", "duration plugin=\(pluginId) ms=\(Int(Date().timeIntervalSince(chainStart) * 1000))") }
         let target = request.episode.id
         guard !target.isEmpty else {
             DiagLog.log("resolve", "error plugin=\(pluginId) empty target")
@@ -558,6 +583,13 @@ enum MediaFusion {
         }
         if value.hasSuffix("/") { value = String(value.dropLast()) }
         guard value.hasPrefix("http") else { return nil }
+        // v1.22.15 (B-4(i), H-2): register the credential
+        // host with the logger so its URL paths are redacted
+        // in the log. Host only — the value itself (a bearer
+        // credential) never enters the log. Return unchanged.
+        if let host = URLComponents(string: value)?.host, !host.isEmpty {
+            DiagLog.registerCredentialHost(host)
+        }
         return value
     }
 

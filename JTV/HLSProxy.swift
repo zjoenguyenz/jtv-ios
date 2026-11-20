@@ -108,17 +108,28 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked 
                     fetched = (data, http)
                     break
                 }
-                if http.statusCode < 500 { return nil } // dead/geo: fail fast
+                if http.statusCode < 500 {
+                    // v1.22.15 (B-2, H-1): failure line only —
+                    // status class, never the URL (DiagLog law).
+                    DiagLog.log("hls", "phase=materialize outcome=http-error status=\(http.statusCode)")
+                    return nil // dead/geo: fail fast
+                }
             }
             if attempt < 3 { try? await Task.sleep(nanoseconds: UInt64(attempt) * 1_000_000_000) }
         }
-        guard let (data, http) = fetched else { return nil }
+        guard let (data, http) = fetched else {
+            DiagLog.log("hls", "phase=materialize outcome=fetch-failed")
+            return nil
+        }
         let scratch = HLSProxyLoader(headers: headers)
         let prepared = scratch.prepare(data: data, finalURL: http.url ?? url)
         guard prepared.contentType == "com.apple.mpegurl",
               let text = String(data: prepared.data, encoding: .utf8),
               !text.contains("\(scheme)://"),
-              !text.contains("__hls_proxy/") else { return nil }
+              !text.contains("__hls_proxy/") else {
+            DiagLog.log("hls", "phase=materialize outcome=needs-loader")
+            return nil
+        }
         let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("hls-local", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -128,7 +139,10 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked 
         var hash: UInt64 = 1469598103934665603
         for byte in url.absoluteString.utf8 { hash = (hash ^ UInt64(byte)) &* 1099511628211 }
         let file = dir.appendingPathComponent("pl-\(hash).m3u8")
-        guard (try? prepared.data.write(to: file, options: .atomic)) != nil else { return nil }
+        guard (try? prepared.data.write(to: file, options: .atomic)) != nil else {
+            DiagLog.log("hls", "phase=materialize outcome=write-failed")
+            return nil
+        }
         return (fileURL: file, data: prepared.data)
     }
 
@@ -138,7 +152,12 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked 
                         shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest) -> Bool {
         guard let requestURL = loadingRequest.request.url,
               requestURL.scheme == Self.scheme,
-              let original = Self.originalURL(from: requestURL) else { return false }
+              let original = Self.originalURL(from: requestURL) else {
+            // v1.22.15 (B-2, H-1): declined request — failure
+            // line only, no URL material (DiagLog law).
+            DiagLog.log("hls", "phase=load outcome=bad-request")
+            return false
+        }
 
         let key = original.absoluteString
         lock.lock()
@@ -189,11 +208,22 @@ final class HLSProxyLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked 
                 return
             }
             if let error {
+                // v1.22.15 (B-2, H-1): final failure only (after
+                // the retry policy above is exhausted) — error
+                // kind as domain#code, never the URL or raw text.
+                // Per-resource successes are deliberately not
+                // logged (ring volume).
+                DiagLog.log("hls", "phase=fetch outcome=network-error kind=\((error as NSError).domain)#\((error as NSError).code) attempt=\(attempt)")
                 loadingRequest.finishLoading(with: error)
                 return
             }
             guard let data, let http = response as? HTTPURLResponse,
                   (200..<300).contains(http.statusCode) else {
+                if let status {
+                    DiagLog.log("hls", "phase=fetch outcome=http-error status=\(status) attempt=\(attempt)")
+                } else {
+                    DiagLog.log("hls", "phase=fetch outcome=bad-response attempt=\(attempt)")
+                }
                 loadingRequest.finishLoading(with: URLError(.badServerResponse))
                 return
             }

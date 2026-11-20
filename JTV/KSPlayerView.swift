@@ -287,9 +287,7 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
         // surface. (PiP is NOT available on this surface: the ME
         // engine renders through Metal, which the system's PiP
         // controller cannot float.)
-        let audioSession = AVAudioSession.sharedInstance()
-        try? audioSession.setCategory(.playback, mode: .moviePlayback)
-        try? audioSession.setActive(true)
+        AudioSession.configureForPlayback()
         setupRemoteCommands()
 
         uiTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
@@ -363,7 +361,7 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
         let watchdog = DispatchWorkItem { [weak self] in
             guard let self, !self.playing else { return }
             DiagLog.log("player-ks", "first-frame watchdog fired (budget \(Int(firstFrameBudget))s)")
-            self.handlePlaybackFailure(message: "Chưa có hình sau \(Int(firstFrameBudget)) giây.")
+            self.handlePlaybackFailure(message: "Chưa có hình sau \(Int(firstFrameBudget)) giây.", kind: "watchdog/first-frame")
         }
         firstFrameWatchdog = watchdog
         DispatchQueue.main.asyncAfter(deadline: .now() + firstFrameBudget, execute: watchdog)
@@ -397,7 +395,10 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
                 ready = true
                 if !didSeekToStart, startPosition > 5 {
                     didSeekToStart = true
-                    layer.seek(time: startPosition, autoPlay: true) { _ in }
+                    // v1.22.15: Resume rule (shared with PlayerView): seek once when the surface first reports ready, only if startPosition > 5; exact seek; play only from a finished seek completion.
+                    layer.seek(time: startPosition, autoPlay: false) { finished in
+                        if finished { layer.play() }
+                    }
                 }
             }
         case .bufferFinished:
@@ -410,7 +411,7 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
             }
             spinner.stopAnimating()
         case .error:
-            handlePlaybackFailure(message: "Engine phát báo lỗi.")
+            handlePlaybackFailure(message: "Engine phát báo lỗi.", kind: "engine/state-error")
         default:
             break
         }
@@ -432,7 +433,14 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
 
     func player(layer: KSPlayerLayer, finish error: Error?) {
         if let error {
-            handlePlaybackFailure(message: error.localizedDescription)
+            // v1.22.15 (B-4): the failure KIND (domain#code)
+            // travels alongside the message — the log line in
+            // showError records the kind only, never the raw
+            // error text, whose content is not app-controlled.
+            // The message still drives the on-screen label,
+            // byte-identical to before.
+            handlePlaybackFailure(message: error.localizedDescription,
+                                  kind: "\((error as NSError).domain)#\((error as NSError).code)")
         } else {
             ended = true
         }
@@ -469,7 +477,7 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
         let freezeBudget: TimeInterval = patientMode ? 30 : 12
         if Date().timeIntervalSince(lastAdvanceAt) > freezeBudget {
             DiagLog.log("player-ks", "freeze watchdog fired (budget \(Int(freezeBudget))s)")
-            handlePlaybackFailure(message: "Hình đứng quá \(Int(freezeBudget)) giây — đường truyền tới file có vấn đề.")
+            handlePlaybackFailure(message: "Hình đứng quá \(Int(freezeBudget)) giây — đường truyền tới file có vấn đề.", kind: "watchdog/freeze")
         }
     }
 
@@ -484,9 +492,9 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
     /// fresh resolve, and only then shows the error. Failures
     /// before the first frame keep the old straight-to-error
     /// behaviour.
-    private func handlePlaybackFailure(message: String?) {
+    private func handlePlaybackFailure(message: String?, kind: String = "app/unknown") {
         guard playing, !failed, recoveryAttempts < 3 else {
-            showError(message: message)
+            showError(message: message, kind: kind)
             return
         }
         recoveryAttempts += 1
@@ -516,11 +524,11 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
                         self.contentHeaders = fresh.headers
                         self.restartLayer()
                     } else {
-                        self.showError(message: message)
+                        self.showError(message: message, kind: kind)
                     }
                 }
             } else {
-                self.showError(message: message)
+                self.showError(message: message, kind: kind)
             }
         }
     }
@@ -580,7 +588,7 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
 
     // MARK: - Error surface (same shape as the AVPlayer surface)
 
-    func showError(message: String? = nil) {
+    func showError(message: String? = nil, kind: String = "app/unknown") {
         guard !failed else { return }
         failed = true
         firstFrameWatchdog?.cancel()
@@ -594,7 +602,9 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
         // close — controlsView (and its close button) is hidden
         // above, so the root-view error button takes over.
         errorCloseButton.isHidden = false
-        DiagLog.log("player-ks", "error shown: \(message ?? "unknown")")
+        // v1.22.15 (B-4): kind only — the raw message (which can
+        // carry a raw error description) never reaches the log.
+        DiagLog.log("player-ks", "error shown kind=\(kind)")
     }
 
     // MARK: - Controls (mirrors PlayerSurfaceViewController)

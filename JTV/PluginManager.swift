@@ -265,6 +265,10 @@ final class PluginManager: ObservableObject {
 
     func setPluginEnabled(_ pluginId: String, enabled: Bool) {
         if enabled { disabledIds.remove(pluginId) } else { disabledIds.insert(pluginId) }
+        // v1.22.15: disabling drops the cached engine, so a
+        // re-enabled plugin starts from a fresh context instead
+        // of reviving state built before the disable.
+        if !enabled { invalidateEngine(for: pluginId) }
         if !enabled && activePluginId == pluginId {
             activePluginId = visiblePlugins.first?.id ?? ""
         }
@@ -290,8 +294,14 @@ final class PluginManager: ObservableObject {
             return nil
         }
         let engine = PluginEngine(pluginId: pluginId)
-        await engine.load(script: script)
-        enginesLock.withLock { engines[pluginId] = engine }
+        // v1.22.15: an engine whose load raised is returned for
+        // this call but NOT cached — caching it would pin the
+        // broken context for every later call.
+        if await engine.load(script: script) {
+            enginesLock.withLock { engines[pluginId] = engine }
+        } else {
+            DiagLog.log("plugin", "id=\(pluginId) engine not cached (load raised)")
+        }
         return engine
     }
 
@@ -331,7 +341,7 @@ final class PluginManager: ObservableObject {
                 anyChanged = anyChanged || synced.changed
                 authoritative[source.url] = synced.remoteIds
             } catch {
-                DiagLog.log("sync", "source failed host=\(URL(string: source.url)?.host ?? "?") error=\(error.localizedDescription)")
+                DiagLog.log("sync", "source failed host=\(URL(string: source.url)?.host ?? "?") error=\((error as NSError).domain)#\((error as NSError).code)")
                 if (error as? URLError)?.code == .badServerResponse {
                     // 404/403 from the raw host — for the owner's own
                     // repo this almost always means it is still private.

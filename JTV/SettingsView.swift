@@ -320,7 +320,7 @@ struct SettingsView: View {
                 .foregroundStyle(.white)
                 .autocorrectionDisabled(true)
                 .textInputAutocapitalization(.never)
-            TextField("Link MediaFusion (manifest)", text: $mediaFusionURL)
+            SecureField("Link MediaFusion (manifest)", text: $mediaFusionURL)
                 .foregroundStyle(.white)
                 .autocorrectionDisabled(true)
                 .textInputAutocapitalization(.never)
