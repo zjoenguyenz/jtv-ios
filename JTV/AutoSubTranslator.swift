@@ -11,16 +11,25 @@ import Translation
 // — the player being dismissed — is cancellation, not error).
 //
 // Isolation (FIX 1, R1-concurrency F-1 — the run-#56 fault class):
-// `TranslationSession` is not Sendable, so it must NEVER cross an
-// isolation boundary. The previous shape handed the session from
+// `TranslationSession` is not Sendable, so it must never be sent
+// out of an actor's region or into an actor isolation domain; the
+// only legal hand is a transfer out of a disconnected region
+// (FIX 2's action closure → `run`). The previous shape handed the
+// session from
 // the `.translationTask` action into the @MainActor controller's
 // performTranslation(session:) — exactly the sending pattern Swift 6
 // diagnoses. The shape now is:
 //
 //   • `AutoSubSessionDriver.run(session:controller:)` — a
-//     NONISOLATED function in this file — is called DIRECTLY from
-//     the `.translationTask` action closure, so the session is born
-//     and dies inside one nonisolated call tree.
+//     NONISOLATED function in this file — is the only statement of
+//     the `.translationTask` action closure, so the session is
+//     born and dies inside one nonisolated call tree. FIX 2 (run #58):
+//     the action closure itself is formed by the driver
+//     (`taskAction(controller:)`) as an explicitly `@Sendable`
+//     closure — a literal written in the SwiftUI anchor's body is
+//     MainActor-domain, so the session it received was a
+//     MainActor-region value and the hand-off to `run` was the
+//     one forbidden send in the build.
 //   • The driver obtains a Sendable job snapshot from the
 //     controller via an awaited @MainActor call, then calls
 //     `prepare` / `translate` LOCALLY with the session — both are
@@ -100,7 +109,8 @@ enum AutoSubTranslator {
     ///
     /// Nonisolated (FIX 1): called only from the nonisolated driver
     /// with the session as a plain parameter — the session never
-    /// crosses an isolation boundary.
+    /// leaves the driver's call tree or enters an actor isolation
+    /// domain.
     ///
     /// Throws: `CancellationError` unchanged when the user declines
     /// the download (the controller logs `pack outcome=declined`);
@@ -388,11 +398,13 @@ struct AutoSubJobSnapshot: Sendable {
 // MARK: - Session driver (FIX 1)
 
 /// The nonisolated bridge between the SwiftUI `.translationTask`
-/// action and the @MainActor controller. Called DIRECTLY from the
-/// action closure with the fresh session; the session is used only
-/// inside this call tree (prepare/translate above) and never
-/// crosses an isolation boundary — every value that crosses to or
-/// from the controller is Sendable:
+/// action and the @MainActor controller. The action closure is
+/// formed HERE (`taskAction(controller:)`, FIX 2) as an explicitly
+/// `@Sendable` closure whose only statement calls `run` with the
+/// fresh session; the session is used only inside this call tree
+/// (prepare/translate above) and never crosses into an actor
+/// isolation domain — every value that crosses to or from the
+/// controller is Sendable:
 ///
 ///   • IN:  `AutoSubJobSnapshot` (language, cues, flags, token)
 ///     from one awaited @MainActor call.
@@ -405,6 +417,32 @@ struct AutoSubJobSnapshot: Sendable {
 ///     in the controller resets the anchor configuration to nil,
 ///     so a later same-pair job re-fires `.translationTask`.
 enum AutoSubSessionDriver {
+
+    /// The `.translationTask` action for `controller` (FIX 2 —
+    /// the run-#58 compile error, `AutoSubOverlay.swift:1040`
+    /// `sending 'session' risks causing data races`).
+    ///
+    /// FIX 1 formed the action as a closure literal inside the
+    /// SwiftUI anchor's `body`. SwiftUI view code runs in the
+    /// MainActor domain, so the session SwiftUI delivered to that
+    /// literal was a MainActor-region value — and handing it to
+    /// the nonisolated `run` was itself the forbidden send, before
+    /// the driver's call tree ever started. Forming the action
+    /// HERE, as an explicitly `@Sendable` closure in a nonisolated
+    /// context, makes the session arrive in a disconnected region
+    /// instead: it is transferred exactly once, into `run`, and
+    /// never touched by the closure again. The only capture is
+    /// `controller` — a @MainActor class, implicitly Sendable via
+    /// its global-actor isolation. Behaviour is unchanged: the
+    /// action still does nothing but call `run` with the fresh
+    /// session, and a fresh action value per `body` pass is what
+    /// the old trailing closure produced as well.
+    @available(iOS 18, *)
+    static func taskAction(controller: AutoSubController) -> @Sendable (TranslationSession) async -> Void {
+        { session in
+            await run(session: session, controller: controller)
+        }
+    }
 
     @available(iOS 18, *)
     static func run(session: TranslationSession, controller: AutoSubController) async {

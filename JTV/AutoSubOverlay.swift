@@ -23,10 +23,13 @@ import UIKit
 //     `.translationTask` anchor (§3.6, S-3). The anchor is the only
 //     path that can present the system's language-pack download
 //     prompt, and the TranslationSession it produces is never
-//     stored and never crosses an isolation boundary (FIX 1): the
-//     anchor's action calls the NONISOLATED
-//     `AutoSubSessionDriver.run(session:controller:)` directly, and
-//     the session dies inside that call tree. The controller only
+//     stored and never crosses into an actor isolation domain
+//     (FIX 1/2):
+//     the anchor's action is the `@Sendable` closure formed by
+//     the driver itself (`AutoSubSessionDriver.taskAction`), whose
+//     only statement calls the NONISOLATED
+//     `AutoSubSessionDriver.run(session:controller:)`, and the
+//     session dies inside that call tree. The controller only
 //     ever exchanges Sendable values with the driver (a job
 //     snapshot out; chunk maps and outcome kinds back).
 //
@@ -995,9 +998,10 @@ final class AutoSubController: ObservableObject {
 
 /// The observable model behind the anchor view. The controller sets
 /// `configuration` to request a session; `.translationTask` then
-/// delivers one to AutoSubAnchorView's action, which hands it
-/// DIRECTLY to the nonisolated `AutoSubSessionDriver.run` (FIX 1) —
-/// the session never crosses into the @MainActor controller and is
+/// delivers one to the driver's own `@Sendable` action closure
+/// (`AutoSubSessionDriver.taskAction`, FIX 2), which hands it
+/// DIRECTLY to the nonisolated `AutoSubSessionDriver.run` — the
+/// session never crosses into the @MainActor controller and is
 /// never stored here or anywhere (Apple's lifetime rule).
 @available(iOS 18, *)
 @MainActor
@@ -1031,14 +1035,17 @@ struct AutoSubAnchorView: View {
     var body: some View {
         Color.clear
             .frame(width: 0, height: 0)
-            .translationTask(model.configuration) { session in
-                // FIX 1: the session goes DIRECTLY to the
-                // nonisolated driver — it never crosses into the
-                // @MainActor controller. Only the controller
-                // reference (a @MainActor class, implicitly
-                // Sendable) is captured here.
-                await AutoSubSessionDriver.run(session: session, controller: controller)
-            }
+            // FIX 2: the action is the driver's own @Sendable
+            // closure (AutoSubSessionDriver.taskAction) — a
+            // closure literal written in this body is
+            // MainActor-domain, so the session delivered to it
+            // was a MainActor-region value that could not be sent
+            // to the nonisolated driver (run #58's error at this
+            // call). Formed inside the driver instead, the
+            // session arrives in a disconnected region and is
+            // transferred exactly once into `run`; it never
+            // crosses into the @MainActor controller.
+            .translationTask(model.configuration, action: AutoSubSessionDriver.taskAction(controller: controller))
             .onAppear {
                 controller.attachAnchor(model)
             }
