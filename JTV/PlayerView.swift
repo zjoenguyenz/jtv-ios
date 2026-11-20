@@ -377,15 +377,23 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
             // use queue: .main, so their blocks provably run on
             // the main actor (the same sanctioned shape as the
             // periodic time observer in makeUIViewController).
+            // Only Sendable values extracted from each
+            // notification cross into the isolated context (the
+            // interruption UInts, the ended item's
+            // ObjectIdentifier) — the Notification itself is
+            // non-Sendable and must not be sent across it.
             interruptionObserver = NotificationCenter.default.addObserver(
                 forName: AVAudioSession.interruptionNotification, object: nil, queue: .main
             ) { [weak self] notification in
-                MainActor.assumeIsolated { self?.handleInterruption(notification) }
+                let typeValue = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+                let optionsValue = notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+                MainActor.assumeIsolated { self?.handleInterruption(typeValue: typeValue, optionsValue: optionsValue) }
             }
             itemEndObserver = NotificationCenter.default.addObserver(
                 forName: .AVPlayerItemDidPlayToEndTime, object: nil, queue: .main
             ) { [weak self] notification in
-                MainActor.assumeIsolated { self?.handleItemEnded(notification) }
+                let endedItemID = (notification.object as? AVPlayerItem).map(ObjectIdentifier.init)
+                MainActor.assumeIsolated { self?.handleItemEnded(endedItemID: endedItemID) }
             }
         }
 
@@ -416,8 +424,10 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         /// (.shouldResume), it had been playing, and the current
         /// item is ready — the same readiness the gated start
         /// waits for. The remembered flag is consumed either way.
-        private func handleInterruption(_ notification: Notification) {
-            guard let typeValue = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+        /// It receives only the two Sendable UInts extracted
+        /// from the notification in the observer block (see init).
+        private func handleInterruption(typeValue: UInt?, optionsValue: UInt) {
+            guard let typeValue,
                   let type = AVAudioSession.InterruptionType(rawValue: typeValue) else { return }
             switch type {
             case .began:
@@ -427,7 +437,6 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
                 DiagLog.log("player-av", "interruption kind=interruption-began")
             case .ended:
                 DiagLog.log("player-av", "interruption kind=interruption-ended")
-                let optionsValue = notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
                 let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
                 let wasPlaying = wasPlayingBeforeInterruption
                 wasPlayingBeforeInterruption = false
@@ -445,10 +454,13 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         /// periodic observer's next tick may never come), so the
         /// saved position lands at the item's end. The identity
         /// check keeps a stale item's end (an in-flight swap)
-        /// from reporting against the new item.
-        private func handleItemEnded(_ notification: Notification) {
-            guard let item = notification.object as? AVPlayerItem,
-                  player?.currentItem === item else { return }
+        /// from reporting against the new item. It receives
+        /// only the ended item's ObjectIdentifier extracted
+        /// from the notification in the observer block (see init).
+        private func handleItemEnded(endedItemID: ObjectIdentifier?) {
+            guard let endedItemID,
+                  let currentItem = player?.currentItem,
+                  ObjectIdentifier(currentItem) == endedItemID else { return }
             DiagLog.log("player-av", "item ended")
             let (c, d) = times()
             onProgress(c, d)
