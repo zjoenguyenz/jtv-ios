@@ -48,6 +48,14 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
     var onFreshStream: (() async -> StreamInfo?)?
     var onProgress: (Double, Double) -> Void
     var onExit: (Double, Double) -> Void
+    /// v1.22.16 (AutoSub, S-5): the stream's external subtitle
+    /// files (`StreamInfo.subtitles` — decoded by the plugin
+    /// engine and, until this version, dropped at exactly this
+    /// call site; RECON §A1) and the AutoSub controller for this
+    /// surface. `headers` above doubles as the subtitle fetch
+    /// headers (SubtitleTrack carries none of its own).
+    var subtitles: [SubtitleTrack] = []
+    var autosub: AutoSubController
 
     func makeCoordinator() -> Coordinator {
         Coordinator(onProgress: onProgress, onExit: onExit)
@@ -117,6 +125,25 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         context.coordinator.onGiveUp = { [weak controller] message, logKind in
             controller?.showError(message: message, logKind: logKind)
         }
+        // v1.22.16 (AutoSub, S-5): the controller and the raw
+        // external tracks follow the same copy-in pattern; the
+        // controller is handed its inputs and started once the
+        // VC is fully set up.
+        controller.autosub = autosub
+        controller.subtitles = subtitles
+        autosub.attach(subtitles: subtitles, headers: headers)
+        context.coordinator.onAfterSubtitleDefault = { [weak controller] item in
+            controller?.handleAfterSubtitleDefault(item)
+        }
+        // Fix pass 1 (R1 spec B-1 / logic M1): the failure
+        // restore signal — the controller ends every failed
+        // vi-auto attempt with selection .auto + phase .failed
+        // and fires this closure; the VC answers by restoring
+        // the native selection snapshotted at the tap.
+        autosub.onPhaseChange = { [weak controller] in
+            controller?.handleAutoSubPhaseChange()
+        }
+        autosub.startEvaluation()
         if PlaylistSynthesizer.streamxxID(from: url) != nil {
             // streamxx streams never need their origin host:
             // the playlist is synthesized from the segment
@@ -223,6 +250,12 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         /// the error label only; the kind (the error's
         /// domain#code) is the only part that may reach DiagLog.
         var onGiveUp: ((String?, String?) -> Void)?
+        /// v1.22.16 (AutoSub, S-5): invoked from handleReadyToPlay
+        /// immediately AFTER applySubtitleDefaultIfNeeded(for:)
+        /// runs, so the VC can reconcile a MANUAL subtitle
+        /// selection (which D-1 must never override) onto a
+        /// recovery-swapped item. D-1 itself is not modified.
+        var onAfterSubtitleDefault: ((AVPlayerItem) -> Void)?
         private var didMaterialize = false
 
         // v1.22 mid-playback self-heal: a stream that dies AFTER
@@ -757,6 +790,10 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         private func handleReadyToPlay(_ item: AVPlayerItem) {
             guard player?.currentItem === item else { return }
             applySubtitleDefaultIfNeeded(for: item)
+            // v1.22.16 (AutoSub, S-5): the ONLY AutoSub touch in
+            // the Coordinator — D-1 has run (unchanged); the VC
+            // now re-applies any manual subtitle selection.
+            onAfterSubtitleDefault?(item)
             guard startRequested, let player else { return }
             startRequested = false
             // Resume rule (shared with KSPlayerView): seek once
@@ -875,6 +912,11 @@ final class PlayerSurfaceViewController: UIViewController {
     var currentSourceId = ""
     var onSwitchSource: ((Episode) -> Void)?
     var onClose: (() -> Void)?
+    /// v1.22.16 (AutoSub, S-5): the AutoSub controller for this
+    /// surface and the stream's raw external subtitle tracks,
+    /// copied in by makeUIViewController (house pattern).
+    var autosub: AutoSubController?
+    var subtitles: [SubtitleTrack] = []
 
     private let videoView = PlayerLayerView()
     private let controlsView = UIView()
@@ -885,6 +927,14 @@ final class PlayerSurfaceViewController: UIViewController {
     private let rotateButton = UIButton(type: .system)
     private let pipButton = UIButton(type: .system)
     private let sourcesButton = UIButton(type: .system)
+    /// v1.22.16 (AutoSub, S-5): the captions button — always
+    /// visible on this surface (owner amendment L-12: the menu
+    /// itself reports the no-subtitles state).
+    private let captionsButton = UIButton(type: .system)
+    /// v1.22.16 (AutoSub, S-5): the file-subtitle overlay —
+    /// sits above videoView, below controlsView (RECON §A4),
+    /// and is driven from refreshUI()'s existing 0.25 s tick.
+    private let overlayView = AutoSubOverlayView()
     private let closeButton = UIButton(type: .system)
     /// v1.22.11: the error slate's own close button, owned by
     /// the ROOT view — showError hides controlsView (and with
@@ -914,6 +964,41 @@ final class PlayerSurfaceViewController: UIViewController {
     private var userPaused = false
     private var didStartPlayback = false
     private var didRequestLandscape = false
+    /// v1.22.16 (AutoSub, S-5): the user's manual native pick,
+    /// remembered by display name + language tag (option objects
+    /// are per-item, so a recovery swap's new group is matched on
+    /// these — see handleAfterSubtitleDefault).
+    private var pickedNativeDisplayName: String?
+    private var pickedNativeLanguageTag: String?
+    /// Fix pass 1 (R1 spec B-1 / logic M1): the native state
+    /// snapshotted at the moment the user taps the vi-auto row,
+    /// so a failed attempt can put it back exactly as it was
+    /// (see handleAutoSubPhaseChange). Kept separate from the
+    /// remembered pick above: the vi-auto tap CLEARS that pick,
+    /// so the restore data needs its own slot. `…Taken`
+    /// distinguishes "no snapshot" from "snapshot of nothing
+    /// selected"; when taken with a nil pick, the pre-tap state
+    /// was off/none. The pick is name + tag only — option
+    /// objects are per-item and never stored.
+    private var preAutoSubSnapshotTaken = false
+    private var preAutoSubNativePick: (name: String, tag: String?)?
+    /// Fix pass 2 (R2 logic N5): the snapshotted option's
+    /// index within its sheet-build group's options array,
+    /// captured alongside the name/tag above. The restore in
+    /// handleAutoSubPhaseChange is same-item in the common
+    /// case, where this index identifies the EXACT option the
+    /// user was watching even when another option shares its
+    /// name+tag; the index is only a preference — it is used
+    /// solely when the option now at that index still matches
+    /// the snapshotted name+tag, otherwise the restore falls
+    /// back to the name+tag first-match. (Cross-item
+    /// reconciliation in handleAfterSubtitleDefault keeps
+    /// name+tag matching — indices are per-item.)
+    private var preAutoSubNativeIndex: Int?
+    /// v1.22.16 (AutoSub, S-5): the item the embedded-track
+    /// enumeration was last logged for — the D-1 hook fires per
+    /// ready report, the enumeration logs once per item.
+    private var lastEnumeratedItemID: ObjectIdentifier?
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -924,6 +1009,20 @@ final class PlayerSurfaceViewController: UIViewController {
         videoView.frame = view.bounds
         videoView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         view.addSubview(videoView)
+
+        // v1.22.16 (AutoSub, S-5): the subtitle overlay goes in
+        // AFTER videoView and BEFORE buildControls() adds
+        // controlsView, so it renders above the picture but
+        // below (and never fades with) the control layer
+        // (RECON §A4 z-order rule).
+        overlayView.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(overlayView)
+        NSLayoutConstraint.activate([
+            overlayView.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            overlayView.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -84),
+            overlayView.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 40),
+            overlayView.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -40),
+        ])
 
         buildControls()
         spinner.color = .white
@@ -1108,6 +1207,19 @@ final class PlayerSurfaceViewController: UIViewController {
         sourcesButton.addTarget(self, action: #selector(showSourceList), for: .touchUpInside)
         sourcesButton.isHidden = sources.count <= 1
 
+        // v1.22.16 (AutoSub, S-5): captions button — same 40 pt
+        // construction as sourcesButton, beside it in the bottom
+        // row. Always visible (L-12): the sheet it opens reports
+        // the no-subtitles state itself.
+        captionsButton.setImage(UIImage(systemName: "captions.bubble"), for: .normal)
+        captionsButton.tintColor = .white
+        captionsButton.backgroundColor = UIColor.black.withAlphaComponent(0.45)
+        captionsButton.layer.cornerRadius = 20
+        captionsButton.translatesAutoresizingMaskIntoConstraints = false
+        captionsButton.widthAnchor.constraint(equalToConstant: 40).isActive = true
+        captionsButton.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        captionsButton.addTarget(self, action: #selector(showSubtitleList), for: .touchUpInside)
+
         // v1.22.6: the close button lives INSIDE the control
         // layer so it fades with the controls while playing.
         // (Before, the resolver's SwiftUI X floated above the
@@ -1148,7 +1260,7 @@ final class PlayerSurfaceViewController: UIViewController {
         sourceLabel.isHidden = sourceLabelText.isEmpty
         controlsView.addSubview(sourceLabel)
 
-        let bottomRow = UIStackView(arrangedSubviews: [currentLabel, slider, durationLabel, sourcesButton, pipButton, rotateButton])
+        let bottomRow = UIStackView(arrangedSubviews: [currentLabel, slider, durationLabel, sourcesButton, captionsButton, pipButton, rotateButton])
         bottomRow.axis = .horizontal
         bottomRow.spacing = 10
         bottomRow.alignment = .center
@@ -1194,6 +1306,330 @@ final class PlayerSurfaceViewController: UIViewController {
             pop.sourceRect = sourcesButton.bounds
         }
         present(sheet, animated: true)
+    }
+
+    /// v1.22.16 (AutoSub, S-5): the subtitle picker — mirrors
+    /// showSourceList()'s sheet pattern exactly ("✓ " prefix +
+    /// isEnabled = false for the current selection, "Huỷ" last,
+    /// popover anchored to the invoking button). Rows, in
+    /// order: off / each native legible option / the external
+    /// VI file track / the auto-translated VI entry. The
+    /// legible group is read from the CURRENT item at
+    /// sheet-build time.
+    @objc private func showSubtitleList() {
+        // Enumeration logging at sheet-build time (spec §3.8):
+        // the log line reflects exactly what the user is shown.
+        if let item = player?.currentItem {
+            logEmbeddedTracks(for: item)
+        }
+
+        let sheet = UIAlertController(title: "Phụ đề", message: nil, preferredStyle: .actionSheet)
+        let item = player?.currentItem
+        let group = item?.asset.mediaSelectionGroup(forMediaCharacteristic: .legible)
+        let options = group?.options ?? []
+        var selectedOption: AVMediaSelectionOption?
+        if let item, let group {
+            selectedOption = item.selectedMediaOption(in: group)
+        }
+        let selection = autosub?.selection ?? .auto
+        let hasExternalVI = autosub?.hasExternalVI ?? false
+        let viAutoOffered = autosub?.viAutoOffered ?? false
+
+        // L-12 explicit empty state: no legible options and no
+        // external tracks of any kind — one disabled row.
+        if options.isEmpty, !hasExternalVI, !viAutoOffered, subtitles.isEmpty {
+            let empty = UIAlertAction(title: "Không có phụ đề", style: .default)
+            empty.isEnabled = false
+            sheet.addAction(empty)
+            sheet.addAction(UIAlertAction(title: "Huỷ", style: .cancel))
+            if let pop = sheet.popoverPresentationController {
+                pop.sourceView = captionsButton
+                pop.sourceRect = captionsButton.bounds
+            }
+            present(sheet, animated: true)
+            return
+        }
+
+        // Off — current when explicitly off, or when AutoSub is
+        // still on its automatic rung and nothing is selected.
+        let offIsCurrent = selection == .off || (selection == .auto && selectedOption == nil)
+        let offAction = UIAlertAction(title: (offIsCurrent ? "✓ " : "") + "Tắt phụ đề", style: .default) { [weak self] _ in
+            guard let self else { return }
+            if let current = self.player?.currentItem,
+               let group = current.asset.mediaSelectionGroup(forMediaCharacteristic: .legible) {
+                current.select(nil, in: group)
+            }
+            self.pickedNativeDisplayName = nil
+            self.pickedNativeLanguageTag = nil
+            self.clearPreAutoSubSnapshot()
+            self.autosub?.userSelectedOff()
+        }
+        offAction.isEnabled = !offIsCurrent
+        sheet.addAction(offAction)
+
+        // Native legible options — AVFoundation renders these
+        // itself, so selecting one hides the overlay (the
+        // controller's .native selection does that in
+        // refreshUI). Only Sendable values cross into the
+        // action handlers: the name/tag strings (for the
+        // remembered pick) and the row's INDEX (Fix pass 1,
+        // R1 logic M3 — the tap must select the EXACT option:
+        // two options can share a displayName and language
+        // tag, so a name+tag re-match could land on the wrong
+        // one; the option object itself is never captured).
+        for (index, option) in options.enumerated() {
+            let name = option.displayName
+            let tag = option.extendedLanguageTag
+            let isCurrent = option == selectedOption && selection != .viAuto && selection != .externalVI
+            let action = UIAlertAction(title: (isCurrent ? "✓ " : "") + name, style: .default) { [weak self] _ in
+                guard let self else { return }
+                self.pickedNativeDisplayName = name
+                self.pickedNativeLanguageTag = tag
+                self.clearPreAutoSubSnapshot()
+                if let current = self.player?.currentItem,
+                   let currentGroup = current.asset.mediaSelectionGroup(forMediaCharacteristic: .legible),
+                   currentGroup.options.indices.contains(index) {
+                    current.select(currentGroup.options[index], in: currentGroup)
+                }
+                self.autosub?.userSelectedNative()
+            }
+            action.isEnabled = !isCurrent
+            sheet.addAction(action)
+        }
+
+        // The external Vietnamese file track — rendered by the
+        // overlay, so any native selection is cleared first.
+        if hasExternalVI {
+            let title = externalVITitle
+            let isCurrent = selection == .externalVI
+            let action = UIAlertAction(title: (isCurrent ? "✓ " : "") + title, style: .default) { [weak self] _ in
+                guard let self else { return }
+                if let current = self.player?.currentItem,
+                   let group = current.asset.mediaSelectionGroup(forMediaCharacteristic: .legible) {
+                    current.select(nil, in: group)
+                }
+                self.pickedNativeDisplayName = nil
+                self.pickedNativeLanguageTag = nil
+                self.clearPreAutoSubSnapshot()
+                self.autosub?.userSelectedExternalVI()
+            }
+            action.isEnabled = !isCurrent
+            sheet.addAction(action)
+        }
+
+        // Auto-translated Vietnamese — offered only when the
+        // controller's trigger conditions (spec §3.2, T1–T4)
+        // hold; its title carries the translation state.
+        // Fix pass 1 (R1 spec B-1 / logic M1): the pre-tap
+        // native state, reduced to Sendable strings HERE so no
+        // AVMediaSelectionOption object crosses into the
+        // action handler — the handler stores these as the
+        // restore snapshot before the selection is cleared.
+        let preAutoSubName = selectedOption?.displayName
+        let preAutoSubTag = selectedOption?.extendedLanguageTag
+        // Fix pass 2 (R2 logic N5): the selected option's
+        // index within this same sheet-build options array,
+        // snapshotted alongside the name/tag so the same-item
+        // failure restore can prefer the exact option.
+        let preAutoSubIndex = selectedOption.flatMap { selected in
+            options.firstIndex(where: { $0 == selected })
+        }
+        if viAutoOffered, let autosub {
+            let isCurrent = selection == .viAuto
+            let action = UIAlertAction(title: (isCurrent ? "✓ " : "") + autosub.viAutoMenuTitle, style: .default) { [weak self] _ in
+                // Fix pass 2 (R2 spec R2-1): the pack latch
+                // makes this entry INERT at the VC layer too —
+                // when the controller is latched, the tap does
+                // NOTHING: no snapshot, no native deselect, no
+                // manual-pick clear, no userSelectedVIAuto call
+                // (the latched controller call would no-op
+                // without firing onPhaseChange, so any work
+                // done before it could never be restored).
+                // `autosub` is Optional on the VC, hence the
+                // `!= true` form of `!packBlocked`.
+                guard let self, self.autosub?.packBlocked != true else { return }
+                self.preAutoSubSnapshotTaken = true
+                self.preAutoSubNativeIndex = preAutoSubIndex
+                if let preAutoSubName {
+                    self.preAutoSubNativePick = (name: preAutoSubName, tag: preAutoSubTag)
+                } else {
+                    self.preAutoSubNativePick = nil
+                }
+                if let current = self.player?.currentItem,
+                   let group = current.asset.mediaSelectionGroup(forMediaCharacteristic: .legible) {
+                    current.select(nil, in: group)
+                }
+                self.pickedNativeDisplayName = nil
+                self.pickedNativeLanguageTag = nil
+                self.autosub?.userSelectedVIAuto()
+            }
+            action.isEnabled = !isCurrent
+            sheet.addAction(action)
+        }
+
+        sheet.addAction(UIAlertAction(title: "Huỷ", style: .cancel))
+        if let pop = sheet.popoverPresentationController {
+            pop.sourceView = captionsButton
+            pop.sourceRect = captionsButton.bounds
+        }
+        present(sheet, animated: true)
+    }
+
+    /// The external VI file track's menu title: the first
+    /// stream track whose declared language normalises to
+    /// Vietnamese (the controller owns identification via
+    /// hasExternalVI; the track list is what the VC holds).
+    private var externalVITitle: String {
+        subtitles.first(where: {
+            AutoSubSourceLanguage.normaliseDeclared(lang: $0.lang, label: $0.label) == .vietnamese
+        })?.displayName ?? "Tiếng Việt (file rời)"
+    }
+
+    /// Selects, in `item`'s legible group, the option matching
+    /// a remembered native pick: display name first (with the
+    /// language tag as a disambiguator), then the tag alone.
+    /// Option objects are per-item, so matching is by these
+    /// values, never by identity.
+    private func selectNativeOption(named name: String, tag: String?, in item: AVPlayerItem) {
+        guard let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .legible) else { return }
+        let match = group.options.first(where: { $0.displayName == name && (tag == nil || $0.extendedLanguageTag == tag) })
+            ?? group.options.first(where: { $0.displayName == name })
+            ?? tag.flatMap { wanted in group.options.first(where: { $0.extendedLanguageTag == wanted }) }
+        if let match {
+            item.select(match, in: group)
+        }
+    }
+
+    /// Fix pass 1 (R1 spec B-1 / logic M1): drops the
+    /// pre-vi-auto snapshot without restoring — used when the
+    /// translation succeeds and whenever the user makes any
+    /// new manual subtitle pick.
+    private func clearPreAutoSubSnapshot() {
+        preAutoSubSnapshotTaken = false
+        preAutoSubNativePick = nil
+        preAutoSubNativeIndex = nil
+    }
+
+    /// Fix pass 1 (R1 spec B-1 / logic M1): the controller's
+    /// `onPhaseChange` consumer, wired in makeUIViewController.
+    /// The controller contract ends EVERY failed vi-auto
+    /// attempt (pack decline/failure, total translation
+    /// failure) with selection reverted to `.auto` and phase
+    /// `.failed`; when a pre-tap snapshot exists, the native
+    /// selection that was showing before the tap is restored
+    /// on the CURRENT item — re-selecting the snapshotted
+    /// option in its legible group (Fix pass 2, R2 logic N5:
+    /// the snapshotted sheet-build index is preferred when
+    /// the option now at that index still matches the
+    /// snapshotted name+tag — the exact option, not a
+    /// same-name+tag twin; otherwise the name+tag first-match
+    /// fallback below), or selecting nil when the snapshot
+    /// was off/none — and the snapshot is dropped.
+    /// A successful translation (phase `.done` with selection
+    /// `.viAuto`) drops the snapshot WITHOUT restoring: the
+    /// generated track is what the user asked for. Idempotent
+    /// and safe with no snapshot, no item, or no group (no-op).
+    func handleAutoSubPhaseChange() {
+        guard let autosub else { return }
+        if autosub.selection == .auto, autosub.phase == .failed, preAutoSubSnapshotTaken {
+            let pick = preAutoSubNativePick
+            let snapshotIndex = preAutoSubNativeIndex
+            clearPreAutoSubSnapshot()
+            guard let item = player?.currentItem else { return }
+            if let pick {
+                // Fix pass 2 (R2 logic N5): same-item restore
+                // prefers the exact option — the one at the
+                // snapshotted index, provided it still matches
+                // the snapshotted name+tag (same match rule as
+                // selectNativeOption's first pass). Any doubt
+                // (no index, index out of range, mismatch)
+                // falls back to the name+tag first-match.
+                var restoredByIndex = false
+                if let snapshotIndex,
+                   let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .legible),
+                   group.options.indices.contains(snapshotIndex) {
+                    let candidate = group.options[snapshotIndex]
+                    if candidate.displayName == pick.name,
+                       pick.tag == nil || candidate.extendedLanguageTag == pick.tag {
+                        item.select(candidate, in: group)
+                        restoredByIndex = true
+                    }
+                }
+                if !restoredByIndex {
+                    selectNativeOption(named: pick.name, tag: pick.tag, in: item)
+                }
+            } else if let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .legible) {
+                item.select(nil, in: group)
+            }
+        } else if autosub.selection == .viAuto, autosub.phase == .done {
+            clearPreAutoSubSnapshot()
+        }
+    }
+
+    /// v1.22.16 (AutoSub, S-5): the D-1 reconciliation hook —
+    /// invoked by the Coordinator immediately AFTER D-1 runs on
+    /// each ready item. A MANUAL subtitle selection is never
+    /// overridden back by D-1 across a recovery swap (spec
+    /// §2.4): it is re-applied onto the new item here. The
+    /// automatic rung is left exactly as D-1 set it.
+    func handleAfterSubtitleDefault(_ item: AVPlayerItem) {
+        // Enumeration once per item, so the embedded tracks
+        // reach the log even if the sheet is never opened.
+        let itemID = ObjectIdentifier(item)
+        if lastEnumeratedItemID != itemID {
+            lastEnumeratedItemID = itemID
+            logEmbeddedTracks(for: item)
+        }
+        guard let autosub else { return }
+        let selection = autosub.selection
+        guard selection != .auto else { return }
+        if selection == .native {
+            if let name = pickedNativeDisplayName {
+                selectNativeOption(named: name, tag: pickedNativeLanguageTag, in: item)
+            }
+        } else {
+            // .off / .externalVI / .viAuto: no native rendering —
+            // clear whatever D-1 just selected (the overlay
+            // renders the file tracks; "off" renders nothing).
+            if let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .legible) {
+                item.select(nil, in: group)
+            }
+        }
+    }
+
+    /// v1.22.16 (AutoSub, S-5): embedded-track enumeration for
+    /// the controller's `autosub embedded …` log line —
+    /// enumeration ONLY (option count, deduplicated sorted
+    /// language codes, a Vietnamese flag computed with D-1's
+    /// matching rules); D-1's selection logic is not
+    /// duplicated here.
+    private func logEmbeddedTracks(for item: AVPlayerItem) {
+        guard let autosub else { return }
+        guard let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .legible) else {
+            autosub.noteEmbeddedTracks(count: 0, languageCodes: [], hasVietnamese: false)
+            return
+        }
+        let options = group.options
+        var codes = Set<String>()
+        for option in options {
+            codes.insert(option.locale?.language.languageCode?.identifier ?? option.extendedLanguageTag ?? "und")
+        }
+        autosub.noteEmbeddedTracks(
+            count: options.count,
+            languageCodes: codes.sorted(),
+            hasVietnamese: options.contains(where: Self.isVietnameseOption)
+        )
+    }
+
+    /// D-1's Vietnamese matching rules, reused for enumeration
+    /// only: language codes vi/vie/vnm, a `vi` BCP-47 tag
+    /// prefix, or "vietnam"/"việt" in the display name.
+    private static func isVietnameseOption(_ option: AVMediaSelectionOption) -> Bool {
+        let code = option.locale?.language.languageCode?.identifier.lowercased() ?? ""
+        let tag = option.extendedLanguageTag?.lowercased() ?? ""
+        let name = option.displayName.lowercased()
+        return ["vi", "vie", "vnm"].contains(code) || tag.hasPrefix("vi")
+            || name.contains("vietnam") || name.contains("việt")
     }
 
     /// Both transports failed or stalled: stop pretending and
@@ -1262,6 +1698,20 @@ final class PlayerSurfaceViewController: UIViewController {
                 info[MPMediaItemPropertyPlaybackDuration] = duration
             }
             MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        }
+        // v1.22.16 (AutoSub, S-5): the overlay rides THIS
+        // existing 0.25 s tick — no new timer or observer. The
+        // controller tracks position for its translation
+        // frontier; the overlay shows a cue only while a file
+        // track (external VI or auto-translated VI) is the
+        // selection — native selections render via
+        // AVFoundation and keep the overlay hidden (mutual
+        // exclusion, spec §3.5).
+        if let autosub {
+            let t = current.isFinite ? current : 0
+            autosub.notePosition(t)
+            let showOverlay = autosub.selection == .viAuto || autosub.selection == .externalVI
+            overlayView.show(text: showOverlay ? autosub.overlayText(at: t) : nil)
         }
     }
 
@@ -1437,6 +1887,12 @@ struct PlayerView: View {
     /// v1.22.6: close, owned by the resolver screen.
     var onClose: (() -> Void)?
 
+    /// v1.22.16 (AutoSub, S-5): the AutoSub controller for the
+    /// AV surface — created here (main actor, per the
+    /// controller's @MainActor isolation) and passed into the
+    /// surface, which copies it into the view controller.
+    @StateObject private var autosub = AutoSubController(surface: .av)
+
     @EnvironmentObject private var history: WatchHistoryManager
     @EnvironmentObject private var service: MovieService
     @Environment(\.dismiss) private var dismiss
@@ -1469,7 +1925,9 @@ struct PlayerView: View {
                         return fresh
                     },
                     onProgress: { save(position: $0, duration: $1, force: false) },
-                    onExit: { save(position: $0, duration: $1, force: true) }
+                    onExit: { save(position: $0, duration: $1, force: true) },
+                    subtitles: stream.subtitles,
+                    autosub: autosub
                 )
                 .ignoresSafeArea()
             } else {
@@ -1482,6 +1940,14 @@ struct PlayerView: View {
                 }
             }
 
+            // v1.22.16 (AutoSub, S-3/S-5): the translation
+            // session anchor — hosts the .translationTask the
+            // controller's translator needs (including the
+            // system language-pack prompt). Below iOS 18 the
+            // feature does not exist and no anchor is embedded.
+            if #available(iOS 18, *) {
+                AutoSubAnchorView(controller: autosub)
+            }
         }
         .statusBarHidden(true)
     }

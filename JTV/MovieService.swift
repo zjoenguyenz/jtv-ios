@@ -375,7 +375,18 @@ final class MovieService: ObservableObject {
         var currentHeaders = await defaultHeaders(for: pluginId)
         var payload = try await Net.fetchText(currentURL, headers: currentHeaders)
         var lastEmbedURL = target
-        for _ in 0..<4 {
+        // Embed-chain parse budget: 4 by default (the historical
+        // bound). A plugin may declare a larger need in its
+        // manifest (maxChainParses — hentaihub's watch-started
+        // chain needs 5); the declaration can only raise the
+        // bound, never lower it, and is capped so a bad value
+        // cannot stall resolution in serial fetches.
+        let declaredParses = await manifest(for: pluginId)?.maxChainParses ?? 0
+        let parseBudget = min(max(declaredParses, 4), 8)
+        if parseBudget != 4 {
+            DiagLog.log("resolve", "budget plugin=\(pluginId) parses=\(parseBudget)")
+        }
+        for _ in 0..<parseBudget {
             var step = await engine.parseEmbed(html: payload, url: currentURL)
             if step == nil || step?.hasPlayableURL != true {
                 let parsed = await engine.parseStream(text: payload, url: currentURL)

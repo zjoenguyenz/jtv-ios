@@ -45,6 +45,12 @@ struct KSPlayerView: View {
     /// v1.22.6: close, owned by the resolver screen.
     var onClose: (() -> Void)?
 
+    /// v1.22.16 (AutoSub, S-6): the AutoSub controller for the
+    /// KS surface — created here (main actor, per the
+    /// controller's @MainActor isolation) and passed into the
+    /// surface, which copies it into the view controller.
+    @StateObject private var autosub = AutoSubController(surface: .ks)
+
     @EnvironmentObject private var history: WatchHistoryManager
     @EnvironmentObject private var service: MovieService
     @Environment(\.dismiss) private var dismiss
@@ -74,7 +80,9 @@ struct KSPlayerView: View {
                         return fresh
                     },
                     onProgress: { save(position: $0, duration: $1, force: false) },
-                    onExit: { save(position: $0, duration: $1, force: true) }
+                    onExit: { save(position: $0, duration: $1, force: true) },
+                    subtitles: stream.subtitles,
+                    autosub: autosub
                 )
                 .ignoresSafeArea()
             } else {
@@ -85,6 +93,15 @@ struct KSPlayerView: View {
                         .buttonStyle(.bordered)
                         .tint(Theme.accent)
                 }
+            }
+
+            // v1.22.16 (AutoSub, S-3/S-6): the translation
+            // session anchor — hosts the .translationTask the
+            // controller's translator needs (including the
+            // system language-pack prompt). Below iOS 18 the
+            // feature does not exist and no anchor is embedded.
+            if #available(iOS 18, *) {
+                AutoSubAnchorView(controller: autosub)
             }
         }
         .statusBarHidden(true)
@@ -123,6 +140,14 @@ struct KSVideoPlayerSurface: UIViewControllerRepresentable {
     var onFreshStream: (() async -> StreamInfo?)?
     var onProgress: (Double, Double) -> Void
     var onExit: (Double, Double) -> Void
+    /// v1.22.16 (AutoSub, S-6): the stream's external subtitle
+    /// files (`StreamInfo.subtitles` — decoded by the plugin
+    /// engine and, until this version, dropped at exactly this
+    /// call site; RECON §B1) and the AutoSub controller for this
+    /// surface. `headers` above doubles as the subtitle fetch
+    /// headers (SubtitleTrack carries none of its own).
+    var subtitles: [SubtitleTrack] = []
+    var autosub: AutoSubController
 
     func makeCoordinator() -> Coordinator {
         Coordinator(onProgress: onProgress, onExit: onExit)
@@ -145,6 +170,14 @@ struct KSVideoPlayerSurface: UIViewControllerRepresentable {
         controller.onProgressTick = { [weak coordinator = context.coordinator] position, duration in
             coordinator?.onProgress(position, duration)
         }
+        // v1.22.16 (AutoSub, S-6): the controller and the raw
+        // external tracks follow the same copy-in pattern; the
+        // controller is handed its inputs and started once the
+        // VC is fully set up.
+        controller.autosub = autosub
+        controller.subtitles = subtitles
+        autosub.attach(subtitles: subtitles, headers: headers)
+        autosub.startEvaluation()
         context.coordinator.controller = controller
         return controller
     }
@@ -193,6 +226,22 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
     var currentSourceId = ""
     var onSwitchSource: ((Episode) -> Void)?
     var onClose: (() -> Void)?
+    /// v1.22.16 (AutoSub, S-6): the AutoSub controller for this
+    /// surface and the stream's raw external subtitle tracks,
+    /// copied in by makeUIViewController (house pattern).
+    /// FIX PASS 1 (spec B-1 / logic M1): the controller's
+    /// phase-change signal is wired HERE — the one place in
+    /// this VC — so a failed vi-auto attempt can restore the
+    /// subtitle selection that was showing before it (see
+    /// handleAutoSubPhaseChange).
+    var autosub: AutoSubController? {
+        didSet {
+            autosub?.onPhaseChange = { [weak self] in
+                self?.handleAutoSubPhaseChange()
+            }
+        }
+    }
+    var subtitles: [SubtitleTrack] = []
 
     private var playerLayer: KSPlayerLayer?
     private var ready = false
@@ -210,6 +259,37 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
     private var lastRecoveryPosition = -1.0
     private var remoteTargets: [(MPRemoteCommand, Any)] = []
     private var lastNowPlayingPush = Date.distantPast
+    // v1.22.16 (AutoSub, S-6): embedded subtitle state. The
+    // track objects are KSPlayer protocol objects (AnyObject,
+    // pre-Swift-6 module): they are held ONLY here, on this
+    // view controller's main-actor context, and are never sent
+    // across an isolation boundary — the subtitle sheet's
+    // action handlers capture only Sendable values (trackIDs
+    // and name strings), exactly like the AV surface.
+    /// Text subtitle tracks enumerated at ready-to-play and
+    /// refreshed at every subtitle-sheet build (image subtitle
+    /// tracks are filtered out — they cannot render as text;
+    /// see enumerateEmbeddedSubtitleTracks).
+    private var embeddedSubtitleTracks: [MediaPlayerTrack] = []
+    /// The user's manual embedded pick, remembered by trackID
+    /// (a recovery rebuild replaces the layer and its track
+    /// objects, so the pick is re-applied by ID after the new
+    /// layer's enumeration — see the enumeration function).
+    private var selectedEmbeddedTrackID: Int32?
+    /// FIX PASS 1 (spec B-1 / logic M1): the KS native state
+    /// snapshotted when the user taps the vi-auto row, BEFORE
+    /// every embedded track is disabled for the attempt — the
+    /// trackID of the user's manual embedded pick at that
+    /// moment, or nil when there was no pick (FIX PASS 2 /
+    /// logic N3: the snapshot is the pick only, never an
+    /// isEnabled scan — decode-enabled is not "was showing").
+    /// The separate flag distinguishes "a snapshot exists
+    /// (possibly of the no-pick state)" from "no attempt in
+    /// flight", so the failure restore in
+    /// handleAutoSubPhaseChange can be idempotent. Only
+    /// Sendable values are held, never a track object.
+    private var preVIAutoSnapshotTrackID: Int32?
+    private var hasPreVIAutoSnapshot = false
 
     private let controlsView = UIView()
     private let spinner = UIActivityIndicatorView(style: .large)
@@ -218,6 +298,17 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
     private let forwardButton = UIButton(type: .system)
     private let rotateButton = UIButton(type: .system)
     private let sourcesButton = UIButton(type: .system)
+    /// v1.22.16 (AutoSub, S-6): the captions button — always
+    /// visible on this surface (owner amendment L-12: the menu
+    /// itself reports the no-subtitles state).
+    private let captionsButton = UIButton(type: .system)
+    /// v1.22.16 (AutoSub, S-6): the subtitle overlay — sits
+    /// above the player view, below controlsView (RECON
+    /// §B1), and is driven from refreshUI()'s existing
+    /// 0.25 s tick. On this surface it is the renderer for
+    /// EVERY subtitle selection: the bare KSPlayerLayer
+    /// renders no subtitles of its own (RECON §B3).
+    private let overlayView = AutoSubOverlayView()
     private let closeButton = UIButton(type: .system)
     /// v1.22.11: the error slate's own close button, owned by
     /// the ROOT view — showError hides controlsView (and with
@@ -251,6 +342,23 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .black
+
+        // v1.22.16 (AutoSub, S-6): the subtitle overlay goes in
+        // BEFORE buildControls() adds controlsView; the player
+        // view itself is inserted at index 0 later (see
+        // beginPlaybackIfPossible), so the overlay renders
+        // above the picture but below (and never fades with)
+        // the control layer — the AV surface's z-order rule
+        // (RECON §A4/§B1).
+        overlayView.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(overlayView)
+        NSLayoutConstraint.activate([
+            overlayView.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            overlayView.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -84),
+            overlayView.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 40),
+            overlayView.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -40),
+        ])
+
         buildControls()
 
         spinner.color = .white
@@ -401,6 +509,14 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
                     }
                 }
             }
+            // v1.22.16 (AutoSub, S-6): embedded subtitle tracks
+            // are enumerated once the layer is ready (the
+            // one-shot resume seek above is untouched). FIX
+            // PASS 1 (logic M4): enumeration is unlatched — a
+            // later ready (e.g. after a restartLayer rebuild)
+            // re-enumerates even if a previous enumeration
+            // already found tracks.
+            enumerateEmbeddedSubtitleTracks()
         case .bufferFinished:
             if !playing {
                 playing = true
@@ -548,6 +664,14 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
         ready = false
         playing = false
         didSeekToStart = false
+        // v1.22.16 (AutoSub, S-6): the rebuilt layer gets a
+        // fresh embedded-track enumeration at its ready-to-play;
+        // the remembered pick (selectedEmbeddedTrackID) is kept
+        // and re-applied by ID there. FIX PASS 1 (logic M4):
+        // enumeration is unlatched, so there is no latch left to
+        // reset here — clearing the stored list until the new
+        // layer enumerates is the whole reset.
+        embeddedSubtitleTracks = []
         ended = false
         lastPositionSec = -1
         lastAdvanceAt = Date()
@@ -675,6 +799,19 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
         sourcesButton.addTarget(self, action: #selector(showSourceList), for: .touchUpInside)
         sourcesButton.isHidden = sources.count <= 1
 
+        // v1.22.16 (AutoSub, S-6): captions button — same 40 pt
+        // construction as the sources button, ALWAYS visible
+        // (owner amendment L-12: the menu itself reports the
+        // no-subtitles state, so the button never hides).
+        captionsButton.setImage(UIImage(systemName: "captions.bubble"), for: .normal)
+        captionsButton.tintColor = .white
+        captionsButton.backgroundColor = UIColor.black.withAlphaComponent(0.45)
+        captionsButton.layer.cornerRadius = 20
+        captionsButton.translatesAutoresizingMaskIntoConstraints = false
+        captionsButton.widthAnchor.constraint(equalToConstant: 40).isActive = true
+        captionsButton.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        captionsButton.addTarget(self, action: #selector(showSubtitleList), for: .touchUpInside)
+
         sourceLabel.text = sourceLabelText.isEmpty ? "" : "Nguồn: \(sourceLabelText)"
         sourceLabel.font = .systemFont(ofSize: 12, weight: .medium)
         sourceLabel.textColor = UIColor.white.withAlphaComponent(0.85)
@@ -715,7 +852,7 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
         errorCloseButton.isHidden = true
         view.addSubview(errorCloseButton)
 
-        let bottomRow = UIStackView(arrangedSubviews: [currentLabel, slider, durationLabel, sourcesButton, rotateButton])
+        let bottomRow = UIStackView(arrangedSubviews: [currentLabel, slider, durationLabel, sourcesButton, captionsButton, rotateButton])
         bottomRow.axis = .horizontal
         bottomRow.spacing = 10
         bottomRow.alignment = .center
@@ -760,6 +897,334 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
         present(sheet, animated: true)
     }
 
+    /// v1.22.16 (AutoSub, S-6): the subtitle picker — the KS
+    /// mirror of the AV surface's sheet (same pattern as
+    /// showSourceList above: UIAlertController, "✓ " prefix +
+    /// isEnabled = false for the current selection, "Huỷ"
+    /// last, popover anchored to the invoking button). Rows,
+    /// in order: off / each embedded text track / the external
+    /// VI file track / the auto-translated VI entry. The
+    /// embedded list is refreshed at every sheet build (FIX
+    /// PASS 1, logic M4 — mirroring the AV surface), so tracks
+    /// that appear after ready-to-play are listed here.
+    @objc private func showSubtitleList() {
+        // FIX PASS 1 (logic M4): re-enumerate embedded tracks
+        // on EVERY sheet build, with fresh values reported to
+        // the controller — a late-appearing embedded VI track
+        // updates T1 instead of leaving vi-auto wrongly offered.
+        enumerateEmbeddedSubtitleTracks()
+        let sheet = UIAlertController(title: "Phụ đề", message: nil, preferredStyle: .actionSheet)
+        let selection = autosub?.selection ?? .auto
+        let hasExternalVI = autosub?.hasExternalVI ?? false
+        let viAutoOffered = autosub?.viAutoOffered ?? false
+
+        // L-12 explicit empty state: no embedded text tracks
+        // and no external tracks of any kind — one disabled row.
+        if embeddedSubtitleTracks.isEmpty, !hasExternalVI, !viAutoOffered, subtitles.isEmpty {
+            let empty = UIAlertAction(title: "Không có phụ đề", style: .default)
+            empty.isEnabled = false
+            sheet.addAction(empty)
+            sheet.addAction(UIAlertAction(title: "Huỷ", style: .cancel))
+            if let pop = sheet.popoverPresentationController {
+                pop.sourceView = captionsButton
+                pop.sourceRect = captionsButton.bounds
+            }
+            present(sheet, animated: true)
+            return
+        }
+
+        // Off — current when explicitly off, or when AutoSub
+        // is still on its automatic rung and nothing is picked.
+        // There is NO automatic subtitle default on this
+        // surface (D-1 is AV-only): the initial KS state is
+        // off, and embedded picks are manual.
+        let offIsCurrent = selection == .off || (selection == .auto && selectedEmbeddedTrackID == nil)
+        let offAction = UIAlertAction(title: (offIsCurrent ? "✓ " : "") + "Tắt phụ đề", style: .default) { [weak self] _ in
+            guard let self else { return }
+            // FIX PASS 1 (M1): a new manual pick supersedes any
+            // in-flight vi-auto attempt — its failure restore
+            // must not override this pick.
+            self.clearPreVIAutoSnapshot()
+            self.disableAllEmbeddedSubtitleTracks()
+            self.autosub?.userSelectedOff()
+        }
+        offAction.isEnabled = !offIsCurrent
+        sheet.addAction(offAction)
+
+        // Embedded text tracks — the bare layer renders none
+        // of them (RECON §B3), so selecting one routes its
+        // decoded cues through the overlay (see refreshUI).
+        // Only Sendable values (trackID, name) cross into the
+        // action handlers; the track object is re-resolved
+        // from the stored list on this VC.
+        for track in embeddedSubtitleTracks {
+            let trackID = track.trackID
+            let code = track.languageCode ?? ""
+            let name = !track.name.isEmpty ? track.name : (!code.isEmpty ? code : "Phụ đề")
+            let isCurrent = trackID == selectedEmbeddedTrackID && selection != .viAuto && selection != .externalVI
+            let action = UIAlertAction(title: (isCurrent ? "✓ " : "") + name, style: .default) { [weak self] _ in
+                guard let self else { return }
+                // FIX PASS 1 (M1): a new manual pick clears any
+                // vi-auto failure-restore snapshot (see the Off
+                // row).
+                self.clearPreVIAutoSnapshot()
+                self.selectEmbeddedSubtitleTrack(trackID: trackID)
+                self.autosub?.userSelectedNative()
+            }
+            action.isEnabled = !isCurrent
+            sheet.addAction(action)
+        }
+
+        // The external Vietnamese file track — rendered by
+        // the overlay, so any embedded selection is cleared
+        // first (mutual exclusion, spec §3.5).
+        if hasExternalVI {
+            let title = externalVITitle
+            let isCurrent = selection == .externalVI
+            let action = UIAlertAction(title: (isCurrent ? "✓ " : "") + title, style: .default) { [weak self] _ in
+                guard let self else { return }
+                // FIX PASS 1 (M1): a new manual pick clears any
+                // vi-auto failure-restore snapshot (see the Off
+                // row).
+                self.clearPreVIAutoSnapshot()
+                self.disableAllEmbeddedSubtitleTracks()
+                self.autosub?.userSelectedExternalVI()
+            }
+            action.isEnabled = !isCurrent
+            sheet.addAction(action)
+        }
+
+        // Auto-translated Vietnamese — offered only when the
+        // controller's trigger conditions (spec §3.2, T1–T4)
+        // hold; its title carries the translation state.
+        if viAutoOffered, let autosub {
+            let isCurrent = selection == .viAuto
+            let action = UIAlertAction(title: (isCurrent ? "✓ " : "") + autosub.viAutoMenuTitle, style: .default) { [weak self] _ in
+                // FIX PASS 2 (spec R2-1, §3.6): the pack latch
+                // makes this entry INERT for the session. This
+                // guard is the FIRST statement: while latched the
+                // tap does NOTHING — no snapshot, no disabling of
+                // embedded tracks, no userSelectedVIAuto() call —
+                // so the subtitle restored after the decline (or
+                // failure) is never destroyed again by a re-tap
+                // whose latched controller call would no-op
+                // without firing onPhaseChange.
+                guard !(self?.autosub?.packBlocked ?? false) else { return }
+                guard let self else { return }
+                // FIX PASS 1 (spec B-1 / logic M1): snapshot the
+                // user's manual embedded pick BEFORE disabling
+                // every embedded track, so a failed attempt can
+                // restore exactly what was showing (see
+                // handleAutoSubPhaseChange).
+                self.snapshotPreVIAutoSelection()
+                self.disableAllEmbeddedSubtitleTracks()
+                self.autosub?.userSelectedVIAuto()
+            }
+            action.isEnabled = !isCurrent
+            sheet.addAction(action)
+        }
+
+        sheet.addAction(UIAlertAction(title: "Huỷ", style: .cancel))
+        if let pop = sheet.popoverPresentationController {
+            pop.sourceView = captionsButton
+            pop.sourceRect = captionsButton.bounds
+        }
+        present(sheet, animated: true)
+    }
+
+    /// The external VI file track's menu title: the first
+    /// stream track whose declared language normalises to
+    /// Vietnamese (the controller owns identification via
+    /// hasExternalVI; the track list is what the VC holds).
+    private var externalVITitle: String {
+        subtitles.first(where: {
+            AutoSubSourceLanguage.normaliseDeclared(lang: $0.lang, label: $0.label) == .vietnamese
+        })?.displayName ?? "Tiếng Việt (file rời)"
+    }
+
+    /// v1.22.16 (AutoSub, S-6): embedded-track enumeration,
+    /// run from the ready-to-play delegate handling AND at
+    /// every subtitle-sheet build. FIX PASS 1 (logic M4): the
+    /// original one-shot latch is REMOVED — enumeration is no
+    /// longer a single shot at the first ready-to-play, so a
+    /// later ready (e.g. after a restartLayer rebuild) and
+    /// every sheet build re-enumerate with fresh values, and
+    /// every enumeration reports them to the controller via
+    /// noteEmbeddedTracks (a late-appearing embedded VI track
+    /// therefore updates T1 instead of leaving vi-auto wrongly
+    /// offered). KSPlayer 2.3.4 exposes the tracks through the
+    /// layer's player (MediaPlayerProtocol.tracks(mediaType:),
+    /// pinned source AVPlayer/MediaPlayerProtocol.swift).
+    /// Image subtitle tracks are filtered OUT of the stored
+    /// list — they cannot render as text — so the reported
+    /// count is the TEXT track count the menu enumerates. A
+    /// manual pick remembered across a layer rebuild is
+    /// re-applied by trackID once the new layer's tracks are
+    /// known.
+    private func enumerateEmbeddedSubtitleTracks() {
+        guard ready, let layer = playerLayer else { return }
+        let textTracks = layer.player.tracks(mediaType: .subtitle).filter { !$0.isImageSubtitle }
+        embeddedSubtitleTracks = textTracks
+        if autosub?.selection == .native, let trackID = selectedEmbeddedTrackID,
+           let track = textTracks.first(where: { $0.trackID == trackID }) {
+            layer.player.select(track: track)
+        }
+        guard let autosub else { return }
+        var codes = Set<String>()
+        for track in textTracks {
+            codes.insert(track.languageCode ?? "und")
+        }
+        autosub.noteEmbeddedTracks(
+            count: textTracks.count,
+            languageCodes: codes.sorted(),
+            hasVietnamese: textTracks.contains(where: Self.isVietnameseTrack)
+        )
+    }
+
+    /// D-1's Vietnamese matching rules, reused for enumeration
+    /// only: language codes vi/vie/vnm, a `vi` BCP-47 prefix,
+    /// or "vietnam"/"việt" in the track name.
+    private static func isVietnameseTrack(_ track: MediaPlayerTrack) -> Bool {
+        let code = (track.languageCode ?? "").lowercased()
+        let name = track.name.lowercased()
+        return ["vi", "vie", "vnm"].contains(code) || code.hasPrefix("vi")
+            || name.contains("vietnam") || name.contains("việt")
+    }
+
+    /// Selects an embedded track exclusively through the
+    /// player's own selection API (ME semantics, pinned
+    /// source MEPlayer/MEPlayerItem.swift: the isEnabled
+    /// flags flip exclusively per media type; a text
+    /// subtitle selection performs no seek).
+    private func selectEmbeddedSubtitleTrack(trackID: Int32) {
+        guard let layer = playerLayer,
+              let track = embeddedSubtitleTracks.first(where: { $0.trackID == trackID })
+        else { return }
+        layer.player.select(track: track)
+        selectedEmbeddedTrackID = trackID
+    }
+
+    /// "Off" for embedded tracks: KSPlayer 2.3.4 has NO
+    /// deselect API, so every subtitle track (text AND
+    /// image, queried fresh from the layer) is disabled
+    /// directly — MediaPlayerTrack.isEnabled is { get set }
+    /// and on the ME engine maps to the FFmpeg stream's
+    /// discard flag (MEPlayer/FFmpegAssetTrack.swift).
+    private func disableAllEmbeddedSubtitleTracks() {
+        guard let layer = playerLayer else {
+            selectedEmbeddedTrackID = nil
+            return
+        }
+        for track in layer.player.tracks(mediaType: .subtitle) {
+            track.isEnabled = false
+        }
+        selectedEmbeddedTrackID = nil
+    }
+
+    // MARK: - FIX PASS 1 (spec B-1 / logic M1): vi-auto failure restore
+
+    /// The controller's onPhaseChange consumer (wired once, in
+    /// the `autosub` property's didSet above). The controller
+    /// ends EVERY failed vi-auto attempt — pack decline, pack
+    /// failure, total translation failure — with its selection
+    /// reverted to `.auto` and its phase `.failed`; when that
+    /// state arrives and a pre-attempt snapshot exists, the
+    /// snapshotted selection is restored here. A completed
+    /// translation (selection `.viAuto`, phase `.done`) clears
+    /// the snapshot WITHOUT restoring. Every other phase /
+    /// selection combination is ignored, so the frequent
+    /// unrelated firings (evaluation, enumeration news) are
+    /// no-ops.
+    private func handleAutoSubPhaseChange() {
+        guard let autosub else { return }
+        if autosub.selection == .auto, autosub.phase == .failed {
+            restorePreVIAutoSelection()
+        } else if autosub.selection == .viAuto, autosub.phase == .done {
+            clearPreVIAutoSnapshot()
+        }
+    }
+
+    /// Snapshots the KS native state at the moment the user
+    /// taps the vi-auto row — called BEFORE
+    /// disableAllEmbeddedSubtitleTracks() wipes it.
+    ///
+    /// FIX PASS 2 (logic N3): the snapshot captures the
+    /// VISIBLE state, not decode state. Per RECON §B3 the ME
+    /// engine auto-enables text tracks at discovery (decode
+    /// only — the bare layer renders nothing, and this app's
+    /// overlay renders embedded cues only for a manual pick),
+    /// so an `isEnabled` track does NOT mean a subtitle was
+    /// showing. The FIX PASS 1 fallback to the first
+    /// `isEnabled` text track is therefore REMOVED: the
+    /// snapshot is the user's manual embedded pick
+    /// (`selectedEmbeddedTrackID`) when one exists, else a
+    /// snapshot-of-nil — whose restore leaves everything
+    /// disabled and the overlay empty, exactly the
+    /// pre-attempt visible state. A snapshot-of-nil is still
+    /// a snapshot: `hasPreVIAutoSnapshot` is set either way.
+    private func snapshotPreVIAutoSelection() {
+        preVIAutoSnapshotTrackID = selectedEmbeddedTrackID
+        hasPreVIAutoSnapshot = true
+    }
+
+    /// Drops the snapshot without restoring — translation
+    /// success, and any new manual subtitle pick, both end the
+    /// restore obligation.
+    private func clearPreVIAutoSnapshot() {
+        hasPreVIAutoSnapshot = false
+        preVIAutoSnapshotTrackID = nil
+    }
+
+    /// Re-selects the snapshotted embedded track after a failed
+    /// vi-auto attempt. Idempotent: the snapshot is consumed
+    /// before any work, so a second firing (the controller
+    /// fires once for the selection revert and once for the
+    /// phase change) restores at most once. A nil snapshot was
+    /// the nothing-enabled state, which the attempt left
+    /// untouched — nothing to re-select. The track is looked
+    /// up FRESH in the layer's current track list by trackID;
+    /// if it no longer exists, every track stays disabled. A
+    /// gone layer/player makes the whole restore a no-op.
+    private func restorePreVIAutoSelection() {
+        guard hasPreVIAutoSnapshot else { return }
+        let snapshot = preVIAutoSnapshotTrackID
+        clearPreVIAutoSnapshot()
+        guard let snapshot, let layer = playerLayer else { return }
+        guard let track = layer.player.tracks(mediaType: .subtitle)
+            .first(where: { $0.trackID == snapshot }) else {
+            selectedEmbeddedTrackID = nil
+            return
+        }
+        layer.player.select(track: track)
+        selectedEmbeddedTrackID = snapshot
+    }
+
+    /// v1.22.16 (AutoSub, S-6): the current cue text of the
+    /// user's embedded pick, read from the ME engine's
+    /// decoded subtitle queue through KSPlayer 2.3.4's public
+    /// SubtitleDataSouce surface (pinned sources:
+    /// Subtitle/SubtitleDataSouce.swift,
+    /// MEPlayer/EmbedDataSouce.swift, Subtitle/KSSubtitle.swift).
+    /// Embedded tracks are SubtitleInfos whose subtitleID is
+    /// String(trackID); search(for:) returns the SubtitleParts
+    /// active at a time, each carrying its text as an
+    /// NSAttributedString? — the plain text is its `.string`.
+    /// Image parts carry no text and contribute nothing.
+    /// The info's delay is applied the way the library's own
+    /// SubtitleModel applies it (search at time - delay).
+    private func embeddedSubtitleText(at time: TimeInterval) -> String? {
+        guard let trackID = selectedEmbeddedTrackID, let layer = playerLayer,
+              let infos = layer.player.subtitleDataSouce?.infos,
+              let info = infos.first(where: { $0.subtitleID == String(trackID) })
+        else { return nil }
+        let parts = info.search(for: time - info.delay)
+        let text = parts.compactMap { $0.text?.string }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        return text.isEmpty ? nil : text
+    }
+
     private func refreshUI() {
         guard let layer = playerLayer, !failed else { return }
         let current = layer.player.currentPlaybackTime
@@ -792,6 +1257,32 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
                 info[MPMediaItemPropertyPlaybackDuration] = duration
             }
             MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        }
+        // v1.22.16 (AutoSub, S-6): the overlay rides THIS
+        // existing 0.25 s tick — no new timer. The controller
+        // tracks position for its translation frontier. The
+        // overlay shows a cue while a file track (external VI
+        // or auto-translated VI) is the selection, or the
+        // decoded cue of the user's embedded pick; every
+        // other state shows nothing (mutual exclusion, spec
+        // §3.5 — and on this surface the overlay is the only
+        // subtitle renderer there is, RECON §B3).
+        let t = current.isFinite ? current : 0
+        autosub?.notePosition(t)
+        let selection = autosub?.selection ?? .auto
+        if selection == .viAuto || selection == .externalVI {
+            overlayView.show(text: autosub?.overlayText(at: t))
+        } else if selection == .native || (selection == .auto && selectedEmbeddedTrackID != nil) || (autosub == nil && selectedEmbeddedTrackID != nil) {
+            // FIX PASS 1 (M1): the `.auto` + pick case is the
+            // restored pre-vi-auto selection after a failed
+            // attempt — the controller's selection stays `.auto`
+            // on failure, and on this surface the overlay is the
+            // only renderer, so the restored pick must route
+            // here or the restore would select a track the
+            // viewer never sees.
+            overlayView.show(text: embeddedSubtitleText(at: t))
+        } else {
+            overlayView.show(text: nil)
         }
     }
 

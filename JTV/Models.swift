@@ -31,12 +31,16 @@ struct PluginManifest: Codable, Identifiable, Hashable {
     /// Set from the plugins.json entry (scripts don't declare it): keeps
     /// the 18+ gate correct even for plugins added remotely later.
     var adult: Bool = false
+    /// Declared by the plugin script's getManifest(): the longest
+    /// embed chain this plugin's protocol needs the resolver to
+    /// follow. 0 = no declaration.
+    var maxChainParses: Int = 0
 
     var isManga: Bool { type.uppercased() == "MANGA" }
     var isEmbedPlayer: Bool { playerType.lowercased() == "embed" }
 
     enum CodingKeys: String, CodingKey {
-        case id, name, version, scriptUrl, iconUrl, baseUrl, isEnabled, type, playerType, adult
+        case id, name, version, scriptUrl, iconUrl, baseUrl, isEnabled, type, playerType, adult, maxChainParses
     }
 
     init() {}
@@ -53,6 +57,7 @@ struct PluginManifest: Codable, Identifiable, Hashable {
         type = try c.decodeIfPresent(String.self, forKey: .type) ?? "MOVIE"
         playerType = try c.decodeIfPresent(String.self, forKey: .playerType) ?? ""
         adult = try c.decodeIfPresent(Bool.self, forKey: .adult) ?? false
+        maxChainParses = try c.decodeIfPresent(Int.self, forKey: .maxChainParses) ?? 0
     }
 }
 
