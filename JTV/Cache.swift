@@ -107,6 +107,50 @@ enum Net {
                 if !(200...299).contains(status) {
                     throw URLError(.badServerResponse)
                 }
+                // v1.22.13: nhplayer's /player.php answers a plain
+                // URLSession fetch with a variant page whose PoW
+                // payload never materialises — the real page only
+                // exists once its own JS has run in a browser (the
+                // 1.22.12 device log showed raw bodies, no
+                // cf-detour, and extraction STILL failing). Force
+                // this one URL through the browser lane even
+                // without a Cloudflare classification. NOTE the
+                // preference order here is the OPPOSITE of the CF
+                // branch above: the gating on this host is keyed
+                // to the client, not to cookies — the phone's
+                // WebView on the same IP receives the genuine
+                // page while its URLSession fetches receive the
+                // variant, so a cookie-warmed plain retry would
+                // just fetch the variant again (and the variant
+                // passes every cfPlainRetry gate). The WebView
+                // body is the only body guaranteed to be what a
+                // real browser on this device received, and the
+                // hentaihub plugin (v1.0.2) was built and proven
+                // to extract from its DOM-serialized form. The
+                // raw retry survives only as the fallback for a
+                // failed WebView pass.
+                // Unlike the CF branch, a failed WebView pass here
+                // falls back to the ORIGINAL body: that body is
+                // what every build up to 1.22.12 returned for this
+                // page, so the forced detour can only improve on
+                // today's behaviour, never error where today
+                // succeeds. The shared triedWebView gate keeps it
+                // to one detour per fetchText call across both
+                // triggers.
+                if isNhplayerPlayerPage(url), !triedWebView {
+                    triedWebView = true
+                    if let html = await WebFetcher.fetchHTML(url: url),
+                       !html.isEmpty, !isChallengeHTML(html) {
+                        DiagLog.log("net", "cf-detour host=\(url.host ?? "?") result=webview")
+                        return html
+                    }
+                    if let raw = await cfPlainRetry(url: url, headers: headers) {
+                        DiagLog.log("net", "cf-detour host=\(url.host ?? "?") result=raw-retry")
+                        return raw
+                    }
+                    DiagLog.log("net", "cf-detour host=\(url.host ?? "?") result=origin")
+                    return text
+                }
                 return text
             } catch {
                 if (error as? URLError)?.code == .cancelled { throw error }
@@ -138,6 +182,16 @@ enum Net {
         let text = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
         guard !isCloudflareChallenge(text, status: status), !isChallengeHTML(text) else { return nil }
         return text
+    }
+
+    /// The forced-detour target (v1.22.13): nhplayer's player
+    /// page. The host must be the bare domain or a subdomain of
+    /// it, and the path exactly /player.php (URL.path never
+    /// carries the query, so ?vid=… does not disturb the match).
+    private static func isNhplayerPlayerPage(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return false }
+        guard host == "nhplayer.com" || host.hasSuffix(".nhplayer.com") else { return false }
+        return url.path == "/player.php"
     }
 
     /// POST variant for plugin hop configs that carry a postBody
