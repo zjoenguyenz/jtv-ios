@@ -113,7 +113,7 @@ enum Net {
                 // exists once its own JS has run in a browser (the
                 // 1.22.12 device log showed raw bodies, no
                 // cf-detour, and extraction STILL failing). Force
-                // this one URL through the browser lane even
+                // this URL through the browser lane even
                 // without a Cloudflare classification. NOTE the
                 // preference order here is the OPPOSITE of the CF
                 // branch above: the gating on this host is keyed
@@ -137,18 +137,31 @@ enum Net {
                 // succeeds. The shared triedWebView gate keeps it
                 // to one detour per fetchText call across both
                 // triggers.
-                if isNhplayerPlayerPage(url), !triedWebView {
+                // v1.22.14: the 1.22.13 device log proved the
+                // player step extracts fine from the lane body —
+                // the chain then died at the NEXT hop, the core
+                // script /player-core-v2.php, which rides this
+                // same plain fetcher and is gated the same way
+                // (per-resource, client-keyed). The detour now
+                // covers both gated resources (see the predicate
+                // below). The forced-mode log lines also gain
+                // byte counts — returned body vs the original
+                // plain body — so a future log can tell a
+                // genuine body from a variant shell or an empty
+                // one by size alone (host + numbers only, per
+                // the DiagLog redaction rules).
+                if isNhplayerGatedResource(url), !triedWebView {
                     triedWebView = true
                     if let html = await WebFetcher.fetchHTML(url: url),
                        !html.isEmpty, !isChallengeHTML(html) {
-                        DiagLog.log("net", "cf-detour host=\(url.host ?? "?") result=webview")
+                        DiagLog.log("net", "cf-detour host=\(url.host ?? "?") result=webview bytes=\(html.utf8.count) plain=\(text.utf8.count)")
                         return html
                     }
                     if let raw = await cfPlainRetry(url: url, headers: headers) {
-                        DiagLog.log("net", "cf-detour host=\(url.host ?? "?") result=raw-retry")
+                        DiagLog.log("net", "cf-detour host=\(url.host ?? "?") result=raw-retry bytes=\(raw.utf8.count) plain=\(text.utf8.count)")
                         return raw
                     }
-                    DiagLog.log("net", "cf-detour host=\(url.host ?? "?") result=origin")
+                    DiagLog.log("net", "cf-detour host=\(url.host ?? "?") result=origin bytes=\(text.utf8.count) plain=\(text.utf8.count)")
                     return text
                 }
                 return text
@@ -184,14 +197,19 @@ enum Net {
         return text
     }
 
-    /// The forced-detour target (v1.22.13): nhplayer's player
-    /// page. The host must be the bare domain or a subdomain of
-    /// it, and the path exactly /player.php (URL.path never
-    /// carries the query, so ?vid=… does not disturb the match).
-    private static func isNhplayerPlayerPage(_ url: URL) -> Bool {
+    /// The forced-detour targets (v1.22.13, extended
+    /// v1.22.14): nhplayer's gated resources — the player page
+    /// (/player.php) and its PoW core script
+    /// (/player-core-v2.php), the two hops of the hentaihub
+    /// chain this host serves as client-keyed variants to a
+    /// plain fetcher. The host must be the bare domain or a
+    /// subdomain of it, and the path exactly one of the two
+    /// (URL.path never carries the query, so ?vid=… / ?t=…&_=…
+    /// do not disturb the match).
+    private static func isNhplayerGatedResource(_ url: URL) -> Bool {
         guard let host = url.host?.lowercased() else { return false }
         guard host == "nhplayer.com" || host.hasSuffix(".nhplayer.com") else { return false }
-        return url.path == "/player.php"
+        return url.path == "/player.php" || url.path == "/player-core-v2.php"
     }
 
     /// POST variant for plugin hop configs that carry a postBody
