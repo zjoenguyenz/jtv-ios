@@ -13,7 +13,7 @@
     {
       "id": "123av",
       "name": "123AV",
-      "version": "1.0.4",
+      "version": "1.0.5",
       "scriptUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/plugins/mod02.js",
       "iconUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/icons/mod02.ico",
       "adult": true,
@@ -31,11 +31,11 @@
     {
       "id": "sextop1",
       "name": "Sextop1",
-      "version": "2.0.3",
+      "version": "2.0.4",
       "scriptUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/plugins/mod04.js",
-      "iconUrl": "https://sextop1.cash/favicon.ico",
+      "iconUrl": "https://sextop1.farm/favicon.ico",
       "adult": true,
-      "baseUrl": "https://sextop1.cash"
+      "baseUrl": "https://sextop1.farm"
     },
     {
       "id": "topxx",
@@ -49,7 +49,7 @@
     {
       "id": "javhd",
       "name": "JavHD",
-      "version": "1.0.6",
+      "version": "1.0.7",
       "scriptUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/plugins/mod06.js",
       "iconUrl": "https://raw.githubusercontent.com/zjoenguyenz/jtv-source/main/icons/mod06.ico",
       "adult": true,
