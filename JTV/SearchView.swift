@@ -128,6 +128,15 @@ struct SearchResultsView: View {
     @State private var isLoadingMore = false
     @State private var loadError: String?
     @State private var didLoad = false
+    /// §13.13 amendment: the cross-source actress probe's
+    /// verdict for this query — when set, the pinned actor
+    /// row renders above the film results (and the empty /
+    /// error branches yield to it).
+    @State private var actorMatch: ActorProbeResult?
+    /// The in-flight actress probe for the current query
+    /// (see the `.task` below); cancelled and replaced
+    /// whenever the query restarts, exactly as on tvOS.
+    @State private var probeTask: Task<Void, Never>?
 
     private let columns = Array(repeating: GridItem(.flexible(), spacing: 12), count: 3)
 
@@ -135,17 +144,21 @@ struct SearchResultsView: View {
         ZStack {
             Color.clear.jtvBackground()
 
-            if isLoading && items.isEmpty {
+            if isLoading && items.isEmpty && actorMatch == nil {
                 ProgressView().tint(Theme.accent).scaleEffect(1.3)
-            } else if let loadError, items.isEmpty {
+            } else if let loadError, items.isEmpty, actorMatch == nil {
                 ContentUnavailableView("Tìm kiếm thất bại", systemImage: "wifi.exclamationmark",
                                        description: Text(loadError))
-            } else if items.isEmpty && didLoad {
+            } else if items.isEmpty && didLoad && actorMatch == nil {
                 ContentUnavailableView("Không tìm thấy kết quả", systemImage: "magnifyingglass",
                                        description: Text("Không có kết quả cho “\(query)”."))
             } else {
                 ScrollView {
-                    LazyVGrid(columns: columns, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 16) {
+                        if let actorMatch {
+                            actorRow(actorMatch)
+                        }
+                        LazyVGrid(columns: columns, spacing: 16) {
                         ForEach(items) { movie in
                             NavigationLink(value: AppRoute.movie(MovieRoute(pluginId: pluginId, movie: movie))) {
                                 MovieGridCell(movie: movie)
@@ -168,12 +181,15 @@ struct SearchResultsView: View {
                                 }
                             }
                         }
+                        }
+
+                        if isLoadingMore {
+                            ProgressView().tint(Theme.accent)
+                                .frame(maxWidth: .infinity)
+                                .padding(.bottom, 8)
+                        }
                     }
                     .padding(16)
-
-                    if isLoadingMore {
-                        ProgressView().tint(Theme.accent).padding(.bottom, 24)
-                    }
                 }
             }
         }
@@ -182,9 +198,66 @@ struct SearchResultsView: View {
         .task(id: query + pluginId) {
             didLoad = false
             items = []
+            actorMatch = nil
+            // §13.13 amendment: the actress probe runs in
+            // PARALLEL with the film search, as on tvOS —
+            // a child task resolves it on its own clock,
+            // so the pinned row appears the moment the
+            // probe lands, even while page 1 is still
+            // loading; it never delays the film results.
+            // A restarted `.task` cancels the previous
+            // probe before launching its own, and
+            // cancellation drops the verdict silently,
+            // per L-15.
+            probeTask?.cancel()
+            probeTask = Task {
+                let probe = await service.actorProbe(name: query)
+                guard !Task.isCancelled else { return }
+                actorMatch = probe
+            }
             await reload()
             didLoad = true
         }
+        .onDisappear {
+            // The probe task is unstructured (it must run
+            // parallel to reload(), not inside the .task's
+            // own lifetime), so .task cancellation does not
+            // reach it: cancel it explicitly when the view
+            // goes away, per the L-15 carve-out discipline.
+            probeTask?.cancel()
+        }
+    }
+
+    /// The pinned actress row (§13.13 amendment): shown
+    /// when the cross-source probe verified the query as an
+    /// actress with actor pages. Tapping pushes the EXISTING
+    /// merged actor page, originated at the winning source
+    /// with its verified route.
+    private func actorRow(_ match: ActorProbeResult) -> some View {
+        NavigationLink(value: AppRoute.actor(ActorRoute(pluginId: match.pluginId, name: query, route: match.route))) {
+            HStack(spacing: 10) {
+                Image(systemName: "person.crop.rectangle.stack")
+                    .font(.system(size: 16))
+                    .foregroundStyle(Theme.accent)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Diễn viên: \(query)")
+                        .font(.system(size: 14.5, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                    Text("\(match.resolverCount) nguồn có trang diễn viên")
+                        .font(.system(size: 12, design: .rounded))
+                        .foregroundStyle(Theme.textDim)
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Theme.textDim)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .glassCard(cornerRadius: 14)
+        }
+        .buttonStyle(.plain)
     }
 
     private func reload() async {

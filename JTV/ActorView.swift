@@ -64,6 +64,7 @@ struct ActorView: View {
     @State private var contributors: [String] = []
     @State private var mergedAvatarUrl: String?
     @State private var mergeSettled = false
+    @State private var mergeFullySettled = false
     @State private var mergeOriginFailed = false
     @State private var isLoading = false
     @State private var isLoadingMore = false
@@ -104,6 +105,7 @@ struct ActorView: View {
         mergedAvatarUrl = coordinator.avatarUrl
         mergeOriginFailed = coordinator.originFailed
         mergeSettled = coordinator.settled
+        mergeFullySettled = coordinator.fullySettled
         if selectedKey == nil {
             selectedKey = rows.first?.id
         }
@@ -115,7 +117,7 @@ struct ActorView: View {
 
             if isLoading && rows.isEmpty {
                 ProgressView().tint(Theme.accent).scaleEffect(1.3)
-            } else if loadError != nil, rows.isEmpty, mergeSettled {
+            } else if loadError != nil, rows.isEmpty, mergeFullySettled {
                 // §13.1f: the error surface shows only once
                 // the merge has settled with zero rows —
                 // contributed rows win over it, and while the
@@ -130,7 +132,7 @@ struct ActorView: View {
                         .buttonStyle(.borderedProminent)
                         .tint(Theme.accent)
                 }
-            } else if didLoad && rows.isEmpty && !mergeSettled {
+            } else if didLoad && rows.isEmpty && !mergeFullySettled {
                 // §13.1f: still merging at zero rows (the
                 // origin may have failed) — the actor card
                 // plus a spinner; no empty copy, no error
@@ -143,7 +145,7 @@ struct ActorView: View {
                 }
                 .padding(16)
                 .frame(maxHeight: .infinity, alignment: .top)
-            } else if didLoad && rows.isEmpty && mergeSettled && loadError == nil {
+            } else if didLoad && rows.isEmpty && mergeFullySettled && loadError == nil {
                 VStack(spacing: 16) {
                     actorCard
                     ContentUnavailableView("Chưa có dữ liệu phim", systemImage: "film.stack",
