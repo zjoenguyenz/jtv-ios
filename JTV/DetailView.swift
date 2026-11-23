@@ -18,6 +18,21 @@ struct MovieDetailView: View {
     @State private var showFullDescription = false
     @State private var recoveredId: String?
     @State private var didAutoResume = false
+    /// L-23: true while a play intent is healing a stage-1
+    /// placeholder detail (see healedDetailForPlay) — the
+    /// play controls are busy, not dead, for that span.
+    /// Owned by play(): checked-and-set synchronously
+    /// before its heal Task spawns and cleared by that
+    /// Task alone (gate 12220 B-i1).
+    @State private var isHealingPlay = false
+    /// Gate 12220 B-i2: the alive half of the tvOS heal's
+    /// generation/alive pair (TVDetailView) — iOS has no
+    /// load-generation machinery (this view instance is
+    /// per-route and load() is view-managed), so the heal
+    /// re-checks this flag after its stage-2 await before
+    /// anything may present over whatever replaced this
+    /// screen. Set false in onDisappear.
+    @State private var detailAlive = true
 
     private var detail: MovieDetail? { bundle?.detail }
     private var isManga: Bool {
@@ -60,6 +75,12 @@ struct MovieDetailView: View {
         }
         .task(id: movie.id) {
             await load()
+        }
+        .onAppear {
+            detailAlive = true
+        }
+        .onDisappear {
+            detailAlive = false
         }
     }
 
@@ -251,7 +272,7 @@ struct MovieDetailView: View {
                     in: RoundedRectangle(cornerRadius: 14, style: .continuous)
                 )
             }
-            .disabled(detail.servers.isEmpty)
+            .disabled(detail.servers.isEmpty || isHealingPlay)
 
             Button {
                 favorites.toggle(pluginId: pluginId, movie: snapshotMovie)
@@ -316,6 +337,20 @@ struct MovieDetailView: View {
             }
             if !detail.directorDisplay.isEmpty {
                 metaRow(label: "Đạo diễn", value: detail.directorDisplay)
+            }
+            // Metadata overlay (1.22.20): the supplied
+            // fields, in the design's detail-page order —
+            // each row exists only when an overlay hit
+            // supplied it (the merge leaves them empty
+            // otherwise).
+            if !detail.studioLine.isEmpty {
+                metaRow(label: "Hãng phim", value: detail.studioLine)
+            }
+            if !detail.releaseDate.isEmpty {
+                metaRow(label: "Phát hành", value: detail.releaseDate)
+            }
+            if detail.runtimeMinutes > 0 {
+                metaRow(label: "Thời lượng", value: "\(detail.runtimeMinutes) phút")
             }
         }
     }
@@ -458,6 +493,7 @@ struct MovieDetailView: View {
                 )
         }
         .buttonStyle(.plain)
+        .disabled(isHealingPlay)
     }
 
     // MARK: - Playback intents
@@ -491,8 +527,71 @@ struct MovieDetailView: View {
         presenter.request = request
     }
 
+    /// L-23: the stage-1 placeholder predicate — the exact
+    /// test load() uses to decide the stage-2 swap.
+    private func isPlaceholder(_ detail: MovieDetail) -> Bool {
+        detail.servers.first?.episodes.first?.id.hasPrefix("jtvstreams:") == true
+    }
+
+    /// L-23 heal: a play intent that lands while the detail
+    /// is still the torrenthub stage-1 placeholder awaits
+    /// the shipped stage-2 expansion FIRST (the same call
+    /// load() makes, published into `bundle` the same way)
+    /// and only then lets the caller build its request from
+    /// the real list — the placeholder episode is a loading
+    /// marker, never a playable target. Returns nil when
+    /// the swapped detail still has no playable episode
+    /// (stage 2 failed or came back empty): no player is
+    /// presented and the page keeps its loading affordance.
+    /// Also returns nil when the screen has moved on during
+    /// the await (B-i2): Back during the heal must not let
+    /// the player present over the previous screen. The
+    /// isHealingPlay guard is NOT touched here — play()
+    /// owns it (B-i1).
+    private func healedDetailForPlay(_ detail: MovieDetail) async -> MovieDetail? {
+        let full = await service.detailStreams(pluginId: pluginId, movieId: movie.id, detail: detail)
+        guard detailAlive, !Task.isCancelled else { return nil }
+        if full.servers != detail.servers, var current = bundle {
+            current.detail = full
+            bundle = current
+        }
+        let healed = bundle?.detail ?? full
+        guard let first = healed.servers.first?.episodes.first,
+              !first.id.hasPrefix("jtvstreams:") else { return nil }
+        return healed
+    }
+
     private func play(episode: Episode, server: EpisodeServer, detail: MovieDetail,
                       startPosition: Double, knownStreamURL: String) {
+        // L-23: both play entries (Phát ngay via
+        // playFirstEpisode, and the episode grid) funnel
+        // through here. A tap on the stage-1 placeholder
+        // heals first, then plays the real list's first
+        // episode — the stub cell's only referent.
+        if isPlaceholder(detail) {
+            // B-i1: check-and-set the heal guard HERE,
+            // synchronously, before the Task spawns (the
+            // tvOS entries' discipline) — a second tap
+            // while a heal is in flight is a no-op, and the
+            // spawned Task is the guard's only clearer.
+            guard !isHealingPlay else { return }
+            isHealingPlay = true
+            Task {
+                defer { isHealingPlay = false }
+                guard let healed = await healedDetailForPlay(detail),
+                      let healedServer = healed.servers.first,
+                      let healedEpisode = healedServer.episodes.first else { return }
+                playNow(episode: healedEpisode, server: healedServer, detail: healed,
+                        startPosition: startPosition, knownStreamURL: knownStreamURL)
+            }
+            return
+        }
+        playNow(episode: episode, server: server, detail: detail,
+                startPosition: startPosition, knownStreamURL: knownStreamURL)
+    }
+
+    private func playNow(episode: Episode, server: EpisodeServer, detail: MovieDetail,
+                         startPosition: Double, knownStreamURL: String) {
         let request = PlaybackRequest(
             movie: snapshotMovie,
             pluginId: pluginId,
