@@ -275,6 +275,16 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         private var lastRecoveryPosition = -1.0
         private var ladderPending = false
         private var materializedFileURL: URL?
+        /// L-25 round 3: this surface's loopback registrations
+        /// from the materialize ladder — the media tiers the
+        /// vid-snap flatten registered inside
+        /// materializedPlaylist (materializedLoopbackURLs) and
+        /// the master this surface registered itself below
+        /// (materializedServerURL). Released ONLY in
+        /// teardownObservers: AVPlayer may re-read either tier
+        /// at any point while the surface lives.
+        private var materializedLoopbackURLs: [URL] = []
+        private var materializedServerURL: URL?
         private var proxyStage = 0   // 0 loader, 1 loopback server, 2 local file, 3 plain
         private var synthPending = false
         private var synthStage = 0   // 0 none, 1 loopback, 2 file, 3 exhausted
@@ -365,6 +375,8 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
                     return
                 }
                 self.materializedFileURL = prepared.fileURL
+                self.materializedLoopbackURLs = prepared.loopbackURLs
+                self.materializedServerURL = serverURL
                 if let serverURL {
                     self.proxyStage = 1
                     self.swapItem(AVPlayerItem(url: serverURL))
@@ -448,6 +460,25 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
             if let itemEndObserver {
                 NotificationCenter.default.removeObserver(itemEndObserver)
                 self.itemEndObserver = nil
+            }
+            // L-25 round 3: release this surface's loopback
+            // registrations (the master it registered plus any
+            // media tiers the vid-snap flatten registered).
+            // Deregistration happens ONLY here, at teardown —
+            // the player may re-read either playlist at any
+            // point during playback. Fire-and-forget: teardown
+            // is synchronous, deregister is queue-serialised
+            // on the server, and the stores are cleared first
+            // so a second teardown call is a no-op.
+            let loopbackURLs = materializedLoopbackURLs + [materializedServerURL].compactMap { $0 }
+            materializedLoopbackURLs = []
+            materializedServerURL = nil
+            if !loopbackURLs.isEmpty {
+                Task {
+                    for url in loopbackURLs {
+                        await LocalHLSServer.shared.deregister(url)
+                    }
+                }
             }
         }
 
