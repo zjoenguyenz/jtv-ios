@@ -40,6 +40,8 @@ struct SearchView: View {
                                        title: categoryRoute.title, initialFilters: categoryRoute.filters)
                 case .search(let searchRoute):
                     SearchResultsView(query: searchRoute.keyword, pluginId: searchRoute.pluginId)
+                case .actor(let actorRoute):
+                    ActorView(pluginId: actorRoute.pluginId, name: actorRoute.name, route: actorRoute.route)
                 }
             }
             .onChange(of: path) { _, _ in NavSanitizer.sanitize(&path) }

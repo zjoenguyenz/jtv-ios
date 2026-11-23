@@ -171,7 +171,7 @@ struct MovieDetailView: View {
                     if !detail.description.isEmpty {
                         descriptionBlock(detail)
                     }
-                    if !detail.castNames.isEmpty {
+                    if !detail.castEntries.isEmpty {
                         castsBlock(detail)
                     }
                     serversBlock(detail)
@@ -353,24 +353,46 @@ struct MovieDetailView: View {
             SectionHeader(title: "Diễn viên")
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
-                    ForEach(detail.castNames, id: \.self) { name in
-                        NavigationLink(value: AppRoute.search(SearchRoute(pluginId: pluginId, keyword: name))) {
-                            HStack(spacing: 6) {
-                                Image(systemName: "person.crop.circle")
-                                    .foregroundStyle(Theme.accent)
-                                Text(name)
-                                    .font(.system(size: 13, weight: .medium, design: .rounded))
-                                    .foregroundStyle(.white)
-                            }
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 8)
-                            .glassCard(cornerRadius: 20)
-                        }
-                        .buttonStyle(.plain)
+                    ForEach(detail.castEntries, id: \.self) { entry in
+                        castChip(entry)
                     }
                 }
             }
         }
+    }
+
+    /// Phase 2 chip routing (plan §1/§2.6): a routed entry of
+    /// a FULL-scope plugin opens that plugin's actor screen;
+    /// everything else keeps the pre-Phase-2 destination (the
+    /// keyword-search screen). The label shows the parsed
+    /// NAME — before Phase 2 the raw markdown string of a
+    /// routed cast was the chip's title.
+    @ViewBuilder
+    private func castChip(_ entry: CastEntry) -> some View {
+        if let route = entry.route, ActorScope.isFull(pluginId: pluginId) {
+            NavigationLink(value: AppRoute.actor(ActorRoute(pluginId: pluginId, name: entry.name, route: route))) {
+                chipLabel(entry.name)
+            }
+            .buttonStyle(.plain)
+        } else {
+            NavigationLink(value: AppRoute.search(SearchRoute(pluginId: pluginId, keyword: entry.name))) {
+                chipLabel(entry.name)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private func chipLabel(_ name: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "person.crop.circle")
+                .foregroundStyle(Theme.accent)
+            Text(name)
+                .font(.system(size: 13, weight: .medium, design: .rounded))
+                .foregroundStyle(.white)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .glassCard(cornerRadius: 20)
     }
 
     private func serversBlock(_ detail: MovieDetail) -> some View {
