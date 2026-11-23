@@ -191,7 +191,7 @@ struct ActorView: View {
                                 Task { @MainActor in
                                     try? await Task.sleep(for: .milliseconds(700))
                                     guard previewGeneration == retired else { return }
-                                    previewStream = nil
+                                    self.previewStream = nil
                                 }
                             })
                             .opacity(previewPlaying ? 1 : 0)
