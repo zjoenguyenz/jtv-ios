@@ -389,7 +389,13 @@ final class WebFetcher: NSObject, WKNavigationDelegate {
             // caller lands on the same placeholder it reaches
             // today, minutes sooner.
             if Task.isCancelled { return nil }
-            if Date().timeIntervalSince(enteredAt) >= 20 { return nil }
+            if Date().timeIntervalSince(enteredAt) >= 20 {
+                // 1.22.19 (L-17 amendment): a dropped waiter
+                // used to leave no trace — the expiry is now
+                // on the record with the wait it paid.
+                DiagLog.log("lane", "kind=bytes outcome=waiter-expired waited_ms=\(Int(Date().timeIntervalSince(enteredAt) * 1000))")
+                return nil
+            }
             waited = true
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
@@ -499,7 +505,12 @@ final class WebFetcher: NSObject, WKNavigationDelegate {
             // the two loops share the lane pool, so an
             // unbounded waiter here starves it identically.
             if Task.isCancelled { return nil }
-            if Date().timeIntervalSince(enteredAt) >= 20 { return nil }
+            if Date().timeIntervalSince(enteredAt) >= 20 {
+                // 1.22.19 (L-17 amendment): same expiry
+                // record as the bytes loop above.
+                DiagLog.log("lane", "kind=html outcome=waiter-expired waited_ms=\(Int(Date().timeIntervalSince(enteredAt) * 1000))")
+                return nil
+            }
             waited = true
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
@@ -615,11 +626,13 @@ final class ImageCacheManager: @unchecked Sendable {
     /// Cache keys whose full WebView fallback ladder already
     /// failed this session (see fetchBytesWithFallback).
     private var fallbackFailed: Set<String> = []
-    /// L-17 (1.3.6): full-ladder failure count per HOST this
-    /// session — the circuit breaker in
-    /// fetchBytesWithFallback. Reset by clear(), together
-    /// with the per-URL memo above.
-    private var hostLadderFailures: [String: Int] = [:]
+    /// L-17 (1.3.6): per-HOST ladder count this session —
+    /// the circuit breaker in fetchBytesWithFallback.
+    /// Reset by clear(), together with the per-URL memo
+    /// above. 1.22.19 (L-17 amendment): the counter counts
+    /// ladder ENTRIES, not completed failures — see the
+    /// breaker site in fetchBytesWithFallback.
+    private var hostLadderEntries: [String: Int] = [:]
     private let lock = NSLock()
     /// v1.22 disk tier (~300 MB, LRU by modification date): every
     /// cold launch used to re-download every poster — the memory
@@ -797,12 +810,31 @@ final class ImageCacheManager: @unchecked Sendable {
         // CDN): every poster paid a clearance + lane burn and
         // the 2 WebView lanes drowned for a whole session
         // (2026-11-22 log — lane waits climbed to 785 s).
-        // After 3 full-ladder failures this session the host
-        // fails right here: the direct attempt above still
-        // runs (a recovered host serves again immediately),
-        // but no clearance and no lane are spent on it.
-        if let host = url.host, !host.isEmpty,
-           lock.withLock({ (hostLadderFailures[host] ?? 0) >= 3 }) { return nil }
+        // After 3 this session the host fails right here:
+        // the direct attempt above still runs (a recovered
+        // host serves again immediately), but no clearance
+        // and no lane are spent on it.
+        // 1.22.19 (L-17 amendment): the count is taken at
+        // ladder ENTRY, not at ladder completion. The
+        // 1.22.18 log showed why completion counting fails:
+        // prefetch fires up to 60 loads at once, so bursts
+        // of ×8/×19 simultaneous fourhoi loads ALL passed
+        // this check while the counter still read 0 — the
+        // first completed failure only landed ~15-40 s
+        // later. Counting the entry (here, before any
+        // clearance or lane is spent) trips the breaker
+        // after 3 entries even mid-burst. A host whose
+        // ladder WORKS is unaffected in practice: once
+        // clearance lands, direct attempts succeed and
+        // the ladder is never entered again.
+        if let host = url.host, !host.isEmpty {
+            let entered = lock.withLock { () -> Bool in
+                if (hostLadderEntries[host] ?? 0) >= 3 { return false }
+                hostLadderEntries[host, default: 0] += 1
+                return true
+            }
+            guard entered else { return nil }
+        }
         await WebFetcher.ensureClearance(for: url)
         if let data = (await direct()).data { return data }
         if let data = await WebFetcher.fetchImageData(url: url, headers: hdrs) { return data }
@@ -810,11 +842,11 @@ final class ImageCacheManager: @unchecked Sendable {
         // law — never the signed/full URL) so a dead image host
         // is diagnosable from the exported log.
         DiagLog.log("image", "fallback ladder failed host=\(url.host ?? "?")")
+        // The per-URL memo is the only completion-side
+        // record now — the host's breaker count was
+        // already taken at ladder entry (1.22.19).
         lock.withLock {
             _ = fallbackFailed.insert(cacheKey)
-            if let host = url.host, !host.isEmpty {
-                hostLadderFailures[host, default: 0] += 1
-            }
         }
         return nil
     }
@@ -844,7 +876,7 @@ final class ImageCacheManager: @unchecked Sendable {
         }
         lock.withLock {
             fallbackFailed.removeAll()
-            hostLadderFailures.removeAll()
+            hostLadderEntries.removeAll()
         }
     }
 }

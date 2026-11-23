@@ -308,14 +308,14 @@ struct MovieDetailView: View {
             if !detail.episode_current.isEmpty {
                 metaRow(label: "Tiến độ", value: detail.episode_current)
             }
-            if !detail.category.isEmpty {
-                metaRow(label: "Thể loại", value: detail.category)
+            if !detail.categoryDisplay.isEmpty {
+                metaRow(label: "Thể loại", value: detail.categoryDisplay)
             }
             if !detail.country.isEmpty {
                 metaRow(label: "Quốc gia", value: detail.country)
             }
-            if !detail.director.isEmpty {
-                metaRow(label: "Đạo diễn", value: detail.director)
+            if !detail.directorDisplay.isEmpty {
+                metaRow(label: "Đạo diễn", value: detail.directorDisplay)
             }
         }
     }
