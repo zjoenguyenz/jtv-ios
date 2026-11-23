@@ -166,6 +166,13 @@ enum Net {
                 }
                 return text
             } catch {
+                // L-16 (1.3.6): the tvOS 1.3.1 per-attempt
+                // transport record (L-T17/FL-385), ported —
+                // without it the error was reduced to
+                // lastError and thrown with no trace, so a
+                // refused hop was undiagnosable from the
+                // device log (the 123av silent death).
+                DiagLog.log("net", "fetchText failed host=\(url.host ?? "?") attempt=\(attempt) status=\(attemptStatus) err=\((error as NSError).domain)#\((error as NSError).code)")
                 if (error as? URLError)?.code == .cancelled { throw error }
                 lastError = error
                 if (400..<500).contains(attemptStatus), attemptStatus != 429 { throw lastError }
@@ -237,6 +244,9 @@ enum Net {
                 }
                 return String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
             } catch {
+                // L-16 (1.3.6): same per-attempt transport
+                // record as fetchText (see above).
+                DiagLog.log("net", "fetchTextPOST failed host=\(url.host ?? "?") attempt=\(attempt) status=\(attemptStatus) err=\((error as NSError).domain)#\((error as NSError).code)")
                 if (error as? URLError)?.code == .cancelled { throw error }
                 lastError = error
                 if (400..<500).contains(attemptStatus), attemptStatus != 429 { throw lastError }
@@ -256,6 +266,9 @@ enum Net {
             do {
                 return try await session.data(for: makeRequest(url: url, headers: headers)).0
             } catch {
+                // L-16 (1.3.6): same per-attempt transport
+                // record as fetchText (see above).
+                DiagLog.log("net", "fetchData failed host=\(url.host ?? "?") attempt=\(attempt) err=\((error as NSError).domain)#\((error as NSError).code)")
                 if (error as? URLError)?.code == .cancelled { throw error }
                 lastError = error
                 if attempt < 2 {
@@ -368,6 +381,15 @@ final class WebFetcher: NSObject, WKNavigationDelegate {
                 lane.busy = false
                 return data
             }
+            // L-17 (1.3.6): a waiter used to poll forever —
+            // uncancellable, no deadline — so a flooded lane
+            // starved image loads for an entire session (the
+            // 785 s grant in the 2026-11-22 log). A waiter
+            // now gives up at ~20 s or on cancellation; the
+            // caller lands on the same placeholder it reaches
+            // today, minutes sooner.
+            if Task.isCancelled { return nil }
+            if Date().timeIntervalSince(enteredAt) >= 20 { return nil }
             waited = true
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
@@ -380,7 +402,14 @@ final class WebFetcher: NSObject, WKNavigationDelegate {
             let generation = lane.dataGeneration
             lane.dataContinuation = cont
             lane.timeoutTask = Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 40_000_000_000)
+                // L-17 (1.3.6): 40 s → 15 s for BYTES loads
+                // — the extractor's nil path resolves in
+                // ~9.3 s when a navigation completes, so an
+                // image navigation unfinished at 15 s is
+                // dead and only holds its lane hostage. The
+                // HTML load below keeps 40 s (challenge
+                // solving legitimately takes longer).
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
                 self.finishData(lane: lane, nil, generation: generation)
             }
             wv.stopLoading()
@@ -465,6 +494,12 @@ final class WebFetcher: NSObject, WKNavigationDelegate {
                 lane.busy = false
                 return html
             }
+            // L-17 (1.3.6): same waiter deadline +
+            // cancellation check as the bytes loop above —
+            // the two loops share the lane pool, so an
+            // unbounded waiter here starves it identically.
+            if Task.isCancelled { return nil }
+            if Date().timeIntervalSince(enteredAt) >= 20 { return nil }
             waited = true
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
@@ -580,6 +615,11 @@ final class ImageCacheManager: @unchecked Sendable {
     /// Cache keys whose full WebView fallback ladder already
     /// failed this session (see fetchBytesWithFallback).
     private var fallbackFailed: Set<String> = []
+    /// L-17 (1.3.6): full-ladder failure count per HOST this
+    /// session — the circuit breaker in
+    /// fetchBytesWithFallback. Reset by clear(), together
+    /// with the per-URL memo above.
+    private var hostLadderFailures: [String: Int] = [:]
     private let lock = NSLock()
     /// v1.22 disk tier (~300 MB, LRU by modification date): every
     /// cold launch used to re-download every poster — the memory
@@ -751,6 +791,18 @@ final class ImageCacheManager: @unchecked Sendable {
         if let data = first.data { return data }
         guard first.wall else { return nil }
         if lock.withLock({ fallbackFailed.contains(cacheKey) }) { return nil }
+        // L-17 (1.3.6): per-host circuit breaker. The per-URL
+        // memo above cannot stop a wall-refusing host with
+        // endless unique URLs (fourhoi.com, MissAV's image
+        // CDN): every poster paid a clearance + lane burn and
+        // the 2 WebView lanes drowned for a whole session
+        // (2026-11-22 log — lane waits climbed to 785 s).
+        // After 3 full-ladder failures this session the host
+        // fails right here: the direct attempt above still
+        // runs (a recovered host serves again immediately),
+        // but no clearance and no lane are spent on it.
+        if let host = url.host, !host.isEmpty,
+           lock.withLock({ (hostLadderFailures[host] ?? 0) >= 3 }) { return nil }
         await WebFetcher.ensureClearance(for: url)
         if let data = (await direct()).data { return data }
         if let data = await WebFetcher.fetchImageData(url: url, headers: hdrs) { return data }
@@ -758,7 +810,12 @@ final class ImageCacheManager: @unchecked Sendable {
         // law — never the signed/full URL) so a dead image host
         // is diagnosable from the exported log.
         DiagLog.log("image", "fallback ladder failed host=\(url.host ?? "?")")
-        lock.withLock { _ = fallbackFailed.insert(cacheKey) }
+        lock.withLock {
+            _ = fallbackFailed.insert(cacheKey)
+            if let host = url.host, !host.isEmpty {
+                hostLadderFailures[host, default: 0] += 1
+            }
+        }
         return nil
     }
 
@@ -785,7 +842,10 @@ final class ImageCacheManager: @unchecked Sendable {
                 try? FileManager.default.removeItem(at: entry)
             }
         }
-        lock.withLock { fallbackFailed.removeAll() }
+        lock.withLock {
+            fallbackFailed.removeAll()
+            hostLadderFailures.removeAll()
+        }
     }
 }
 

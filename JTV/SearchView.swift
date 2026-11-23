@@ -197,7 +197,14 @@ struct SearchResultsView: View {
             totalPages = max(result.pagination.totalPages, 1)
             page = result.pagination.currentPage
         } catch {
-            loadError = error.localizedDescription
+            // L-15: cancellation is not an error — a
+            // churned instance being torn down stays
+            // silent instead of surfacing a failure.
+            if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                DiagLog.log("search", "results cancelled plugin=\(pluginId)")
+            } else {
+                loadError = error.localizedDescription
+            }
         }
         isLoading = false
     }

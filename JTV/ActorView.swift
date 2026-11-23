@@ -41,6 +41,13 @@ extension MovieRoute: Identifiable {
     var id: String { "\(pluginId)#\(movie.id)#\(autoResume)" }
 }
 
+/// Same precedent for the merged filmography (§13.7): a
+/// row's identity is its source plus the film's slug within
+/// that source — Movie.id alone collides across sources.
+extension ActorFilmRow: Identifiable {
+    var id: String { "\(pluginId)#\(movie.id)" }
+}
+
 struct ActorView: View {
     let pluginId: String
     let name: String
@@ -49,15 +56,23 @@ struct ActorView: View {
     @EnvironmentObject private var service: MovieService
     @EnvironmentObject private var plugins: PluginManager
 
-    @State private var items: [Movie] = []
-    @State private var page = 0
-    @State private var totalPages = 1
+    // §13.7: the list is the coordinator's merged rows,
+    // mirrored into @State on every onChange. The
+    // coordinator owns every source's pagination cursor.
+    @State private var rows: [ActorFilmRow] = []
+    @State private var mergeCoordinator: ActorMergeCoordinator?
+    @State private var contributors: [String] = []
+    @State private var mergedAvatarUrl: String?
+    @State private var mergeSettled = false
+    @State private var mergeOriginFailed = false
     @State private var isLoading = false
     @State private var isLoadingMore = false
     @State private var loadError: String?
     @State private var didLoad = false
 
-    @State private var selectedId: String?
+    @State private var selectedKey: String?
+    @State private var avatarImage: UIImage?
+    @State private var avatarLogged = false
     @State private var previewStream: StreamInfo?
     @State private var previewGeneration = 0
     @State private var previewPlaying = false
@@ -68,17 +83,44 @@ struct ActorView: View {
         plugins.installedPlugin(id: pluginId)?.manifest.name ?? pluginId
     }
 
-    private var selectedMovie: Movie? {
-        items.first { $0.id == selectedId } ?? items.first
+    private var selectedRow: ActorFilmRow? {
+        rows.first { $0.id == selectedKey } ?? rows.first
+    }
+
+    private func sourceName(_ id: String) -> String {
+        plugins.installedPlugin(id: id)?.manifest.name ?? id
+    }
+
+    /// Copies the coordinator's published state into the
+    /// view's @State mirrors. Selection: a fresh reload
+    /// clears selectedKey first (see reload), so the first
+    /// mirror that carries rows seeds it with the first
+    /// row's key; once a selection exists an append NEVER
+    /// changes it (§13.1g).
+    private func mirrorMergeState() {
+        guard let coordinator = mergeCoordinator else { return }
+        rows = coordinator.rows
+        contributors = coordinator.contributors
+        mergedAvatarUrl = coordinator.avatarUrl
+        mergeOriginFailed = coordinator.originFailed
+        mergeSettled = coordinator.settled
+        if selectedKey == nil {
+            selectedKey = rows.first?.id
+        }
     }
 
     var body: some View {
         ZStack {
             Color.clear.jtvBackground()
 
-            if isLoading && items.isEmpty {
+            if isLoading && rows.isEmpty {
                 ProgressView().tint(Theme.accent).scaleEffect(1.3)
-            } else if loadError != nil, items.isEmpty {
+            } else if loadError != nil, rows.isEmpty, mergeSettled {
+                // §13.1f: the error surface shows only once
+                // the merge has settled with zero rows —
+                // contributed rows win over it, and while the
+                // merge still runs the spinner branch below
+                // covers the page.
                 ContentUnavailableView {
                     Label("Không tải được danh sách phim", systemImage: "wifi.exclamationmark")
                 } description: {
@@ -88,7 +130,20 @@ struct ActorView: View {
                         .buttonStyle(.borderedProminent)
                         .tint(Theme.accent)
                 }
-            } else if didLoad && items.isEmpty {
+            } else if didLoad && rows.isEmpty && !mergeSettled {
+                // §13.1f: still merging at zero rows (the
+                // origin may have failed) — the actor card
+                // plus a spinner; no empty copy, no error
+                // surface.
+                VStack(spacing: 16) {
+                    actorCard
+                    ProgressView().tint(Theme.accent)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 24)
+                }
+                .padding(16)
+                .frame(maxHeight: .infinity, alignment: .top)
+            } else if didLoad && rows.isEmpty && mergeSettled && loadError == nil {
                 VStack(spacing: 16) {
                     actorCard
                     ContentUnavailableView("Chưa có dữ liệu phim", systemImage: "film.stack",
@@ -124,8 +179,9 @@ struct ActorView: View {
             MovieDetailView(pluginId: route.pluginId, movie: route.movie, autoResume: route.autoResume)
         }
         .task { if !didLoad { await reload() } }
-        .task(id: selectedId ?? "-") { await runPreview() }
-        .onChange(of: selectedId) { _, _ in
+        .task(id: selectedKey ?? "-") { await runPreview() }
+        .task(id: mergedAvatarUrl) { await loadAvatar() }
+        .onChange(of: selectedKey) { _, _ in
             previewStream = nil
             previewPlaying = false
             previewNoTrailer = false
@@ -140,11 +196,20 @@ struct ActorView: View {
             ZStack {
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
                     .fill(Theme.glassFill)
-                Image(systemName: "person.fill")
-                    .font(.system(size: 30))
-                    .foregroundStyle(Theme.accent)
+                if let avatarImage {
+                    // §13.1e: the borrowed TopXX portrait,
+                    // filling the glyph slot's shape.
+                    Image(uiImage: avatarImage)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                } else {
+                    Image(systemName: "person.fill")
+                        .font(.system(size: 30))
+                        .foregroundStyle(Theme.accent)
+                }
             }
             .frame(width: 64, height: 64)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(Theme.glassStroke, lineWidth: 1))
             VStack(alignment: .leading, spacing: 4) {
@@ -152,12 +217,22 @@ struct ActorView: View {
                     .font(.system(size: 19, weight: .bold, design: .rounded))
                     .foregroundStyle(.white)
                     .lineLimit(1)
-                Text("\(items.count) phim · Nguồn \(pluginName)")
+                Text(headerSubLine)
                     .font(.system(size: 13, design: .rounded))
                     .foregroundStyle(Theme.textDim)
-                Text("Nguồn không có ảnh đại diện")
-                    .font(.system(size: 12, design: .rounded))
-                    .foregroundStyle(Theme.textFaint)
+                    .lineLimit(2)
+                if avatarImage == nil {
+                    Text("Nguồn không có ảnh đại diện")
+                        .font(.system(size: 12, design: .rounded))
+                        .foregroundStyle(Theme.textFaint)
+                } else if !contributors.contains("topxx") {
+                    // §13.1e edge: TopXX supplied the portrait
+                    // but is named nowhere in the sub-line
+                    // (it contributed zero rows).
+                    Text("Ảnh đại diện: TopXX")
+                        .font(.system(size: 12, design: .rounded))
+                        .foregroundStyle(Theme.textFaint)
+                }
             }
             Spacer(minLength: 0)
         }
@@ -165,18 +240,60 @@ struct ActorView: View {
         .glassCard(cornerRadius: 18)
     }
 
+    /// §13.1b's three sub-line states, from the mirrored
+    /// contributor set (coordinator order: origin first when
+    /// it contributed, then canonical order; only sources
+    /// with ≥1 row on screen are named).
+    private var headerSubLine: String {
+        let names = contributors.map { sourceName($0) }
+        let named = names.enumerated()
+            .map { $0.offset == 0 ? "Nguồn \($0.element)" : $0.element }
+            .joined(separator: " · ")
+        if !mergeSettled {
+            // The running suffix is the header's ONLY
+            // loading indicator.
+            if names.isEmpty {
+                return "\(rows.count) phim · Đang tìm thêm…"
+            }
+            return "\(rows.count) phim · \(named) · Đang tìm thêm…"
+        }
+        if contributors.count >= 2 || (mergeOriginFailed && !contributors.isEmpty) {
+            return "\(rows.count) phim · \(named)"
+        }
+        // Settled solo — byte-identical to 1.22.17.
+        return "\(rows.count) phim · Nguồn \(contributors.first.map { sourceName($0) } ?? pluginName)"
+    }
+
+    /// §13.1e: loads the borrowed portrait the coordinator
+    /// published. Any failure leaves the glyph in place; the
+    /// `avatar source=topxx` line fires exactly once per
+    /// view, only when a borrowed avatar is actually shown.
+    private func loadAvatar() async {
+        avatarImage = nil
+        guard let url = mergedAvatarUrl else { return }
+        guard let image = await ImageCacheManager.shared.loadImage(urlString: url) else { return }
+        avatarImage = image
+        if !avatarLogged {
+            avatarLogged = true
+            DiagLog.log("actor", "avatar source=topxx")
+        }
+    }
+
     // MARK: Trailer frame (drawing: 16:9 hero at the top)
 
     private var trailerFrame: some View {
         Button {
-            if let selectedMovie {
-                detailRoute = MovieRoute(pluginId: pluginId, movie: selectedMovie)
+            if let selectedRow {
+                // §13.1g freeze on push, with the ROW's own
+                // source identity (§13.6).
+                mergeCoordinator?.freeze()
+                detailRoute = MovieRoute(pluginId: selectedRow.pluginId, movie: selectedRow.movie)
             }
         } label: {
             ZStack {
                 RoundedRectangle(cornerRadius: 18, style: .continuous)
                     .fill(Theme.bgMid)
-                if let movie = selectedMovie {
+                if let movie = selectedRow?.movie {
                     if !movie.displayBackdrop.isEmpty {
                         CachedAsyncImage(urlString: movie.displayBackdrop)
                     }
@@ -241,7 +358,7 @@ struct ActorView: View {
 
     @ViewBuilder
     private var captionRow: some View {
-        if let movie = selectedMovie {
+        if let movie = selectedRow?.movie {
             HStack(alignment: .firstTextBaseline, spacing: 10) {
                 Text(movie.title)
                     .font(.system(size: 15, weight: .semibold, design: .rounded))
@@ -260,10 +377,10 @@ struct ActorView: View {
 
     private var rowsList: some View {
         LazyVStack(spacing: 10) {
-            ForEach(items) { movie in
-                row(movie)
+            ForEach(rows) { filmRow in
+                row(filmRow)
                     .onAppear {
-                        if movie.id == items.last?.id {
+                        if filmRow.id == rows.last?.id {
                             Task { await loadMore() }
                         }
                     }
@@ -271,13 +388,17 @@ struct ActorView: View {
         }
     }
 
-    private func row(_ movie: Movie) -> some View {
-        let isSelected = selectedMovie?.id == movie.id
+    private func row(_ filmRow: ActorFilmRow) -> some View {
+        let movie = filmRow.movie
+        let isSelected = selectedRow?.id == filmRow.id
         return Button {
             if isSelected {
-                detailRoute = MovieRoute(pluginId: pluginId, movie: movie)
+                // §13.1g freeze on push; the route carries
+                // the ROW's source (§13.6).
+                mergeCoordinator?.freeze()
+                detailRoute = MovieRoute(pluginId: filmRow.pluginId, movie: movie)
             } else {
-                selectedId = movie.id
+                selectedKey = filmRow.id
             }
         } label: {
             HStack(alignment: .center, spacing: 12) {
@@ -289,7 +410,7 @@ struct ActorView: View {
                         .font(.system(size: 15, weight: .semibold, design: .rounded))
                         .foregroundStyle(.white)
                         .lineLimit(1)
-                    Text(rowMeta(movie))
+                    Text(rowMeta(filmRow))
                         .font(.system(size: 12.5, design: .rounded))
                         .foregroundStyle(Theme.textDim)
                         .lineLimit(1)
@@ -315,52 +436,88 @@ struct ActorView: View {
         .buttonStyle(.plain)
     }
 
-    private func rowMeta(_ movie: Movie) -> String {
+    private func rowMeta(_ filmRow: ActorFilmRow) -> String {
+        let movie = filmRow.movie
         var parts: [String] = []
         if movie.year > 0 { parts.append(String(movie.year)) }
         if !movie.quality.isEmpty { parts.append(movie.quality) }
         if !movie.episode_current.isEmpty { parts.append(movie.episode_current) }
+        // §13.1d: a non-origin row names its source as the
+        // meta line's final segment; origin rows unchanged.
+        if filmRow.pluginId != pluginId { parts.append(sourceName(filmRow.pluginId)) }
         return parts.joined(separator: " · ")
     }
 
     // MARK: List loading (CategoryDetailView's discipline)
 
     private func reload() async {
+        // Gate fix (C-M2): the OUTGOING coordinator is
+        // frozen BEFORE its replacement is installed — a
+        // superseded coordinator's target/budget tasks then
+        // wind down under the coordinator's frozen guards
+        // instead of running on beside the new visit.
+        mergeCoordinator?.freeze()
         isLoading = true
         loadError = nil
+        // §13.7: a FRESH coordinator per reload; clearing
+        // the selection makes the mirror re-seed it from
+        // the new first row (appends never touch an
+        // existing selection — mirrorMergeState).
+        selectedKey = nil
+        let coordinator = ActorMergeCoordinator(service: service, originPluginId: pluginId, name: name)
+        coordinator.originRoute = route
+        coordinator.onChange = { self.mirrorMergeState() }
+        mergeCoordinator = coordinator
         do {
             let result = try await service.list(pluginId: pluginId, slug: route,
                                                 filters: ListFilters(), page: 1)
-            items = result.items
-            page = result.pagination.currentPage
-            totalPages = max(result.pagination.totalPages, 1)
-            if selectedId == nil { selectedId = items.first?.id }
-            DiagLog.log("actor", "list plugin=\(pluginId) count=\(items.count) totalPages=\(totalPages)")
+            coordinator.begin(originFirstPage: result, originFailed: false)
+            mirrorMergeState()
+            DiagLog.log("actor", "list plugin=\(pluginId) count=\(rows.count) totalPages=\(max(result.pagination.totalPages, 1))")
         } catch {
-            loadError = error.localizedDescription
-            DiagLog.log("actor", "list failed plugin=\(pluginId) kind=\((error as NSError).domain)#\((error as NSError).code)")
+            // L-15: cancellation is not an error — an
+            // instance torn down mid-load (view churn)
+            // must not flash the error state or mark the
+            // origin failed for a merge nobody is watching.
+            if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                DiagLog.log("actor", "list cancelled plugin=\(pluginId)")
+                // Gate fix (C-M3): a cancelled reload leaves
+                // the view UNLOADED — didLoad stays false.
+                // The fresh coordinator above was never begun,
+                // so claiming a completed load here would
+                // strand the page in the still-merging branch
+                // with no merge running and no retry path;
+                // with didLoad false the page keeps its
+                // pre-load surface and re-entering re-runs the
+                // load. (Beginning the coordinator as
+                // origin-failed instead would contradict the
+                // L-15 rule above: a cancelled load is not an
+                // origin failure.)
+                isLoading = false
+                return
+            } else {
+                loadError = error.localizedDescription
+                DiagLog.log("actor", "list failed plugin=\(pluginId) kind=\((error as NSError).domain)#\((error as NSError).code)")
+                // §13.1f: the targets still run on an origin
+                // failure — contributed rows win over the
+                // error surface.
+                coordinator.begin(originFirstPage: nil, originFailed: true)
+            }
         }
         isLoading = false
         didLoad = true
     }
 
     private func loadMore() async {
-        guard didLoad, !isLoading, !isLoadingMore, page >= 1, page < totalPages else { return }
+        guard didLoad, !isLoading, !isLoadingMore,
+              let coordinator = mergeCoordinator else { return }
         isLoadingMore = true
         defer { isLoadingMore = false }
-        do {
-            let result = try await service.list(pluginId: pluginId, slug: route,
-                                                filters: ListFilters(), page: page + 1)
-            let known = Set(items.map { $0.id })
-            items.append(contentsOf: result.items.filter { !known.contains($0.id) })
-            page = result.pagination.currentPage
-            totalPages = max(result.pagination.totalPages, totalPages)
-            DiagLog.log("actor", "list.more plugin=\(pluginId) count=\(items.count) page=\(page)")
-        } catch {
-            // Keep current items; pagination failures are
-            // non-fatal (the app's discipline).
-            DiagLog.log("actor", "list.more failed plugin=\(pluginId) kind=\((error as NSError).domain)#\((error as NSError).code)")
-        }
+        // §13.5 lockstep pagination lives in the
+        // coordinator (it owns every cursor and logs the
+        // cycle's `merge more` line, §13.9); its onChange
+        // mirrors the appended rows back here.
+        await coordinator.loadMore()
     }
 
     // MARK: Preview (selection-driven — the touch model has
@@ -375,10 +532,10 @@ struct ActorView: View {
     private static let embedChainPlugins: Set<String> = ["123av", "javhd", "avdbapi"]
 
     private func runPreview() async {
-        guard let movie = selectedMovie else { return }
+        guard let row = selectedRow else { return }
         previewGeneration += 1
         let generation = previewGeneration
-        let stream = await resolveActorPreview(movie: movie)
+        let stream = await resolveActorPreview(row: row)
         guard !Task.isCancelled, generation == previewGeneration else { return }
         if let stream {
             previewNoTrailer = false
@@ -386,7 +543,7 @@ struct ActorView: View {
         } else {
             previewStream = nil
             previewNoTrailer = true
-            DiagLog.log("actor", "preview outcome=no-trailer plugin=\(pluginId) movie=\(movie.id)")
+            DiagLog.log("actor", "preview outcome=no-trailer plugin=\(row.pluginId) movie=\(row.movie.id)")
         }
     }
 
@@ -421,7 +578,13 @@ struct ActorView: View {
         return stream
     }
 
-    private func resolveActorPreview(movie: Movie) async -> StreamInfo? {
+    private func resolveActorPreview(row: ActorFilmRow) async -> StreamInfo? {
+        // §13.6: every step below runs against the ROW's
+        // source — the local pluginId shadows the page's
+        // origin for the whole resolution (detail call,
+        // embed-chain gate, PlaybackRequest, log lines).
+        let movie = row.movie
+        let pluginId = row.pluginId
         // Fast path: the list item's own preview clip.
         if !movie.previewUrl.isEmpty, MediaURL.isDirectMedia(movie.previewUrl) {
             let declaredRank = max(Self.declaredQualityRank(movie.quality),

@@ -40,6 +40,13 @@ import MediaPlayer
 struct KSPlayerView: View {
     let stream: StreamInfo
     let request: PlaybackRequest
+    /// SPEC-136 §2.6/§4.3: when a cross-source fallback served
+    /// this play, the resolver passes the ORIGIN request here
+    /// and history is written under that identity (with an
+    /// empty streamURL — the serving plugin's URL must not
+    /// enter the origin title's fast-resume path). Nil (every
+    /// other construction site) = today's behaviour exactly.
+    var historyRequest: PlaybackRequest? = nil
     /// v1.22.4: source switching, owned by the resolver screen.
     var onSwitchSource: ((Episode) -> Void)?
     /// v1.22.6: close, owned by the resolver screen.
@@ -65,7 +72,7 @@ struct KSPlayerView: View {
                     startPosition: request.startPosition,
                     title: request.movie.title,
                     patientMode: request.episode.id.hasPrefix("jtvhash:"),
-                    sourceLabel: request.episode.name,
+                    sourceLabel: PlayerView.sourceLabelText(for: request),
                     sources: request.switchList.isEmpty
                         ? (request.allEpisodes.isEmpty ? [request.episode] : request.allEpisodes)
                         : request.switchList,
@@ -108,15 +115,20 @@ struct KSPlayerView: View {
     }
 
     private func save(position: Double, duration: Double, force: Bool) {
+        // SPEC-136 §2.6: a fallback-served play is recorded
+        // under the ORIGIN identity (historyRequest) with an
+        // EMPTY streamURL; every other play is byte-identical
+        // to before (historyRequest nil → request, stream.url).
+        let recordRequest = historyRequest ?? request
         let record = HistoryRecord(
-            pluginId: request.pluginId,
-            pluginName: request.pluginName,
+            pluginId: recordRequest.pluginId,
+            pluginName: recordRequest.pluginName,
             isManga: false,
-            movie: request.movie,
-            serverName: request.serverName,
-            episodeName: request.episode.name,
-            episodeId: request.episode.id,
-            streamURL: stream.url,
+            movie: recordRequest.movie,
+            serverName: recordRequest.serverName,
+            episodeName: recordRequest.episode.name,
+            episodeId: recordRequest.episode.id,
+            streamURL: historyRequest == nil ? stream.url : "",
             lastPosition: position,
             duration: duration,
             updatedAt: Date()
@@ -879,7 +891,10 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
 
     /// v1.22.4: the sibling-source picker (see the AV surface).
     @objc private func showSourceList() {
-        let sheet = UIAlertController(title: "Chọn nguồn khác", message: "Nguồn đang phát: \(sourceLabelText)", preferredStyle: .actionSheet)
+        // SPEC-136 §1A: no new copy — the message inherits the
+        // §1A template via sourceLabelText; when the composed
+        // text is empty the message is omitted (nil).
+        let sheet = UIAlertController(title: "Chọn nguồn khác", message: sourceLabelText.isEmpty ? nil : "Nguồn đang phát: \(sourceLabelText)", preferredStyle: .actionSheet)
         for episode in sources {
             let isCurrent = episode.id == currentSourceId
             let action = UIAlertAction(title: (isCurrent ? "✓ " : "") + episode.name, style: .default) { [weak self] _ in

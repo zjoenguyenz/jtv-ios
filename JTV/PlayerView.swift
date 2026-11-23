@@ -1290,7 +1290,10 @@ final class PlayerSurfaceViewController: UIViewController {
     /// resolver, which re-resolves and resumes at the position
     /// the surface has been saving to history.
     @objc private func showSourceList() {
-        let sheet = UIAlertController(title: "Chọn nguồn khác", message: "Nguồn đang phát: \(sourceLabelText)", preferredStyle: .actionSheet)
+        // SPEC-136 §1A: no new copy — the message inherits the
+        // §1A template via sourceLabelText; when the composed
+        // text is empty the message is omitted (nil).
+        let sheet = UIAlertController(title: "Chọn nguồn khác", message: sourceLabelText.isEmpty ? nil : "Nguồn đang phát: \(sourceLabelText)", preferredStyle: .actionSheet)
         for episode in sources {
             let isCurrent = episode.id == currentSourceId
             let action = UIAlertAction(title: (isCurrent ? "✓ " : "") + episode.name, style: .default) { [weak self] _ in
@@ -1882,6 +1885,13 @@ extension PlayerSurfaceViewController: AVPictureInPictureControllerDelegate {
 struct PlayerView: View {
     let stream: StreamInfo
     let request: PlaybackRequest
+    /// SPEC-136 §2.6/§4.3: when a cross-source fallback served
+    /// this play, the resolver passes the ORIGIN request here
+    /// and history is written under that identity (with an
+    /// empty streamURL — the serving plugin's URL must not
+    /// enter the origin title's fast-resume path). Nil (every
+    /// other construction site) = today's behaviour exactly.
+    var historyRequest: PlaybackRequest? = nil
     /// v1.22.4: source switching, owned by the resolver screen.
     var onSwitchSource: ((Episode) -> Void)?
     /// v1.22.6: close, owned by the resolver screen.
@@ -1908,7 +1918,7 @@ struct PlayerView: View {
                     startViaProxy: stream.requiresProxy,
                     title: request.movie.title,
                     patientMode: request.episode.id.hasPrefix("jtvhash:"),
-                    sourceLabel: request.episode.name,
+                    sourceLabel: Self.sourceLabelText(for: request),
                     sources: request.switchList.isEmpty
                         ? (request.allEpisodes.isEmpty ? [request.episode] : request.allEpisodes)
                         : request.switchList,
@@ -1952,16 +1962,33 @@ struct PlayerView: View {
         .statusBarHidden(true)
     }
 
+    /// SPEC-136 §1A: the ONE source-label template for ALL
+    /// plays, composed from the EFFECTIVE (playing) request:
+    /// `<episode.name> · <pluginName>` — empty segments dropped;
+    /// both empty → "" (the surface hides the label, and the
+    /// source-list sheet omits its message). The surface adds
+    /// the "Nguồn: " prefix when rendering.
+    static func sourceLabelText(for request: PlaybackRequest) -> String {
+        [request.episode.name, request.pluginName]
+            .filter { !$0.isEmpty }
+            .joined(separator: " · ")
+    }
+
     private func save(position: Double, duration: Double, force: Bool) {
+        // SPEC-136 §2.6: a fallback-served play is recorded
+        // under the ORIGIN identity (historyRequest) with an
+        // EMPTY streamURL; every other play is byte-identical
+        // to before (historyRequest nil → request, stream.url).
+        let recordRequest = historyRequest ?? request
         let record = HistoryRecord(
-            pluginId: request.pluginId,
-            pluginName: request.pluginName,
+            pluginId: recordRequest.pluginId,
+            pluginName: recordRequest.pluginName,
             isManga: false,
-            movie: request.movie,
-            serverName: request.serverName,
-            episodeName: request.episode.name,
-            episodeId: request.episode.id,
-            streamURL: stream.url,
+            movie: recordRequest.movie,
+            serverName: recordRequest.serverName,
+            episodeName: recordRequest.episode.name,
+            episodeId: recordRequest.episode.id,
+            streamURL: historyRequest == nil ? stream.url : "",
             lastPosition: position,
             duration: duration,
             updatedAt: Date()
@@ -2247,6 +2274,29 @@ struct PlaybackResolverView: View {
     /// switch swaps its episode (and carries the saved position)
     /// while the rest of the request stays identical.
     @State private var activeRequest: PlaybackRequest
+    /// SPEC-136 §4.3: the INITIAL request, kept immutable — a
+    /// fallback serve replaces activeRequest's playing context
+    /// but the title identity (movie) and the history identity
+    /// always come from here (§1A/§2.6).
+    @State private var originRequest: PlaybackRequest
+    /// SPEC-136 §4.3: the origin copy handed to the player
+    /// views as `historyRequest` when (and only when) a
+    /// fallback served this play; nil otherwise.
+    @State private var historyRequest: PlaybackRequest? = nil
+    /// SPEC-136 §2.3 (gate fix M-1): set by switchSource —
+    /// a manual in-player pick routes to the plain raced
+    /// resolve and NEVER into resolveWithFallback. Lives for
+    /// this resolver view's lifetime, exactly like the tvOS
+    /// session's manualSourceChosen: a fresh entry (a new
+    /// resolver view) starts unmarked, and a retry of a
+    /// manual attempt stays manual.
+    @State private var manualSwitchAttempt = false
+    /// SPEC-136 §5.3/§1C: torrent phase state for the resolving
+    /// spinner line. A lock-guarded box (the DebridPhase2RaceBox
+    /// idiom) because the core's phase callback is @Sendable
+    /// and fires off the main actor; the .resolving view reads
+    /// snapshots from its 1 s TimelineView tick.
+    @State private var debridWaitBox = DebridWaitBox()
     /// Guards against a stale resolve landing after a switch:
     /// only the newest generation may set the phase.
     @State private var resolveGeneration = 0
@@ -2254,6 +2304,7 @@ struct PlaybackResolverView: View {
     init(request: PlaybackRequest) {
         self.request = request
         _activeRequest = State(initialValue: request)
+        _originRequest = State(initialValue: request)
     }
 
     private enum Phase {
@@ -2275,9 +2326,7 @@ struct PlaybackResolverView: View {
             case .resolving:
                 VStack(spacing: 16) {
                     ProgressView().tint(Theme.accent).scaleEffect(1.3)
-                    Text("Đang lấy link phát…")
-                        .font(.system(size: 14, weight: .medium, design: .rounded))
-                        .foregroundStyle(Theme.textDim)
+                    resolvingStatusLine
                     Text(activeRequest.episode.name)
                         .font(.system(size: 12, design: .rounded))
                         .foregroundStyle(Theme.textFaint)
@@ -2286,9 +2335,9 @@ struct PlaybackResolverView: View {
                 .padding(24)
             case .video(let stream):
                 if stream.useCompatEngine {
-                    KSPlayerView(stream: stream, request: activeRequest, onSwitchSource: { switchSource(to: $0) }, onClose: { dismiss() })
+                    KSPlayerView(stream: stream, request: activeRequest, historyRequest: historyRequest, onSwitchSource: { switchSource(to: $0) }, onClose: { dismiss() })
                 } else {
-                    PlayerView(stream: stream, request: activeRequest, onSwitchSource: { switchSource(to: $0) }, onClose: { dismiss() })
+                    PlayerView(stream: stream, request: activeRequest, historyRequest: historyRequest, onSwitchSource: { switchSource(to: $0) }, onClose: { dismiss() })
                 }
             case .manga(let stream):
                 MangaReaderView(
@@ -2401,6 +2450,72 @@ struct PlaybackResolverView: View {
         }
     }
 
+    // MARK: - SPEC-136 §1C torrent wait line (resolver .resolving)
+
+    /// The status line under the resolving spinner. Phase 1
+    /// (and every non-torrent resolution) is exactly today's
+    /// "Đang lấy link phát…". In Phase 2 (a debrid server-side
+    /// download, reported via the §5.3 phase events collected
+    /// in debridWaitBox) the line REPLACES it in the same slot
+    /// once Phase 2 has lasted 3 s; at 5:00 elapsed the
+    /// long-wait line appears directly under it. The 1 s
+    /// TimelineView tick drives both the reveal and the
+    /// elapsed clock, which counts from Phase-2 entry and
+    /// never resets on a provider join/drop.
+    @ViewBuilder
+    private var resolvingStatusLine: some View {
+        TimelineView(.periodic(from: Date(), by: 1)) { context in
+            let wait = debridWaitBox.snapshot()
+            let elapsed = wait.since.map { context.date.timeIntervalSince($0) } ?? 0
+            VStack(spacing: 6) {
+                if wait.since != nil, elapsed >= 3 {
+                    Text(Self.phaseLine(providers: wait.providers, elapsed: elapsed))
+                        .font(.system(size: 14, weight: .medium, design: .rounded))
+                        .foregroundStyle(Theme.textDim)
+                    if elapsed >= 300 {
+                        Text("Vẫn đang tải trên máy chủ. Đóng lại cũng được — phần tải vẫn tiếp tục, mở lại sau sẽ có nhanh hơn.")
+                            .font(.system(size: 12, design: .rounded))
+                            .foregroundStyle(Theme.textFaint)
+                            .multilineTextAlignment(.center)
+                    }
+                } else {
+                    Text("Đang lấy link phát…")
+                        .font(.system(size: 14, weight: .medium, design: .rounded))
+                        .foregroundStyle(Theme.textDim)
+                }
+            }
+        }
+    }
+
+    /// §1C phase line: the race form names both providers
+    /// (fixed order TorBox first — the core emits its token
+    /// set in that order and re-emits the survivor set when a
+    /// leg drops, so the latest event's list is rendered
+    /// as-is); the single form names the one running provider.
+    /// Display names come from the shell's own token→name
+    /// mapping (the Settings screen's names).
+    private static func phaseLine(providers: [String], elapsed: TimeInterval) -> String {
+        let names = providers.map(providerDisplayName)
+        let joined = names.joined(separator: " và ")
+        return "Đang chờ \(joined) tải xong… · đã chờ \(elapsedText(elapsed))"
+    }
+
+    private static func providerDisplayName(_ token: String) -> String {
+        switch token {
+        case "torbox": return "TorBox"
+        case "premiumize": return "Premiumize"
+        default: return token
+        }
+    }
+
+    /// {m:ss} — no leading-zero minutes, two-digit seconds.
+    private static func elapsedText(_ elapsed: TimeInterval) -> String {
+        let total = max(0, Int(elapsed))
+        let minutes = total / 60
+        let seconds = total % 60
+        return "\(minutes):\(seconds < 10 ? "0" : "")\(seconds)"
+    }
+
     // MARK: - v1.22.4 source switching
 
     /// All sources offered by the in-player switcher: the
@@ -2453,6 +2568,11 @@ struct PlaybackResolverView: View {
     /// new source resumes where the old one stopped.
     private func switchSource(to episode: Episode) {
         guard episode.id != activeRequest.episode.id else { return }
+        // §2.3 (gate fix M-1): mark the manual pick BEFORE
+        // the resolve starts, so resolve() routes this
+        // attempt to the plain resolve — a hand pick is
+        // respected absolutely (the §4.1 tvOS rule).
+        manualSwitchAttempt = true
         var next = activeRequest
         next.episode = episode
         if let record = history.record(for: activeRequest.pluginId, movieId: activeRequest.movie.id),
@@ -2472,6 +2592,8 @@ struct PlaybackResolverView: View {
 
     private func resolve(generation: Int) async {
         phase = .resolving
+        historyRequest = nil
+        debridWaitBox.begin(generation: generation)
         do {
             // v1.22: a hard deadline on the resolver screen for
             // PAGE sources — the old unbounded chain could spin for
@@ -2487,8 +2609,50 @@ struct PlaybackResolverView: View {
             // only produced false failures.
             let resolution: PlaybackResolution
             if activeRequest.episode.id.hasPrefix("jtvhash:") {
-                resolution = try await service.resolveEpisode(activeRequest)
+                // SPEC-136 §5.3: hash requests keep today's
+                // exemption and plain call, plus the phase
+                // handler that feeds the §1C wait line. The box
+                // is generation-guarded, so a superseded
+                // attempt's events can never land.
+                let waitBox = debridWaitBox
+                resolution = try await service.resolveEpisode(activeRequest, onDebridPhase: { event in
+                    waitBox.apply(event, generation: generation)
+                })
+            } else if !manualSwitchAttempt, FallbackCatalog.origins.contains(activeRequest.pluginId) {
+                // SPEC-136 §4.3/§2.5: catalogue-code origins run
+                // the fallback chain OUTSIDE the 45 s race — the
+                // chain's own per-hop/total ceilings bound it.
+                let outcome = try await service.resolveWithFallback(activeRequest)
+                if outcome.didFallback, generation == resolveGeneration {
+                    // §1A/§2.6 split: the playing context is the
+                    // SERVING plugin's (episode/server/switch
+                    // list/plugin id+name — in-player switching
+                    // resolves through the serving plugin's
+                    // engine); the title identity stays the
+                    // ORIGIN movie.
+                    var served = outcome.servedRequest
+                    served.movie = originRequest.movie
+                    activeRequest = served
+                    // History is written under the origin
+                    // identity: a copy of the origin request
+                    // with its fast-resume URL suppressed (§2.6).
+                    var originCopy = originRequest
+                    originCopy.knownStreamURL = ""
+                    historyRequest = originCopy
+                }
+                resolution = outcome.resolution
             } else {
+                // Plain raced resolve: non-catalogue origins,
+                // and manual in-player switches (§2.3 — a
+                // manual attempt never enters the chain. After
+                // a fallback serve, a hand pick therefore
+                // resolves the ACTIVE request — the serving
+                // plugin's context carrying the picked
+                // episode — through its own plugin, and
+                // historyRequest stays nil for the attempt:
+                // the history record derives from the request
+                // actually playing, never re-derived from the
+                // stale origin).
                 resolution = try await withThrowingTaskGroup(of: PlaybackResolution.self) { group in
                     group.addTask { try await service.resolveEpisode(activeRequest) }
                     group.addTask {
@@ -2509,7 +2673,66 @@ struct PlaybackResolverView: View {
             }
         } catch {
             guard generation == resolveGeneration else { return }
+            // L-16: the failure this view shows used to be
+            // invisible in the log — record the plugin and
+            // the error kind beside the resolve chain's own
+            // lines.
+            DiagLog.log("resolve", "resolver failed plugin=\(activeRequest.pluginId) kind=\((error as NSError).domain)#\((error as NSError).code)")
             phase = .failed(error.localizedDescription)
         }
+    }
+}
+
+// MARK: - SPEC-136 §5.3 phase collection (iOS shell)
+
+/// Lock-guarded holder for the torrent phase state behind the
+/// resolver's §1C wait line — the DebridPhase2RaceBox idiom
+/// (a final class, @unchecked Sendable, NSLock), because
+/// `MovieService.resolveEpisode`'s phase callback is @Sendable
+/// and fires from the debrid chain's executor, while the view
+/// reads snapshots on the main actor from its 1 s
+/// TimelineView tick. Events carry the resolve generation
+/// that installed the handler; a superseded attempt's events
+/// are dropped. The Phase-2 clock (`since`) is set by the
+/// FIRST .downloading event of an attempt and NEVER reset by
+/// later ones — a race leg dropping out only replaces the
+/// provider set (§1C).
+final class DebridWaitBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var generation = 0
+    private var providers: [String] = []
+    private var since: Date?
+
+    /// Opens a new resolve attempt: clears any previous wait
+    /// state and arms the box for that attempt's events.
+    func begin(generation newGeneration: Int) {
+        lock.lock()
+        generation = newGeneration
+        providers = []
+        since = nil
+        lock.unlock()
+    }
+
+    func apply(_ event: DebridPhaseEvent, generation eventGeneration: Int) {
+        lock.lock()
+        guard eventGeneration == generation else { lock.unlock(); return }
+        switch event {
+        case .probing:
+            break
+        case .downloading(let tokens):
+            if since == nil { since = Date() }
+            providers = tokens
+        case .finished:
+            providers = []
+            since = nil
+        }
+        lock.unlock()
+    }
+
+    func snapshot() -> (providers: [String], since: Date?) {
+        lock.lock()
+        let current = (providers: providers, since: since)
+        lock.unlock()
+        return current
     }
 }
