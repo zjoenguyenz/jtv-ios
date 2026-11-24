@@ -62,6 +62,7 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
     }
 
     func makeUIViewController(context: Context) -> PlayerSurfaceViewController {
+        PlaybackAudioScope.surfaceDidMake()  // I-1
         // Playback may rotate; the rest of the app may not. The
         // surface owns the lock: opened here, restored in dismantle
         // (the one callback that only runs when the player screen
@@ -175,6 +176,7 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         // No orientation restore here: the resolver screen owns it
         // (its onDisappear is the one signal that always means the
         // player screen closed).
+        PlaybackAudioScope.surfaceDidDismantle()  // I-1: after the pause
     }
 
     /// Swift 6: this coordinator only ever runs on the main actor
@@ -1934,11 +1936,18 @@ struct PlayerView: View {
     /// surface, which copies it into the view controller.
     @StateObject private var autosub = AutoSubController(surface: .av)
 
-    @EnvironmentObject private var history: WatchHistoryManager
+    // I-4: non-observing — this view only writes progress, so a
+    // history save must not re-render it (see WatchHistoryStoreKey).
+    @Environment(\.watchHistoryStore) private var history
     @EnvironmentObject private var service: MovieService
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
+        // I-4: resolved once per body pass and captured by the
+        // progress closures, so the coordinator's later calls
+        // (including the forced save at dismantle) always reach
+        // the live manager, never an uninstalled-view read.
+        let historyStore = history
         ZStack {
             Color.black.ignoresSafeArea()
             if let url = stream.streamURL {
@@ -1965,8 +1974,8 @@ struct PlayerView: View {
                               case .video(let fresh) = resolution else { return nil }
                         return fresh
                     },
-                    onProgress: { save(position: $0, duration: $1, force: false) },
-                    onExit: { save(position: $0, duration: $1, force: true) },
+                    onProgress: { save(position: $0, duration: $1, force: false, into: historyStore) },
+                    onExit: { save(position: $0, duration: $1, force: true, into: historyStore) },
                     subtitles: stream.subtitles,
                     autosub: autosub
                 )
@@ -2005,7 +2014,14 @@ struct PlayerView: View {
             .joined(separator: " · ")
     }
 
-    private func save(position: Double, duration: Double, force: Bool) {
+    private func save(position: Double, duration: Double, force: Bool,
+                      into store: WatchHistoryManager?) {
+        // I-4: the store is injected once at the App root; a nil
+        // here means the injection was lost (a wiring defect).
+        guard let store else {
+            assertionFailure("watchHistoryStore not injected")
+            return
+        }
         // SPEC-136 §2.6: a fallback-served play is recorded
         // under the ORIGIN identity (historyRequest) with an
         // EMPTY streamURL; every other play is byte-identical
@@ -2024,7 +2040,7 @@ struct PlayerView: View {
             duration: duration,
             updatedAt: Date()
         )
-        history.upsert(record, force: force)
+        store.upsert(record, force: force)
     }
 }
 
@@ -2148,6 +2164,12 @@ private struct EmbedWebView: UIViewControllerRepresentable {
     }
 
     func makeUIViewController(context: Context) -> EmbedHostViewController {
+        // I-1: a web embed may play its own audio, which used to
+        // run under the .playback session activated at launch —
+        // keep that by configuring it here, as the native
+        // surfaces do when they load.
+        AudioSession.configureForPlayback()
+        PlaybackAudioScope.surfaceDidMake()
         // The embed surface owns the orientation lock, exactly
         // like the native one: opened here, restored in dismantle.
         OrientationHelper.setLock(.allButUpsideDown)
@@ -2201,6 +2223,7 @@ private struct EmbedWebView: UIViewControllerRepresentable {
         // No orientation restore here either: promotion to the
         // native player dismantles this surface too, and the
         // resolver owns the restore for the whole screen.
+        PlaybackAudioScope.surfaceDidDismantle()  // I-1
     }
 
     final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
@@ -2298,7 +2321,9 @@ struct PlaybackResolverView: View {
     let request: PlaybackRequest
 
     @EnvironmentObject private var service: MovieService
-    @EnvironmentObject private var history: WatchHistoryManager
+    // I-4: non-observing — the resolver only reads history once,
+    // in switchSource, from the live manager this key carries.
+    @Environment(\.watchHistoryStore) private var history
     @Environment(\.dismiss) private var dismiss
 
     /// v1.22.4: the request actually being played — a source
@@ -2331,6 +2356,11 @@ struct PlaybackResolverView: View {
     /// Guards against a stale resolve landing after a switch:
     /// only the newest generation may set the phase.
     @State private var resolveGeneration = 0
+    /// I-2 (AUDIT-IOS): the running resolve. Cancelled before a
+    /// new resolve starts (source switch, Thử lại) and when this
+    /// screen disappears, so an abandoned chain stops its work
+    /// and can never land a phase after the user has moved on.
+    @State private var resolveTask: Task<Void, Never>?
 
     init(request: PlaybackRequest) {
         self.request = request
@@ -2455,6 +2485,7 @@ struct PlaybackResolverView: View {
             }
         }
         .task {
+            PlaybackAudioScope.coverDidOpen()  // I-1
             startResolve()
         }
         // Orientation restore lives HERE and only here. Nothing
@@ -2469,6 +2500,12 @@ struct PlaybackResolverView: View {
         // sources back upright. Direct sources never create an
         // embed, so they rotated fine.
         .onDisappear {
+            // I-2: the screen closed — stop the in-flight resolve.
+            resolveTask?.cancel()
+            resolveTask = nil
+            // I-1: the player screen closed — the audio session is
+            // handed back once the last surface is gone too.
+            PlaybackAudioScope.coverDidClose()
             OrientationHelper.setLock(.portrait)
             OrientationHelper.requestGeometry(.portrait)
         }
@@ -2606,7 +2643,14 @@ struct PlaybackResolverView: View {
         manualSwitchAttempt = true
         var next = activeRequest
         next.episode = episode
-        if let record = history.record(for: activeRequest.pluginId, movieId: activeRequest.movie.id),
+        // I-4 fix round: the same nil policy as PlayerView /
+        // KSPlayerView.save — a nil store is a lost injection:
+        // assert in debug; in release the switch proceeds without
+        // the resume position (the only thing history supplies).
+        if history == nil {
+            assertionFailure("watchHistoryStore not injected")
+        }
+        if let record = history?.record(for: activeRequest.pluginId, movieId: activeRequest.movie.id),
            record.lastPosition > 5 {
             next.startPosition = record.lastPosition
         }
@@ -2616,9 +2660,12 @@ struct PlaybackResolverView: View {
     }
 
     private func startResolve() {
+        // I-2: a new resolve supersedes the old one — cancel it
+        // instead of letting it run on in the background.
+        resolveTask?.cancel()
         resolveGeneration += 1
         let generation = resolveGeneration
-        Task { await resolve(generation: generation) }
+        resolveTask = Task { await resolve(generation: generation) }
     }
 
     private func resolve(generation: Int) async {
@@ -2696,14 +2743,18 @@ struct PlaybackResolverView: View {
                 }
             }
             // A source switch during the wait supersedes this run.
-            guard generation == resolveGeneration else { return }
+            // I-2: so does a cancel (screen closed / superseded) —
+            // a result that arrives anyway is dropped.
+            guard generation == resolveGeneration, !Task.isCancelled else { return }
             switch resolution {
             case .video(let stream): phase = .video(stream)
             case .manga(let stream): phase = .manga(stream)
             case .embed(let url, let headers, let sniffMedia): phase = .embed(url, headers, sniffMedia)
             }
         } catch {
-            guard generation == resolveGeneration else { return }
+            // I-2: a cancelled run (screen closed / superseded)
+            // is not a failure — no failure phase, no failure line.
+            guard generation == resolveGeneration, !Task.isCancelled else { return }
             // L-16: the failure this view shows used to be
             // invisible in the log — record the plugin and
             // the error kind beside the resolve chain's own
