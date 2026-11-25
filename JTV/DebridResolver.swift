@@ -93,10 +93,20 @@ enum DebridResolver {
     /// play outcomes are recorded by the shell at first frame /
     /// terminal death.
     private static let servedLock = NSLock()
-    private static var servedProviderStorage: String?
+    /// Swift 6 fix (CI run #69): a nonisolated mutable static var
+    /// is rejected as non-concurrency-safe shared state, even
+    /// though every access was already under servedLock. The slot
+    /// now lives in a reference box held by a static let — the
+    /// SourceReputation idiom — and every access stays under the
+    /// same lock; only the storage shape changes, never the
+    /// semantics.
+    private final class ServedProviderBox: @unchecked Sendable {
+        var value: String?
+    }
+    private static let servedProviderStorage = ServedProviderBox()
     static var lastServedProvider: String? {
-        get { servedLock.withLock { servedProviderStorage } }
-        set { servedLock.withLock { servedProviderStorage = newValue } }
+        get { servedLock.withLock { servedProviderStorage.value } }
+        set { servedLock.withLock { servedProviderStorage.value = newValue } }
     }
 
     private static let videoExts: Set<String> = ["mkv", "mp4", "avi", "m4v", "mov", "ts", "m2ts", "wmv", "flv", "webm"]
