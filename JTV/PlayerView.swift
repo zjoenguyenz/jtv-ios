@@ -48,6 +48,13 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
     var onFreshStream: (() async -> StreamInfo?)?
     var onProgress: (Double, Double) -> Void
     var onExit: (Double, Double) -> Void
+    /// Source reputation (1.22.25): fired once when this
+    /// surface's recovery ladders are exhausted and the error
+    /// slate is shown — the served stream's terminal death,
+    /// reported to the resolver shell that owns the outcome
+    /// record. Nil (every construction that does not pass it)
+    /// = exactly today's behaviour.
+    var onGiveUp: (() -> Void)? = nil
     /// v1.22.16 (AutoSub, S-5): the stream's external subtitle
     /// files (`StreamInfo.subtitles` — decoded by the plugin
     /// engine and, until this version, dropped at exactly this
@@ -125,6 +132,7 @@ struct VideoPlayerSurface: UIViewControllerRepresentable {
         controller.onClose = onClose
         context.coordinator.onGiveUp = { [weak controller] message, logKind in
             controller?.showError(message: message, logKind: logKind)
+            onGiveUp?()
         }
         // v1.22.16 (AutoSub, S-5): the controller and the raw
         // external tracks follow the same copy-in pattern; the
@@ -1929,6 +1937,15 @@ struct PlayerView: View {
     var onSwitchSource: ((Episode) -> Void)?
     /// v1.22.6: close, owned by the resolver screen.
     var onClose: (() -> Void)?
+    /// Source reputation (1.22.25): the first progress report
+    /// (the surface's first-frame signal) and the terminal
+    /// give-up, reported to the resolver shell, which owns the
+    /// start stamp and the serving-plugin attribution. Both
+    /// nil by default — every other construction site keeps
+    /// exactly today's behaviour.
+    var onFirstProgress: (() -> Void)? = nil
+    var onPlaybackFailure: (() -> Void)? = nil
+    @State private var didReportFirstProgress = false
 
     /// v1.22.16 (AutoSub, S-5): the AutoSub controller for the
     /// AV surface — created here (main actor, per the
@@ -1974,8 +1991,15 @@ struct PlayerView: View {
                               case .video(let fresh) = resolution else { return nil }
                         return fresh
                     },
-                    onProgress: { save(position: $0, duration: $1, force: false, into: historyStore) },
+                    onProgress: {
+                        if !didReportFirstProgress {
+                            didReportFirstProgress = true
+                            onFirstProgress?()
+                        }
+                        save(position: $0, duration: $1, force: false, into: historyStore)
+                    },
                     onExit: { save(position: $0, duration: $1, force: true, into: historyStore) },
+                    onGiveUp: { onPlaybackFailure?() },
                     subtitles: stream.subtitles,
                     autosub: autosub
                 )
@@ -2361,6 +2385,14 @@ struct PlaybackResolverView: View {
     /// screen disappears, so an abandoned chain stops its work
     /// and can never land a phase after the user has moved on.
     @State private var resolveTask: Task<Void, Never>?
+    /// Source reputation (1.22.25, DESIGN §3.2): the current
+    /// attempt's resolve-start stamp — the surfaces report
+    /// first progress up, and the shell computes
+    /// start-to-first-frame from it. The two flags keep one
+    /// attempt to at most one success and one failure record.
+    @State private var resolveStartedAt: Date?
+    @State private var reputationSuccessRecorded = false
+    @State private var reputationFailureRecorded = false
 
     init(request: PlaybackRequest) {
         self.request = request
@@ -2396,9 +2428,9 @@ struct PlaybackResolverView: View {
                 .padding(24)
             case .video(let stream):
                 if stream.useCompatEngine {
-                    KSPlayerView(stream: stream, request: activeRequest, historyRequest: historyRequest, onSwitchSource: { switchSource(to: $0) }, onClose: { dismiss() })
+                    KSPlayerView(stream: stream, request: activeRequest, historyRequest: historyRequest, onSwitchSource: { switchSource(to: $0) }, onClose: { dismiss() }, onFirstProgress: { recordFirstFrame() }, onPlaybackFailure: { recordTerminalFailure() })
                 } else {
-                    PlayerView(stream: stream, request: activeRequest, historyRequest: historyRequest, onSwitchSource: { switchSource(to: $0) }, onClose: { dismiss() })
+                    PlayerView(stream: stream, request: activeRequest, historyRequest: historyRequest, onSwitchSource: { switchSource(to: $0) }, onClose: { dismiss() }, onFirstProgress: { recordFirstFrame() }, onPlaybackFailure: { recordTerminalFailure() })
                 }
             case .manga(let stream):
                 MangaReaderView(
@@ -2665,12 +2697,58 @@ struct PlaybackResolverView: View {
         resolveTask?.cancel()
         resolveGeneration += 1
         let generation = resolveGeneration
+        // Reputation: a fresh attempt gets a fresh outcome slate.
+        reputationSuccessRecorded = false
+        reputationFailureRecorded = false
         resolveTask = Task { await resolve(generation: generation) }
+    }
+
+    // MARK: - Source reputation feeds (DESIGN §3.2)
+
+    /// The debrid provider pseudo-id that served the current
+    /// stream, on the hash path only — DebridResolver remembers
+    /// it at logServed; cleared at every resolve start below so
+    /// a stale provider can never be credited with a later play.
+    private var servingDebridProvider: String? {
+        activeRequest.episode.id.hasPrefix("jtvhash:") ? DebridResolver.lastServedProvider : nil
+    }
+
+    /// First frame reached (the surfaces' first progress
+    /// report): record the start-to-first-frame success against
+    /// the SERVING plugin — activeRequest.pluginId, which the
+    /// fallback serve already swapped to the serving plugin —
+    /// and against the serving debrid provider on the hash path.
+    private func recordFirstFrame() {
+        guard !reputationSuccessRecorded else { return }
+        reputationSuccessRecorded = true
+        let ms = resolveStartedAt.map { Int(Date().timeIntervalSince($0) * 1000) } ?? 0
+        SourceReputation.shared.recordSuccess(key: activeRequest.pluginId, firstFrameMs: ms)
+        if let provider = servingDebridProvider {
+            SourceReputation.shared.recordSuccess(key: "debrid:\(provider)", firstFrameMs: ms)
+        }
+    }
+
+    /// A served stream died terminally (surface give-up):
+    /// record the failure against the serving plugin / provider.
+    /// (A resolve that never served is NOT recorded here — it is
+    /// a resolve statistic, per DESIGN §3.2's tier separation.)
+    private func recordTerminalFailure() {
+        guard !reputationFailureRecorded else { return }
+        reputationFailureRecorded = true
+        SourceReputation.shared.recordFailure(key: activeRequest.pluginId)
+        if let provider = servingDebridProvider {
+            SourceReputation.shared.recordFailure(key: "debrid:\(provider)")
+        }
     }
 
     private func resolve(generation: Int) async {
         phase = .resolving
         historyRequest = nil
+        // Reputation: stamp this attempt's start (the
+        // first-frame computation's zero) and clear any stale
+        // serving-provider memory before the chain can set it.
+        resolveStartedAt = Date()
+        DebridResolver.lastServedProvider = nil
         debridWaitBox.begin(generation: generation)
         do {
             // v1.22: a hard deadline on the resolver screen for
@@ -2760,6 +2838,13 @@ struct PlaybackResolverView: View {
             // the error kind beside the resolve chain's own
             // lines.
             DiagLog.log("resolve", "resolver failed plugin=\(activeRequest.pluginId) kind=\((error as NSError).domain)#\((error as NSError).code)")
+            // Reputation: NO play outcome is recorded here
+            // (gate correction R1). A resolve that never served
+            // a stream is a RESOLVE outcome — the MovieService
+            // defer already records it as resolve statistics,
+            // and DESIGN §3.2 keeps the tier playback-pure:
+            // play failures come only from the surfaces'
+            // give-up funnels, where a served stream died.
             phase = .failed(error.localizedDescription)
         }
     }

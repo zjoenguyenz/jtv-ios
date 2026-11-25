@@ -232,20 +232,32 @@ struct Movie: Codable, Identifiable, Hashable {
     /// under the same measured ≥720p gate as every preview.
     /// Additive + defaulted: old persisted JSON decodes with "".
     var previewUrl: String = ""
+    /// FL-488 root fix (1.22.25): the URL of the page that
+    /// served this movie, stamped by MovieService at fetch
+    /// time (list / search / actor fetches know the page URL
+    /// they fetched; the detail flow stamps it via
+    /// MovieDetail). Image loads pass it as the Referer —
+    /// some image hosts refuse the synthesised host-root
+    /// Referer the image fetcher falls back to. Additive +
+    /// optional, decode-if-present: old persisted JSON and
+    /// unstamped movies decode with nil, and nil keeps
+    /// exactly today's image behaviour.
+    var sourcePageURL: String? = nil
 
     enum CodingKeys: String, CodingKey {
-        case id, title, posterUrl, backdropUrl, year, quality, episode_current, lang, previewUrl
+        case id, title, posterUrl, backdropUrl, year, quality, episode_current, lang, previewUrl, sourcePageURL
     }
 
     init() {}
 
     init(id: String, title: String, posterUrl: String = "", backdropUrl: String = "",
          year: Int = 0, quality: String = "", episode_current: String = "", lang: String = "",
-         previewUrl: String = "") {
+         previewUrl: String = "", sourcePageURL: String? = nil) {
         self.id = id; self.title = title; self.posterUrl = posterUrl
         self.backdropUrl = backdropUrl; self.year = year; self.quality = quality
         self.episode_current = episode_current; self.lang = lang
         self.previewUrl = previewUrl
+        self.sourcePageURL = sourcePageURL
     }
 
     init(from decoder: Decoder) throws {
@@ -265,9 +277,20 @@ struct Movie: Codable, Identifiable, Hashable {
         episode_current = try c.decodeIfPresent(String.self, forKey: .episode_current) ?? ""
         lang = try c.decodeIfPresent(String.self, forKey: .lang) ?? ""
         previewUrl = try c.decodeIfPresent(String.self, forKey: .previewUrl) ?? ""
+        sourcePageURL = try c.decodeIfPresent(String.self, forKey: .sourcePageURL) ?? nil
     }
 
     var displayBackdrop: String { backdropUrl.isEmpty ? posterUrl : backdropUrl }
+
+    /// FL-488: the image-load headers for this movie's
+    /// poster/backdrop — the serving page as Referer when
+    /// the movie carries one, empty (exactly today's
+    /// behaviour, host-root synthesis in the fetcher) when
+    /// it does not.
+    var imageHeaders: [String: String] {
+        guard let sourcePageURL, !sourcePageURL.isEmpty else { return [:] }
+        return ["Referer": sourcePageURL]
+    }
 }
 
 struct Pagination: Codable {
@@ -379,12 +402,18 @@ struct MovieDetail: Codable {
     var tmdbId: String = ""
     var tmdbSeason: Int = 0
     var tmdbType: String = ""
+    /// FL-488 root fix (1.22.25): the detail page URL that
+    /// served this record, stamped by MovieService.detailMeta
+    /// — the Referer context for the detail's own images
+    /// (poster / backdrop). Additive + optional,
+    /// decode-if-present, exactly like Movie.sourcePageURL.
+    var sourcePageURL: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, title, originName, posterUrl, backdropUrl, description, year, rating,
              quality, servers, episode_current, lang, category, country, director, casts,
              studio, label, series, releaseDate, runtimeMinutes,
-             tmdbId, tmdbSeason, tmdbType
+             tmdbId, tmdbSeason, tmdbType, sourcePageURL
     }
 
     init(from decoder: Decoder) throws {
@@ -425,12 +454,21 @@ struct MovieDetail: Codable {
         } else { tmdbId = "" }
         tmdbSeason = try c.decodeIfPresent(Int.self, forKey: .tmdbSeason) ?? 0
         tmdbType = try c.decodeIfPresent(String.self, forKey: .tmdbType) ?? ""
+        sourcePageURL = try c.decodeIfPresent(String.self, forKey: .sourcePageURL) ?? nil
+    }
+
+    /// FL-488: the image-load headers for this detail's
+    /// poster/backdrop — see Movie.imageHeaders.
+    var imageHeaders: [String: String] {
+        guard let sourcePageURL, !sourcePageURL.isEmpty else { return [:] }
+        return ["Referer": sourcePageURL]
     }
 
     /// Movie snapshot for navigation / favorites.
     var asMovie: Movie {
         Movie(id: id, title: title, posterUrl: posterUrl, backdropUrl: backdropUrl,
-              year: year, quality: quality, episode_current: episode_current, lang: lang)
+              year: year, quality: quality, episode_current: episode_current, lang: lang,
+              sourcePageURL: sourcePageURL)
     }
 
     /// Structured cast entries parsed from the raw `casts`
@@ -614,6 +652,14 @@ struct StreamInfo: Codable {
     var isEmbed: Bool = false
     /// Form body for POST-config hops (e.g. vlxx's ajax player call).
     var postBody: String? = nil
+    /// Fetch-spec (engine fetch-spec design): how the NEXT hop of the
+    /// embed chain must be fetched when this step is followed. All
+    /// four are additive + defaulted; a step carrying none of them is
+    /// fetched exactly as before (POST iff a non-empty postBody).
+    var fetchMethod: String? = nil        // "GET" | "POST" (case-insensitive); nil = legacy rule
+    var postFields: [String: String]? = nil  // body fields, engine-encoded (see postContentType)
+    var postContentType: String? = nil    // "form" | "json" | a full MIME string; nil = legacy rule
+    var refetch: Bool = false             // follow this step even when url == the page just fetched
     /// Start playback through the HLS rescue proxy immediately
     /// (the playlist's segments sit behind a dead proxy host — see
     /// MovieService.markProxyIfNeeded). Set by the app only;
@@ -632,16 +678,20 @@ struct StreamInfo: Codable {
     /// plugins that don't emit it decode [] (Phase 2 pattern).
     var alternateURLs: [String] = []
 
-    enum CodingKeys: String, CodingKey { case url, headers, subtitles, images, isEmbed, postBody, requiresProxy, useCompatEngine, alternateURLs }
+    enum CodingKeys: String, CodingKey { case url, headers, subtitles, images, isEmbed, postBody, requiresProxy, useCompatEngine, alternateURLs, fetchMethod, postFields, postContentType, refetch }
 
     init(url: String = "", headers: [String: String] = [:],
          subtitles: [SubtitleTrack] = [], images: [String] = [], isEmbed: Bool = false,
          postBody: String? = nil, requiresProxy: Bool = false, useCompatEngine: Bool = false,
-         alternateURLs: [String] = []) {
+         alternateURLs: [String] = [],
+         fetchMethod: String? = nil, postFields: [String: String]? = nil,
+         postContentType: String? = nil, refetch: Bool = false) {
         self.url = url; self.headers = headers; self.subtitles = subtitles
         self.images = images; self.isEmbed = isEmbed; self.postBody = postBody
         self.requiresProxy = requiresProxy; self.useCompatEngine = useCompatEngine
         self.alternateURLs = alternateURLs
+        self.fetchMethod = fetchMethod; self.postFields = postFields
+        self.postContentType = postContentType; self.refetch = refetch
     }
 
     init(from decoder: Decoder) throws {
@@ -655,6 +705,10 @@ struct StreamInfo: Codable {
         requiresProxy = try c.decodeIfPresent(Bool.self, forKey: .requiresProxy) ?? false
         useCompatEngine = try c.decodeIfPresent(Bool.self, forKey: .useCompatEngine) ?? false
         alternateURLs = try c.decodeIfPresent([String].self, forKey: .alternateURLs) ?? []
+        fetchMethod = try c.decodeIfPresent(String.self, forKey: .fetchMethod) ?? nil
+        postFields = try c.decodeIfPresent([String: String].self, forKey: .postFields) ?? nil
+        postContentType = try c.decodeIfPresent(String.self, forKey: .postContentType) ?? nil
+        refetch = try c.decodeIfPresent(Bool.self, forKey: .refetch) ?? false
     }
 
     var streamURL: URL? { url.isEmpty ? nil : URL(string: url) }
@@ -786,14 +840,20 @@ enum FallbackCatalog {
     /// its `.txt` suffix. jav.spa is excluded permanently
     /// (helvid-walled playback — RESEARCH-NJAV addendum).
     static func targets(for origin: String) -> [String] {
+        let base: [String]
         switch origin {
-        case "missav":  return ["123av", "njav", "avdbapi", "javguru"]
-        case "123av":   return ["missav", "njav", "avdbapi", "javguru"]
-        case "njav":    return ["123av", "missav", "avdbapi", "javguru"]
-        case "avdbapi": return ["123av", "missav", "njav", "javguru"]
-        case "javguru": return ["missav", "123av", "njav", "avdbapi"]
+        case "missav":  base = ["123av", "njav", "avdbapi", "javguru"]
+        case "123av":   base = ["missav", "njav", "avdbapi", "javguru"]
+        case "njav":    base = ["123av", "missav", "avdbapi", "javguru"]
+        case "avdbapi": base = ["123av", "missav", "njav", "javguru"]
+        case "javguru": base = ["missav", "123av", "njav", "avdbapi"]
         default:        return []
         }
+        // Source reputation (DESIGN §3.3 surface 1): the same
+        // list, stable-sorted by the learned ordering key —
+        // cold start / all-AVERAGE reproduces the static order
+        // above exactly; the list is never shrunk.
+        return SourceReputation.shared.sortedByReputation(base, surface: "fallback") { $0 }
     }
 }
 
@@ -810,8 +870,14 @@ enum ActorMerge {
 
     /// Merge targets for an actor page: every actor-capable source
     /// except the page's origin, in canonical order.
+    /// Source reputation (DESIGN §3.3 surface 3): the returned
+    /// order is stable-sorted by the learned ordering key, so
+    /// reputation governs the merge's release / dedupe priority
+    /// only — targets still fetch in parallel, the canonical
+    /// list itself is unchanged, and cold start / all-AVERAGE
+    /// reproduces the canonical order exactly.
     static func targets(for origin: String) -> [String] {
-        canonicalOrder.filter { $0 != origin }
+        SourceReputation.shared.sortedByReputation(canonicalOrder.filter { $0 != origin }, surface: "actor-merge") { $0 }
     }
 }
 

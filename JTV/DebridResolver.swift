@@ -82,6 +82,23 @@ enum DebridPhaseEvent: Sendable, Equatable {
 }
 
 enum DebridResolver {
+    /// Source reputation plumbing (1.22.25, DESIGN §3.2): the
+    /// provider that served the current stream, remembered at
+    /// logServed (the one point every success exit passes) so
+    /// the player shell can attribute the play outcome to the
+    /// provider pseudo-id. The shell clears it when a new
+    /// resolve starts; a non-debrid serve never sets it, so a
+    /// stale value can only be read for the hash play that set
+    /// it. Resolve-phase outcomes feed resolve stats only —
+    /// play outcomes are recorded by the shell at first frame /
+    /// terminal death.
+    private static let servedLock = NSLock()
+    private static var servedProviderStorage: String?
+    static var lastServedProvider: String? {
+        get { servedLock.withLock { servedProviderStorage } }
+        set { servedLock.withLock { servedProviderStorage = newValue } }
+    }
+
     private static let videoExts: Set<String> = ["mkv", "mp4", "avi", "m4v", "mov", "ts", "m2ts", "wmv", "flv", "webm"]
     private static let friendlyExts: Set<String> = ["mp4", "m4v", "mov"]
     /// Server-side downloads of uncached torrents get a long but
@@ -179,6 +196,15 @@ enum DebridResolver {
         var phase2Tokens: [String] = []
         if !tb.isEmpty && !attempted.contains("tb") { phase2Tokens.append("torbox") }
         if !pm.isEmpty { phase2Tokens.append("premiumize") }
+        // Source reputation (DESIGN §3.3 surface 2): the same
+        // candidate list, stable-sorted by the ordering key —
+        // cold start / all-AVERAGE keeps today's torbox-first
+        // order exactly. Phase 1 above is two hard-coded serial
+        // legs with no candidate list, so it stays UNTOUCHED;
+        // the race/single dispatch below keys off the list's
+        // contents, never its order, so a reorder changes only
+        // which leg is named first in the phase lines.
+        phase2Tokens = SourceReputation.shared.sortedByReputation(phase2Tokens, surface: "debrid-phase2") { "debrid:\($0)" }
         if !phase2Tokens.isEmpty {
             DiagLog.log("debrid", "provider=all phase=phase2 mode=\(phase2Tokens.count > 1 ? "race" : "single") providers=\(phase2Tokens.joined(separator: ","))")
             onPhase?(.downloading(providers: phase2Tokens))
@@ -290,6 +316,10 @@ enum DebridResolver {
     /// inside the race legs just before they hand their
     /// stream to the box.
     private static func logServed(provider: String, stream: StreamInfo) {
+        // Reputation plumbing: remember the winning provider
+        // for the shell's play-outcome attribution (see
+        // lastServedProvider above).
+        lastServedProvider = provider
         let url = URL(string: stream.url)
         DiagLog.log("debrid", "provider=\(provider) phase=resolve outcome=served scheme=\(url?.scheme ?? "?") host=\(url?.host ?? "?")")
     }

@@ -98,7 +98,7 @@ struct HistoryView: View {
 
     private func historyRow(_ record: HistoryRecord) -> some View {
         HStack(spacing: 13) {
-            CachedAsyncImage(urlString: record.movie.posterUrl)
+            CachedAsyncImage(urlString: record.movie.posterUrl, headers: record.movie.imageHeaders)
                 .frame(width: 54, height: 80)
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                 .overlay(

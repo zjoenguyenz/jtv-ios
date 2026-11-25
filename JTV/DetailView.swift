@@ -205,7 +205,7 @@ struct MovieDetailView: View {
 
     private func hero(_ detail: MovieDetail) -> some View {
         ZStack(alignment: .bottomLeading) {
-            CachedAsyncImage(urlString: detail.backdropUrl.isEmpty ? detail.posterUrl : detail.backdropUrl)
+            CachedAsyncImage(urlString: detail.backdropUrl.isEmpty ? detail.posterUrl : detail.backdropUrl, headers: detail.imageHeaders)
                 .frame(maxWidth: .infinity)
                 .frame(height: 250)
                 .clipped()
@@ -214,7 +214,7 @@ struct MovieDetailView: View {
                 .frame(height: 250)
 
             HStack(alignment: .bottom, spacing: 14) {
-                CachedAsyncImage(urlString: detail.posterUrl)
+                CachedAsyncImage(urlString: detail.posterUrl, headers: detail.imageHeaders)
                     .frame(width: 92, height: 138)
                     .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                     .overlay(

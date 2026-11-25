@@ -221,7 +221,11 @@ enum Net {
 
     /// POST variant for plugin hop configs that carry a postBody
     /// (e.g. vlxx's /ajax.php player call). Same retry policy.
-    static func fetchTextPOST(_ urlString: String, body: String, headers: [String: String] = [:]) async throws -> String {
+    /// Fetch-spec (1.22.25): `contentType` is the RESOLVED MIME
+    /// string from MovieService's spec dispatch; nil keeps the
+    /// legacy rule bit-for-bit (the headers map's Content-Type
+    /// if present, else the form default).
+    static func fetchTextPOST(_ urlString: String, body: String, headers: [String: String] = [:], contentType: String? = nil) async throws -> String {
         guard let url = URL(string: urlString) else {
             throw URLError(.badURL)
         }
@@ -232,7 +236,9 @@ enum Net {
                 var req = makeRequest(url: url, headers: headers)
                 req.httpMethod = "POST"
                 req.timeoutInterval = 12
-                if req.value(forHTTPHeaderField: "Content-Type") == nil {
+                if let contentType {
+                    req.setValue(contentType, forHTTPHeaderField: "Content-Type")
+                } else if req.value(forHTTPHeaderField: "Content-Type") == nil {
                     req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
                 }
                 req.httpBody = body.data(using: .utf8)

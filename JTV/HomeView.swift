@@ -210,7 +210,7 @@ struct HomeView: View {
         if let hero = heroMovie {
             NavigationLink(value: AppRoute.movie(MovieRoute(pluginId: pluginId, movie: hero))) {
                 ZStack(alignment: .bottomLeading) {
-                    CachedAsyncImage(urlString: hero.displayBackdrop)
+                    CachedAsyncImage(urlString: hero.displayBackdrop, headers: hero.imageHeaders)
                         .frame(maxWidth: .infinity)
                         .frame(height: 210)
                         .clipped()
@@ -345,7 +345,10 @@ struct HomeView: View {
             for await (sectionId, movies) in group {
                 if !movies.isEmpty {
                     sectionItems[sectionId] = movies
-                    ImageCacheManager.shared.prefetch(urlStrings: movies.map(\.posterUrl))
+                    // FL-488: the batch came from ONE list fetch,
+                    // so every movie carries the same serving
+                    // page — its Referer rides the prefetch.
+                    ImageCacheManager.shared.prefetch(urlStrings: movies.map(\.posterUrl), headers: movies.first?.imageHeaders ?? [:])
                 }
             }
         }
@@ -386,7 +389,7 @@ private struct HomeContinueWatchingRow: View {
         NavigationLink(value: AppRoute.movie(MovieRoute(pluginId: record.pluginId, movie: record.movie, autoResume: true))) {
             VStack(alignment: .leading, spacing: 7) {
                 ZStack(alignment: .bottomLeading) {
-                    CachedAsyncImage(urlString: record.movie.displayBackdrop)
+                    CachedAsyncImage(urlString: record.movie.displayBackdrop, headers: record.movie.imageHeaders)
                         .frame(width: 210, height: 118)
                         .clipped()
                     LinearGradient(colors: [.clear, .black.opacity(0.65)], startPoint: .center, endPoint: .bottom)

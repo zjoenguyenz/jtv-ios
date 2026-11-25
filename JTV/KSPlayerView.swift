@@ -51,6 +51,12 @@ struct KSPlayerView: View {
     var onSwitchSource: ((Episode) -> Void)?
     /// v1.22.6: close, owned by the resolver screen.
     var onClose: (() -> Void)?
+    /// Source reputation (1.22.25): first progress report and
+    /// terminal give-up, reported to the resolver shell —
+    /// see PlayerView's identical pair. Nil by default.
+    var onFirstProgress: (() -> Void)? = nil
+    var onPlaybackFailure: (() -> Void)? = nil
+    @State private var didReportFirstProgress = false
 
     /// v1.22.16 (AutoSub, S-6): the AutoSub controller for the
     /// KS surface — created here (main actor, per the
@@ -91,8 +97,15 @@ struct KSPlayerView: View {
                               case .video(let fresh) = resolution else { return nil }
                         return fresh
                     },
-                    onProgress: { save(position: $0, duration: $1, force: false, into: historyStore) },
+                    onProgress: {
+                        if !didReportFirstProgress {
+                            didReportFirstProgress = true
+                            onFirstProgress?()
+                        }
+                        save(position: $0, duration: $1, force: false, into: historyStore)
+                    },
                     onExit: { save(position: $0, duration: $1, force: true, into: historyStore) },
+                    onGiveUp: { onPlaybackFailure?() },
                     subtitles: stream.subtitles,
                     autosub: autosub
                 )
@@ -163,6 +176,10 @@ struct KSVideoPlayerSurface: UIViewControllerRepresentable {
     var onFreshStream: (() async -> StreamInfo?)?
     var onProgress: (Double, Double) -> Void
     var onExit: (Double, Double) -> Void
+    /// Source reputation (1.22.25): fired once from the
+    /// controller's terminal showError — see VideoPlayerSurface's
+    /// identical hook. Nil = exactly today's behaviour.
+    var onGiveUp: (() -> Void)? = nil
     /// v1.22.16 (AutoSub, S-6): the stream's external subtitle
     /// files (`StreamInfo.subtitles` — decoded by the plugin
     /// engine and, until this version, dropped at exactly this
@@ -194,6 +211,7 @@ struct KSVideoPlayerSurface: UIViewControllerRepresentable {
         controller.onProgressTick = { [weak coordinator = context.coordinator] position, duration in
             coordinator?.onProgress(position, duration)
         }
+        controller.onShowError = onGiveUp
         // v1.22.16 (AutoSub, S-6): the controller and the raw
         // external tracks follow the same copy-in pattern; the
         // controller is handed its inputs and started once the
@@ -251,6 +269,11 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
     var currentSourceId = ""
     var onSwitchSource: ((Episode) -> Void)?
     var onClose: (() -> Void)?
+    /// Source reputation (1.22.25): fired once by showError —
+    /// the terminal error funnel every served-stream death on
+    /// this surface passes (first-frame watchdog, .error state,
+    /// freeze watchdog all land there).
+    var onShowError: (() -> Void)?
     /// v1.22.16 (AutoSub, S-6): the AutoSub controller for this
     /// surface and the stream's raw external subtitle tracks,
     /// copied in by makeUIViewController (house pattern).
@@ -754,6 +777,7 @@ final class KSPlayerSurfaceViewController: UIViewController, KSPlayerLayerDelega
         // v1.22.15 (B-4): kind only — the raw message (which can
         // carry a raw error description) never reaches the log.
         DiagLog.log("player-ks", "error shown kind=\(kind)")
+        onShowError?()
     }
 
     // MARK: - Controls (mirrors PlayerSurfaceViewController)

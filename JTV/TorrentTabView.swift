@@ -202,7 +202,12 @@ struct TorrentTabView: View {
             for await (sectionId, items) in group {
                 if !items.isEmpty {
                     sectionItems[sectionId] = items
-                    ImageCacheManager.shared.prefetch(urlStrings: items.map(\.posterUrl))
+                    // FL-488 (gate sweep, attempt 2): the batch
+                    // came from ONE list fetch, so every movie
+                    // carries the same serving page — its
+                    // Referer rides the prefetch, exactly as
+                    // HomeView's section prefetch does.
+                    ImageCacheManager.shared.prefetch(urlStrings: items.map(\.posterUrl), headers: items.first?.imageHeaders ?? [:])
                 }
             }
         }

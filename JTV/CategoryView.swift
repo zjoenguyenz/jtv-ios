@@ -258,15 +258,28 @@ struct CategoryDetailView: View {
         }
     }
 
+    /// FL-489 (1.22.25): true once a fetched page added zero
+    /// new items — this list stops paginating even if the
+    /// parser's totalPages suggests more.
+    @State private var pagingFinished = false
+
     private func reload() async {
         isLoading = true
         loadError = nil
         page = 1
+        pagingFinished = false
         do {
             let result = try await service.list(pluginId: pluginId, slug: slug, filters: filters, page: 1)
             items = result.items
             totalPages = max(result.pagination.totalPages, 1)
-            page = result.pagination.currentPage
+            // FL-489 app-side fix: this view OWNS its counter —
+            // page 1 was requested, so the counter is 1. The
+            // parser-reported pagination.currentPage NEVER
+            // overwrites it (a mis-reporting parser used to
+            // bounce the counter back to the first pages
+            // forever); totalPages is still adopted.
+            page = 1
+            if result.items.isEmpty { pagingFinished = true }
         } catch {
             loadError = error.localizedDescription
         }
@@ -274,16 +287,22 @@ struct CategoryDetailView: View {
     }
 
     private func loadMore() async {
-        guard !isLoadingMore, page < totalPages else { return }
+        guard !isLoadingMore, !pagingFinished, page < totalPages else { return }
         isLoadingMore = true
         defer { isLoadingMore = false }
         do {
             let next = page + 1
             let result = try await service.list(pluginId: pluginId, slug: slug, filters: filters, page: next)
             let known = Set(items.map { $0.id })
-            items.append(contentsOf: result.items.filter { !known.contains($0.id) })
-            page = result.pagination.currentPage
+            let fresh = result.items.filter { !known.contains($0.id) }
+            items.append(contentsOf: fresh)
+            // FL-489: the counter becomes the REQUESTED page;
+            // the next request is counter + 1.
+            page = next
             totalPages = max(result.pagination.totalPages, totalPages)
+            // Stop rule: a page that adds zero new items (after
+            // dedupe) ends pagination for this list.
+            if fresh.isEmpty { pagingFinished = true }
         } catch {
             // Keep current items; pagination failures are non-fatal.
         }

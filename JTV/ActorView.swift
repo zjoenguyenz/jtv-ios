@@ -297,7 +297,7 @@ struct ActorView: View {
                     .fill(Theme.bgMid)
                 if let movie = selectedRow?.movie {
                     if !movie.displayBackdrop.isEmpty {
-                        CachedAsyncImage(urlString: movie.displayBackdrop)
+                        CachedAsyncImage(urlString: movie.displayBackdrop, headers: movie.imageHeaders)
                     }
                     if let previewStream {
                         IOSPreviewHost(
@@ -404,7 +404,7 @@ struct ActorView: View {
             }
         } label: {
             HStack(alignment: .center, spacing: 12) {
-                CachedAsyncImage(urlString: movie.posterUrl)
+                CachedAsyncImage(urlString: movie.posterUrl, headers: movie.imageHeaders)
                     .frame(width: 54, height: 72)
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                 VStack(alignment: .leading, spacing: 5) {

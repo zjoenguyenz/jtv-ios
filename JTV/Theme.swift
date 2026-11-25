@@ -65,7 +65,7 @@ struct MovieCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             ZStack(alignment: .topLeading) {
-                CachedAsyncImage(urlString: movie.posterUrl)
+                CachedAsyncImage(urlString: movie.posterUrl, headers: movie.imageHeaders)
                     .frame(width: width, height: width * 1.5)
                     .clipped()
 
@@ -122,7 +122,7 @@ struct MovieGridCell: View {
         VStack(alignment: .leading, spacing: 6) {
             GeometryReader { geo in
                 ZStack(alignment: .topLeading) {
-                    CachedAsyncImage(urlString: movie.posterUrl)
+                    CachedAsyncImage(urlString: movie.posterUrl, headers: movie.imageHeaders)
                         .frame(width: geo.size.width, height: geo.size.width * 1.5)
                         .clipped()
                     if !movie.quality.isEmpty {
