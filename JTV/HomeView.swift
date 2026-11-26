@@ -17,15 +17,6 @@ struct HomeView: View {
 
     @State private var sections: [HomeSection] = []
     @State private var sectionItems: [String: [Movie]] = [:]
-    // L-T42 (1.22.26): per-section rail paging state, mirroring
-    // CategoryDetailView's ownership rules (FL-489): the view
-    // owns the page counter (the REQUESTED page), totalPages is
-    // adopted monotonic-max, and a page that adds zero new items
-    // after dedupe finishes that section's rail.
-    @State private var sectionPages: [String: Int] = [:]
-    @State private var sectionTotalPages: [String: Int] = [:]
-    @State private var sectionFinished: Set<String> = []
-    @State private var sectionsLoadingMore: Set<String> = []
     @State private var isLoading = false
     @State private var didInitialSync = false
     @State private var path: [AppRoute] = []
@@ -36,9 +27,6 @@ struct HomeView: View {
     private struct HomeCacheEntry {
         var sections: [HomeSection]
         var items: [String: [Movie]]
-        var pages: [String: Int]
-        var totalPages: [String: Int]
-        var finished: Set<String>
         var loadedAt: Date
     }
     @State private var homeCache: [String: HomeCacheEntry] = [:]
@@ -316,11 +304,6 @@ struct HomeView: View {
                                         MovieCard(movie: movie)
                                     }
                                     .buttonStyle(.plain)
-                                    .onAppear {
-                                        if movie.id == items.last?.id {
-                                            Task { await loadMoreSection(section) }
-                                        }
-                                    }
                                 }
                             }
                         }
@@ -340,9 +323,6 @@ struct HomeView: View {
            Date().timeIntervalSince(cached.loadedAt) < 600 {
             sections = cached.sections
             sectionItems = cached.items
-            sectionPages = cached.pages
-            sectionTotalPages = cached.totalPages
-            sectionFinished = cached.finished
             return
         }
         isLoading = true
@@ -351,30 +331,18 @@ struct HomeView: View {
         guard pluginId == pid else { return }
         sections = loadedSections
         sectionItems = [:]
-        sectionPages = [:]
-        sectionTotalPages = [:]
-        sectionFinished = []
         // Fetch every section's first page IN PARALLEL and publish each
         // row as soon as its own fetch lands — previously this loop was
         // strictly serial, so the slowest section blocked all the others.
-        await withTaskGroup(of: (String, ListPage?).self) { group in
+        await withTaskGroup(of: (String, [Movie]).self) { group in
             for section in loadedSections {
                 group.addTask {
                     let page = try? await service.list(pluginId: pid, slug: section.slug,
                                                        filters: ListFilters(), page: 1)
-                    return (section.id, page)
+                    return (section.id, page?.items ?? [])
                 }
             }
-            for await (sectionId, page) in group {
-                let movies = page?.items ?? []
-                // L-T42 / FL-489: page 1 was REQUESTED, so the
-                // view-owned counter is 1 — never the parser's
-                // pagination.currentPage. totalPages is adopted.
-                sectionPages[sectionId] = 1
-                sectionTotalPages[sectionId] = max(page?.pagination.totalPages ?? 1, 1)
-                if movies.isEmpty {
-                    sectionFinished.insert(sectionId)
-                }
+            for await (sectionId, movies) in group {
                 if !movies.isEmpty {
                     sectionItems[sectionId] = movies
                     // FL-488: the batch came from ONE list fetch,
@@ -385,61 +353,7 @@ struct HomeView: View {
             }
         }
         guard pluginId == pid else { return }
-        homeCache[pid] = HomeCacheEntry(sections: sections, items: sectionItems,
-                                        pages: sectionPages, totalPages: sectionTotalPages,
-                                        finished: sectionFinished, loadedAt: Date())
-    }
-
-    // MARK: - Rail paging (L-T42)
-
-    /// Appends the next page to one home rail when its tail
-    /// approaches. Mirrors CategoryDetailView.loadMore: view-owned
-    /// counter, monotonic-max totalPages, dedupe by id, a page
-    /// adding zero new items finishes the rail, and failures are
-    /// non-fatal — a failed fetch does NOT advance the cursor, so
-    /// a later tail appearance retries the same page. A stale
-    /// append is dropped, never published over a reload: the
-    /// cursor and item count captured before the fetch are
-    /// revalidated after it, and any intervening publish voids it.
-    private func loadMoreSection(_ section: HomeSection) async {
-        let pid = pluginId
-        guard !pid.isEmpty else { return }
-        guard !sectionsLoadingMore.contains(section.id) else { return }
-        guard let current = sectionPages[section.id],
-              let total = sectionTotalPages[section.id] else { return }
-        let countAtStart = sectionItems[section.id]?.count ?? 0
-        guard current < total else { return }
-        guard !sectionFinished.contains(section.id) else { return }
-        sectionsLoadingMore.insert(section.id)
-        defer { sectionsLoadingMore.remove(section.id) }
-        let requestedPage = current + 1
-        let result = try? await service.list(pluginId: pid, slug: section.slug,
-                                             filters: ListFilters(), page: requestedPage)
-        guard let result else { return }
-        guard pluginId == pid else { return }
-        guard sectionPages[section.id] == current, (sectionItems[section.id]?.count ?? 0) == countAtStart else { return }
-        let existing = sectionItems[section.id] ?? []
-        var seen = Set(existing.map(\.id))
-        let fresh = result.items.filter { seen.insert($0.id).inserted }
-        if !fresh.isEmpty {
-            sectionItems[section.id] = existing + fresh
-            ImageCacheManager.shared.prefetch(urlStrings: fresh.map(\.posterUrl), headers: fresh.first?.imageHeaders ?? [:])
-        }
-        // FL-489: the counter becomes the REQUESTED page; the
-        // parser-reported pagination.currentPage never overwrites it.
-        sectionPages[section.id] = requestedPage
-        sectionTotalPages[section.id] = max(sectionTotalPages[section.id] ?? total, result.pagination.totalPages)
-        if fresh.isEmpty {
-            sectionFinished.insert(section.id)
-        }
-        if var entry = homeCache[pid] {
-            entry.items = sectionItems
-            entry.pages = sectionPages
-            entry.totalPages = sectionTotalPages
-            entry.finished = sectionFinished
-            homeCache[pid] = entry
-        }
-        DiagLog.log("home", "rail append section=\(section.slug) page=\(requestedPage) added=\(fresh.count) total=\(sectionItems[section.id]?.count ?? 0)")
+        homeCache[pid] = HomeCacheEntry(sections: sections, items: sectionItems, loadedAt: Date())
     }
 }
 
